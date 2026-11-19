@@ -23,7 +23,7 @@
 | 納入的 session | 只收**互動**的 top-level session。print、JSON、headless RPC、腳本呼叫的 omp 不建格 |
 | MVP 驗證目標 | **收藏**：session、成果與投入累積成城鎮，可以回看；不做建築效果 |
 | 自動選地 | 第一次看到新的遠征時，用 BFS 找最近的未佔用格；距離相同時依北、東、南、西的順序 |
-| 收成 | **git hook 自動收成**：agent 在自己的回合裡做出的 commit（含 merge、amend、rebase）會自動分類、自動發資源。人工卡只處理無法判斷歸屬的例外 |
+| 收成 | **git hook 自動收成**：agent 在自己的回合裡做出的 commit（含 merge、amend、rebase）會自動分類、自動發資源。來源不足的提交只記錄原因，不要求人工處理；之後取得確切證據時自動補算 |
 | 未 commit 的成果 | 不發建築資源 |
 | 土地進度 | 三個來源加總，到 100 點完成開墾：工作時間每分鐘 +1；每次有效收成 +20；每張羊皮卷 +10。數值都是試玩參數 |
 | 建築資源 | 木材、石材、鐵料只會由 commit 成果**直接發放**，不依 token、時間或 model；唯一的間接來源是市集轉換 |
@@ -53,7 +53,7 @@
 
 - **一個新的 mod**：不 clone 內建 mod，也不綁定特定 layout。城鎮地圖是一個 mod tab。
 - **CLI adapter**：OMP extension 是參考實作。每個 adapter 輸出同一種活動格式（§6），內容包括 session 身份、這個 session 的來源角色（root、child、fork）、每段 visit 的 repo 身份、工作區間與用量。
-- **收成 hook**：每座城可以選擇安裝一個 `post-commit` hook，在 commit 發生時記下 commit 和 agent 身份（§7）。
+- **收成 hook**：每座城可以選擇安裝 `post-commit`、`post-merge`、`post-rewrite`，在本機 Git 操作發生時記下 repo 與 commit 證據（§7）。
 - **三層資料**：
   - adapter 狀態：由 CLI process 持續寫入，herdr 關閉時照常累積。
   - commit 紀錄：由 hook 寫入，一個 commit 一個檔案。
@@ -81,7 +81,7 @@ flowchart LR
   Build --> Review[歷程清單與回看]
 ```
 
-日常操作只有兩件事：**蓋房**和**用羊皮卷加速**。收成是自動的，只有例外才需要人工處理。
+日常操作只有兩件事：**蓋房**和**用羊皮卷加速**。收成與來源核對都是自動的；來源不足時只保留紀錄與原因，不要求人工整理。
 
 ## 4. 地圖規則
 
@@ -108,7 +108,7 @@ flowchart LR
 |---|---|---|
 | 土地階段 | 未開墾、已開墾、已建、已撤回、已封存 | 只能往前推進，不會倒退。總點數達 100（不論來自工作時間、收成或加速）時，自動從未開墾推進到已開墾並揭開鄰格。活動事件與收成**不能覆寫**已建、已撤回、已封存；已撤回與已封存那一代的點數凍結 |
 | 活動狀態 | active、idle | root 或可歸戶的 child **只要有一個** active，就是 active；畫面上顯示為「探索中」，否則為「駐紮」 |
-| 例外標記 | 有／無待確認 commit | 由 hook 紀錄與歸屬結果重新計算出來，不額外儲存 |
+| 來源標記 | 正常／來源不明 | 由 commit 證據與歸屬結果重新計算，不額外儲存，也不等待使用者確認 |
 
 「預留」不是一個獨立狀態，而是土地階段為「未開墾」時的初始呈現。
 
@@ -182,7 +182,8 @@ interface NormalizedUsage {
 
 ### 6.2 ack、compact 與寫入者
 
-- **每個寫入者一個檔案**：adapter 寫 `activity/<sessionId>/<writerEpoch>.json`。同一個 session 在另一個 terminal 被 resume 時，新的 process 用新的 `writerEpoch` 開新檔，舊的 writer 只能寫自己的檔，不會互相覆蓋。
+- **使用範圍（使用者確認）**：多視窗使用不同 session；不支援同一個 session 同時在兩個視窗工作，也不為此增加切換記帳視窗的操作。仍須支援先結束舊程序、之後 resume 同一個 session，且不重算先前用量。
+- **每個寫入者一個檔案**：adapter 寫 `activity/<sessionId>/<writerEpoch>.json`。舊程序結束後 resume 時，新程序使用新的 `writerEpoch`，保留舊檔以供離線重播；這不是同 session 多視窗同時工作的支援承諾。
 - **ack 也按 epoch 分開**：mod 在帳本提交成功後寫 `acks/<sessionId>/<writerEpoch>.json`，內容是 `{ackedEventSeq, journalSeq}`。adapter 只讀自己 epoch 的 ack，並且只能刪掉 `eventSeq ≤ ackedEventSeq` 的事件。
 - mod 合併所有 epoch 的事件：interval 取聯集，晚到的 heartbeat 只能延長**自己 epoch** 內尚未關閉的 interval；跟已保存區間重疊的部分不重算。
 - **heartbeat**：OMP 用 `ctx.setInterval`，每 60 秒更新一次。沒有正常關閉的 interval，只算到最後一次寫入磁碟的 heartbeat。系統休眠或事件迴圈卡住時，heartbeat 不會準時觸發；規則只保證「不多算」。
@@ -203,8 +204,8 @@ interface NormalizedUsage {
 - 安裝三個 hook：`post-commit`（一般 commit、amend）、`post-merge`（成功自動合併）、`post-rewrite`（amend、rebase，從 stdin 取得舊 sha 對新 sha 的對照）。cherry-pick 等其他路徑由 S8 實測；沒有被任何 hook 觸發的提交，由下面的補捉流程處理。
 - 安裝位置：repo 有自己的 `core.hooksPath` 時，裝在那個路徑；沒有時，裝在 common dir 的 `hooks/`，所有 worktree 共用。原本就有同名 hook 時，改名保留並由新 hook 先呼叫它；husky 這類工具，或 hooks 目錄已納入版本控制的情況，安裝前要先提示。
 - hook 執行時寫入 `commits/<sha>.json`，內容包括：sha、觸發的 hook 種類、commonDir、toplevel、時間，以及環境變數 `PI_SESSION_ID`、`PI_TOOL_CALL_ID`、`CODEX_THREAD_ID`、`HC_TERMINAL_ID`。
-- hook 必須在 50 ms 內結束、不連網、**一律以 exit 0 結束**。
-- **補捉**：mod 定期讀取已知 checkout 的 `git reflog`。發生時間落在某個 agent 回合內、卻沒有任何 hook 紀錄的提交，列入例外卡，標記為「無來源證據」，不會自動發資源。
+- 本 mod 的 hook 記錄器必須不連網、**一律以 exit 0 結束**；受控環境的目標是 p95 在 50 ms 內。原本既有 hook 的耗時不在本 mod 可保證的範圍。
+- **補捉**：mod 定期讀取已知 checkout 的 `git reflog`。發生時間落在某個 agent 回合內、卻沒有任何 hook 紀錄的提交，保留紀錄並顯示「無來源證據」；沒有其他可核對的來源證據時不發資源、不提供人工補領，也不跳出提醒。
 
 ### 7.2 歸屬
 
@@ -212,9 +213,9 @@ interface NormalizedUsage {
 |---|---|
 | 有 `PI_SESSION_ID`（OMP 的 bash 會注入） | 歸到這個 session；若它是 child，再往上歸到 root |
 | 有 `CODEX_THREAD_ID` 或 Claude Code 的對應變數 | 歸到對應的 session（S7 驗證） |
-| 只有 `HC_TERMINAL_ID` | **不自動收成。** terminal ID 會被從該 terminal 啟動的 IDE、背景程序繼承，不能證明提交來源。依提交當下該 terminal 跑的互動 session 給出建議歸屬，放進例外卡由你確認 |
+| 只有 `HC_TERMINAL_ID` | **不自動收成。** terminal ID 會被從該 terminal 啟動的 IDE、背景程序繼承，不能證明提交來源。只保留紀錄與原因，不猜所屬對話、不提供人工補領 |
 | 什麼都沒有（IDE、手動 commit） | 不收成，只記錄 |
-| 沒有安裝 hook 的城 | **不自動收成。** 沒有 hook，就沒有任何資料能把某個 SHA 綁到產生它的那個動作上；只看 HEAD 在工具呼叫或回合前後的差異，無法排除你同時從 IDE 做的提交。adapter 仍會記錄每次工具呼叫前後新增的 SHA，但只當成**建議**：例外卡上預先選好建議的 session，由你按一下確認 |
+| 沒有安裝 hook 的城 | **目前規格不自動收成。** OMP commit 工具另有精確 SHA 與 session 來源紀錄（見 §15.2），但紀錄缺 repo 身分，正式整合尚未驗證。不能只看 HEAD 在工具呼叫或回合前後的差異，因為無法排除你同時從 IDE 做的提交 |
 | 依提交時間，這個 session 當時所屬的那一代已撤回或已封存，或當時沒有現役的一代 | 不收成 |
 
 ### 7.3 發資源
@@ -230,22 +231,25 @@ interface NormalizedUsage {
 
 ### 7.4 研究羊皮卷（自動）
 
-- 一個回合從 `agent_start` 到 `agent_end`。回合結束時，先標成「待結算」，等這段時間內、這個 session 各個 checkout 上的所有提交都確定歸屬（自動歸屬、人工指定或忽略）之後才結算。
-- 只要有任何 commit 歸到這個 session、時間又落在這個回合內，就算這個 commit 沒有產生新單位，這個回合也不算研究。沒有的話，這個回合 root 加 child 的 `inputNonCache + output` token 加進**這座城**的研究計量器。被人工忽略的提交，視為沒有歸屬。
+- 一個回合從 `agent_start` 到 `agent_end`。回合結束時，先標成「待結算」，等這段時間內、這個 session 各個 checkout 上的提交完成來源核對（確認歸屬或列為來源不明）之後才結算，不等待使用者處理。
+- 只要有任何 commit 歸到這個 session、時間又落在這個回合內，就算這個 commit 沒有產生新單位，這個回合也不算研究。沒有的話，這個回合 root 加 child 的 `inputNonCache + output` token 加進**這座城**的研究計量器。來源不明的提交視為沒有歸屬。
 - 計量器每滿 100,000 加 1 張羊皮卷，餘數保留；cache read／write 不算，用量未知的回合不計。
 - 這個規則有一個已知的漏洞：先探索、下一回合才 commit 的工作，探索回合的 token 會被算成研究。因為換算比例很低，第一版接受，試玩時觀察。
+- **遲到來源的例外**：若提交來源尚未確認時，該段工作已累積研究進度或獲得研究羊皮卷，之後補齊來源並補算提交成果時，不倒扣研究進度或已發獎勵、不產生欠款，也不撤銷已用羊皮卷完成的操作。第一版接受因此同時領到研究與提交獎勵；同一份來源紀錄重播不能再次發放任何已領獎勵。
 - 結論可以選填，只用在回看，不影響換算。
 
-### 7.5 人工例外卡
+### 7.5 來源不明的提交
 
-只會在以下情況出現：
+以下情況若沒有其他可核對的來源證據，只保留提交紀錄與原因，不發資源：
 
-- 沒有安裝 hook 的城：回合期間新增的所有提交，附上依工具呼叫前後 HEAD 差異算出的建議歸屬。
+- 沒有安裝 hook 的城。
 - 已安裝 hook 的城，補捉到沒有任何 hook 紀錄的提交。
 - hook 紀錄裡的 session 無法對應到任何遠征。
 - hook 紀錄只有 `HC_TERMINAL_ID`、沒有 agent 的 session 身份。
 
-使用者可以選擇歸給哪一格，或忽略。選擇之後，資源的發放規則和自動收成完全相同。
+第一版不提供人工補領、不猜所屬對話，也不跳出提醒。使用者可在紀錄中查看原因；這不影響已提交的程式碼。此選擇接受來源漏記時少算遊戲資源，以免增加人工確認負擔。
+
+若之後取得能核對同一提交的確切來源，系統自動重新判定收成，不需要使用者操作；依提交當時的資格與既有去重規則處理，原本符合資格且尚未領取的成果才發資源。首次讀取時來源不明，不代表永久取消資格；不能只靠時間接近或同一個 terminal 補猜。
 
 ### 7.6 蓋房、加速與市集
 
@@ -322,7 +326,7 @@ interface NormalizedUsage {
 
 - **點格子**：可以看到 CLI、session、generation、每段 visit 與它所在的 checkout、工作區間、三種開墾點、每次收成的 commit、成果路徑與 claim、資源向量、規則版本、provider 投資、建築與實際支付的資源。
 - **歷程清單**：可以依日期、城、session、commit 訊息、成果路徑搜尋，點選後跳到對應的格子。已撤回和已封存的遠征，從這份清單查得到。
-- 這是本提案和其他 layout 的主要差別，必須在 MVP 裡做到。
+- 歷程清單支撐城鎮遊戲狀態的回看與追溯；產品主體仍是會隨日常工作成長的城鎮，不把歷程管理包裝成主要目的。
 
 ## 13. 存檔
 
@@ -365,11 +369,17 @@ herdr 一次只能讀 1 MiB（`herdr.d.ts:27-29`），所以**每個檔案都必
 | 地面：伐木地、採石地、抄寫地、礦地、勘查地 | 5 |
 | 建築：5 種 × 4 套派系風格（Anthropic、OpenAI、Google、無派系） | 20 |
 | 資源圖示：木材、石材、鐵料、羊皮卷 | 4 |
-| 狀態標記：探索中、駐紮、待確認、已封存 | 4 |
+| 狀態標記：探索中、駐紮、來源不明、已封存 | 4 |
 | 市集 | 1 |
 | **合計** | **約 39 張** |
 
 - 先用 OMP 和 mock 圖完成一條縱切流程，驗證收藏價值成立，再補齊全部派系美術。
+
+### 14.1 已選定的地圖資訊架構
+
+- 採用 [地圖原型 C：遠征指揮桌](https://github.com/kaihg/herdr-reclaim/blob/prototype/map-ui/mod/herdr-reclaim/prototype-map.html?variant=C) 作為正式畫面的方向：上方顯示城鎮資源與主要行會，左側列出遠征，中央保留城鎮地圖，右側顯示選取遠征的狀態與可執行操作。
+- 歷程搜尋不常駐擠壓中央地圖；由選取遠征或格子的詳情進入，仍須滿足 §12 的跨日期、session、commit 與路徑搜尋。
+- 原型只決定資訊層級與畫面分區；正式實作須以 herdr／gpui-kit 重寫，不直接移植 throwaway HTML、CSS 或假資料。
 
 ## 15. 先行技術驗證
 
@@ -383,7 +393,7 @@ herdr 一次只能讀 1 MiB（`herdr.d.ts:27-29`），所以**每個檔案都必
 | S3 | 收成、claim、journal 與 CAS | 測試城：1 萬支遠征（含撤回與封存）、10 萬筆操作、一個改了 2 萬個路徑的 commit | head 大小固定，每個檔案都低於 256 KiB；索引頁面寫滿時正確拆分、查得到；大 commit 的內容檔切塊後可完整讀回；城級去重：兩支遠征從不同起點看到同一份內容，只發一次；兩個畫面用不同 operation ID 同時搶同一份庫存，只成功一次；內容檔已寫、journal 還沒附加時中斷，重啟後該操作視為未完成、可以重試；換段時，一個寫入者封段、另一個同時附加到舊段：後者 CAS 失敗、改寫到下一段並重新檢查庫存，不會重複支出 |
 | S4 | 地圖 | 300 格與高矮不同的 mock 建築 | BFS 結果穩定、圖片不攔錯點擊、延遲符合開工前訂的門檻 |
 | S5 | provider 額度 | 讀一次原始額度資訊 | 保存原始值與擷取時間；拿不到時顯示未知 |
-| S6 | adapter 協定 | OMP | 以下情境都要通過：互動 TUI 的 root、print 模式的 root、headless RPC、task child、root fork、兩個 terminal resume 同一個 session，逐一核對建了幾格、各 epoch 的檔案有沒有互相覆蓋；ack 延遲以及 compact 前後中斷時，重播結果相同；herdr 關閉期間依序在 A、臨時 worktree、B 工作，並刪掉臨時 worktree 後才重播，投入仍歸到正確的城；heartbeat 只算到最後一次寫入 |
+| S6 | adapter 協定 | OMP | 以下情境都要通過：互動 TUI 的 root、print 模式的 root、headless RPC、task child、root fork、多視窗使用不同 session，以及舊程序結束後 resume 同一個 session，逐一核對建了幾格、重啟前後的用量沒有重算；ack 延遲以及 compact 前後中斷時，重播結果相同；herdr 關閉期間依序在 A、臨時 worktree、B 工作，並刪掉臨時 worktree 後才重播，投入仍歸到正確的城；heartbeat 只算到最後一次寫入 |
 | S7 | Codex／Claude adapter | 各做一個最小 adapter | 純文字回合、工具回合、resume、child、abort 都要通過；Claude 依 message ID 去重；Codex 正確處理 cached input；確認 bash 的環境變數裡有沒有可用的 session ID |
 | S8 | git hook | 測試 repo | 安裝時會串接既有的 hook、尊重 `core.hooksPath`、遇到 husky 會提示；OMP bash 執行的 commit 帶有 `PI_SESSION_ID`；OMP 自己的 commit 工具執行時，hook 會不會跑、環境變數在不在；逐一實測初始 commit、commit、amend、rebase、cherry-pick、`merge --no-ff`、衝突解決後的 merge commit，各自觸發哪個 hook、`diff-tree` 指令能否正確列出路徑；沒有觸發的提交能被 reflog 補捉；hook 在 50 ms 內完成；同一次 agent 工具呼叫還沒結束時從 IDE 插入一個提交，hook 只把帶有 agent 環境變數的那個 SHA 歸給 agent；沒裝 hook 時不會自動發任何資源 |
 
@@ -422,7 +432,7 @@ herdr 一次只能讀 1 MiB（`herdr.d.ts:27-29`），所以**每個檔案都必
 - 第一父節點 diff、初始 commit `--root`、rewrite 的舊／新 SHA 對照均有斷言通過。amend／rebase 會重複通知，不能按 hook 次數發資源。
 - 測試安裝器尊重 repo-local `core.hooksPath`；既有 hook 收到原參數與 rewrite stdin，即使回傳 7，記錄器仍回傳 0；Husky／已追蹤的 hook 路徑會拒絕直接安裝。這是 spike，不是正式安裝器。
 - OMP **bash** 路徑的 hook 有 `PI_SESSION_ID`、`PI_TOOL_CALL_ID`。同一次 bash 工具呼叫內，模擬 IDE 提交只保留 `HC_TERMINAL_ID`、移除 session 變數，該 SHA 沒有 agent 身分；不能用 terminal ID 自動歸戶。
-- OMP **eval `commit` namespace** 的隔離實測：`post-commit` 有執行，但 `PI_SESSION_ID` 與 `PI_TOOL_CALL_ID` 都是空值，只有 `HC_TERMINAL_ID=t58`。**因此目前主要提交工具不能自動收成**；依 §7.2 必須進例外卡，不能用相鄰工具呼叫推定來源。測試提交 `10a36617b5395ca0a8ad819ed68e532d70e4a31b` 位於一次性 repo，並非本專案歷史。
+- OMP **eval `commit` namespace** 的隔離實測：`post-commit` 有執行，但 `PI_SESSION_ID` 與 `PI_TOOL_CALL_ID` 都是空值，只有 `HC_TERMINAL_ID=t58`。這證明 **hook 環境變數不足以辨認來源**，不是 OMP 完全沒有來源紀錄。後續已在目前 session 的 `changes.jsonl` 核對四筆精確提交 SHA，包含測試提交 `10a36617b5395ca0a8ad819ed68e532d70e4a31b`；可由 adapter 讀取並與 hook 配對，不必猜相鄰工具呼叫。實機證據、v18.22.0 原始碼與中斷／跨 repo 限制見 [提交來源查證](../spikes/s8/commit-attribution.md)。**正式整合尚未實作，S8 仍未通過。**
 - 關閉 hook 的提交可由 reflog 找到，但沒有來源證據。正式帳本尚未接線，所以「不發資源」目前僅是規格，沒有端到端驗證。
 - Python spike 記錄器 50 次：中位數 **61.27 ms**、p95 **64.34 ms**、最大 **66.01 ms**，未達 50 ms。這只量測新記錄器；既有 hook 的執行時間不受本 mod 控制，§7.1 的總耗時保證仍須釐清。
 
@@ -496,6 +506,8 @@ S2b 只量到現有全量掃描：10k entries 8.04 ms、heap delta 327,680 bytes
 
 **本輪協定調查已完成，S6 整體仍未通過：跨 epoch 用量缺少去重身分。** 可重跑：`bun spikes/s6/verify-protocol.ts`。使用真正的檔案、CAS 與 Git worktree；所有資料在 `/tmp/reclaim-s6-*`，結束清除。沒有啟動模型、child agent 或改已安裝 extension。
 
+**後續使用範圍修正（使用者確認）**：不需要同 session 多視窗同時工作的支援。本節保留原始實測紀錄，但該並行情境不再是交付門檻，也不再據此要求增加複雜的並行用量合併機制。正常關閉後 resume、崩潰恢復與延遲重播仍須避免重算；具體記帳方式尚待定，不代表 S6 已通過。
+
 | 情境 | 執行結果 |
 |---|---|
 | root／print／RPC／fork／child 事件投影 | root 與互動 fork 共兩格；print／RPC 不建格；child 用量歸 root，不另建格 |
@@ -514,7 +526,7 @@ S2b 只量到現有全量掃描：10k entries 8.04 ms、heap delta 327,680 bytes
 - 歷史 A：writer a、b 都讀到 source-1（100 tokens），正確總額 100。
 - 歷史 B：a 讀 source-1、b 讀 source-2（各 100 tokens），正確總額 200。
 - 去掉來源 entry ID 後，§6.1 的兩組 usage 事件逐欄相同。按 epoch 加總會把 A 重算；取最大值則會漏算 B。ack 只證明這個 writer 的事件已處理，不能證明來源用量未被別的 writer 回報。
-- **待修規格**：usage 必須攜帶跨 epoch 穩定的來源 key（例如 CLI + session ID + usage entry ID），並定義同 key 更新的版本／取代語意；或明確限制同 session 的唯一用量寫入者。不能僅靠 `writerEpoch + eventSeq` 宣稱不重複計費。本輪不偷偷改成單 writer，也不把未知用量補零。
+- **原調查建議，已縮限適用範圍**：若要支援同 session 多個並行寫入者，需穩定來源 key 與更新語意，或唯一用量寫入者。使用者已排除該並行情境；不再把這套並行方案列為必要條件，但正常 resume 與重播不能把舊用量重新相加。
 
 **OMP API 的補充證據**：
 
@@ -537,7 +549,7 @@ heap delta 本次均為 0，**不代表沒有配置**；配置結構由實作及
 **包含**
 
 - OMP adapter、共同的活動格式；S7 通過的 Codex／Claude 最小 adapter
-- git hook 自動收成（post-commit、post-merge、post-rewrite）、reflog 補捉、未裝 hook 時的建議卡、人工例外卡
+- git hook 自動收成（post-commit、post-merge、post-rewrite）、reflog 補捉、來源不明的提交紀錄與原因；不含人工補領
 - 自動選地、resume、move、撤回、封存、重新派遣
 - 開墾點（工作時間、收成、加速）、研究羊皮卷、市集、建築、派系
 - 歷程清單與回看、journal 帳本、CAS、claim 去重
@@ -568,25 +580,27 @@ heap delta 本次均為 0，**不代表沒有配置**；配置結構由實作及
    - 最後一次 heartbeat 在 60000 ms、process 在 119000 ms 中止：只算到 60000 ms。
 3. **離線重播與寫入者**
    - herdr 關閉期間依序在 A、臨時 worktree、B 工作，刪掉 worktree 後才重播：各段投入歸到正確的城。
-   - 兩個 terminal resume 同一個 session：兩個 epoch 各寫自己的檔案，事件不會被覆蓋；舊 writer 晚到的 heartbeat 不會延長已關閉的 interval。
+   - 多視窗使用不同 session，各自記帳、不混在一起。舊程序結束後 resume 同一個 session，延續原遠征且不重算先前用量；舊程序晚到的 heartbeat 不會延長已關閉的 interval。不驗收同 session 同時在兩個視窗工作。
    - ack 延遲或 compact 前中斷後重播：時間和用量都相同。
 4. **commit 收成**
    - OMP bash 執行的 commit，改了 1 個程式檔、2 個測試檔、1 份文件：得到木材 10、石材 20、羊皮卷 1，該格 +20 點。
    - 同一代遠征把同一個檔案 commit 三次：只算 1 單位。
    - 用 IDE 手動 commit：不收成。
    - 已裝 hook 的城：agent 執行 `git commit … && npm test`，先產生 A；測試還在跑時，你從 IDE 提交 B。A 帶有 `PI_SESSION_ID`，自動歸給 agent；B 沒有，不收成。
-   - 沒裝 hook 的城：不論是工具呼叫之間、工具呼叫進行中，或 agent 的 commit 失敗之後，你從 IDE 做的提交都不會自動發資源；所有提交只出現在例外卡上，附建議歸屬，由你確認。
-   - 已裝 hook 的城：從 herdr terminal 啟動的程式提交，只帶有 `HC_TERMINAL_ID`、沒有 agent 的 session 身份：不自動收成，進例外卡並附建議歸屬。
+   - 沒裝 hook 的城：不論是工具呼叫之間、工具呼叫進行中，或 agent 的 commit 失敗之後，你從 IDE 做的提交都不會發資源；只保留紀錄與原因，不猜所屬對話。
+   - 已裝 hook 的城：從 herdr terminal 啟動的程式提交，只帶有 `HC_TERMINAL_ID`、沒有其他 agent 來源證據：不收成，只記錄原因，不提供人工補領。
    - 新 repo 的第一個 commit 也能正常收成。
    - 城級去重：S1 在內容 A 時開始、S2 在內容 B 時開始，兩者都 commit 出內容 C，只有先到的那次發資源。
    - amend 成相同內容：不重複發；revert 回到已被領過的內容：不發。
    - merge：只跟第一個父節點比較；其他分支帶進來、已經在該分支被領過的內容不重複發；從未被領過的則照常發。`merge --no-ff` 經由 post-merge 也能收成。
    - 舊的一代已撤回，忽略期間產生 commit，之後重新派遣，mod 才讀到這個 commit：依提交時間歸到舊的一代，不收成，也不會補進新的一代。
-   - 沒裝 hook 的城：例外卡上，依工具呼叫前後 HEAD 差異預先選好建議的 session；你確認之後才發資源，規則和自動收成相同。
+   - 來源不明的提交不跳出提醒、不提供人工補領；使用者能在紀錄中看到提交與未收成原因。
+   - 先讀到提交、稍後才收到能核對該 SHA 的 OMP 來源紀錄：原提交符合資格且未領過時自動補算；再次重播同一份證據不重複發資源，不要求使用者確認。
 5. **研究、羊皮卷與市集**
    - 同城的 S1 有 60000 個合格 token（沒有 commit 的回合）：0 張、計量器 60000；S2 再有 40000：1 張、計量器歸 0。另一座城的計量器不受影響。
    - cache 的 500000 token 不影響上述結果；有 commit 的回合不累加，即使那個 commit 沒有產生新單位；用量未知的回合不累加。
-   - 回合結束時，這段時間內還有待確認的 commit：研究暫不結算；這個 commit 後來被歸給這個 session，這個回合就不發研究羊皮卷；被忽略的話，才補發研究羊皮卷。
+   - 回合結束時，這段時間內還有待核對來源的 commit：研究暫不結算；系統確認這個 commit 屬於該 session 後，這個回合不發研究羊皮卷；若核對結果為來源不明，則視為沒有歸屬，不等待人工確認。
+   - 來源不明時已發出研究羊皮卷，之後確認該段工作有符合資格的提交：自動補算提交成果，保留已發出的研究羊皮卷；即使羊皮卷已用完，也不扣成負數或撤銷先前操作。再次重播不重複發獎勵。
    - 市集用 3 張羊皮卷換 1 份木材；庫存不足時，整筆不執行。
 6. **加速與資格**
    - 5 點的格子用 3 張羊皮卷：自然 5 加上加速 30，庫存歸 0。95 點的格子用 1 張：完成開墾、揭開鄰格，超出的點數不退。80 點的格子收成 +20：自動變成已開墾。
