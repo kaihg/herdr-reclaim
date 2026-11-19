@@ -1,7 +1,7 @@
-# herdr 開墾城鎮 mod 提案（v5.1）
+# herdr 開墾城鎮 mod 提案（v6）
 
 > **狀態**：提案定稿前的版本，尚未實作。
-> **歷程**：v1–v4 經過兩輪、共六份獨立審查（設計、技術、規格各兩次）與七輪使用者回饋。v5 以「開墾模式」為唯一主線；被放棄的方案列在附錄 A。
+> **歷程**：v1–v5.2 經過兩輪獨立審查與多輪使用者回饋。v6 將核心身份從工單改為 `(cityId, rootSessionId)` 遠征：新 root session 自動探索土地、事件驅動累積投入、成果另行收成。被放棄的方案列在附錄 A。
 > **事實依據**：
 > - herdr-app 0.1.16：`~/.config/herdr-app/herdr.d.ts`、`gpui-kit.d.ts`、`AGENTS.md`
 > - `hc` 實測
@@ -10,27 +10,28 @@
 
 ## 0. 一句話
 
-**每完成一份工作，城鎮就開墾出一塊地、蓋起一棟建築；城鎮就是你的工作史，可以回頭翻閱。**
+**每個 agent session 都是一支遠征隊：工作期間探索土地，驗收成果後收成資源，最後把可回看的工作史長成一座城。**
 
 ## 1. 決定紀錄
 
 | 議題 | 決定 |
 |---|---|
-| 主題 | 寫實中世紀（世紀帝國式）；單位是工匠，不是冒險者；不做等級 |
-| 一格代表 | 一張完成的工單（開墾模式）；不再是一個檔案 |
-| MVP 驗證目標 | **收藏**：成果累積成城鎮、可以回看；不做建築效果 |
-| 建材 | **有類型**：每張結案的工單（含續作）依成果類型給一份；蓋房時花一份，類型決定能蓋什麼；民居收任何類型；沒有建材也能照常開墾（§11） |
-| 開地與蓋房 | **兩個動作**：結案時那一格變成「已開墾空地」，這塊地永遠對應它自己的 session 結果；蓋房是之後另外的動作 |
-| 研究型工單 | 給羊皮卷（可以蓋圖書館）；揭開範圍與一般工單相同 |
-| 結案時 agent 還在跑 | 警告並確認後，以當下為截點結算；之後的費用另外歸屬 |
-| 行會 | 不進遊戲規則。工單投入最多的 provider 決定建築的**派系風格**，只影響外觀（§9） |
-| 熱點 | 只當可忽略的提示（MVP 不做） |
-| 結案 | 由城主驗收；issue / MR 提示屬於後續功能 |
+| 主題 | 寫實中世紀（世紀帝國式）；單位是工匠，不是冒險者；不做角色等級 |
+| 一格代表 | 一組 `(cityId, rootSessionId)` 遠征；同一 root session 在不同 city 各有一格，subagent 併入 root、不另開地 |
+| MVP 驗證目標 | **收藏**：session、成果與投入累積成城鎮，可以回看；不做建築效果 |
+| 自動選地 | 第一次看到新的 `(cityId, rootSessionId)`，依固定 BFS 順序選最近的未佔用格；地形與路線有差異後才考慮手動選路 |
+| 土地進度 | root session 與可歸戶 subagent 的 active interval 聯集每分鐘 +1 點；100 點完成開墾。進度只表示投入與成本，不表示品質或產值 |
+| 成果資源 | 驗收成果後可同時取得木材、石材、鐵料；數量依成果種類與數量，不依 token、時間或 model |
+| 羊皮卷 | 文件成果或經驗收的無檔案研究可產生；不是建築材料。羊皮卷可消耗以加速任一遠征格，暫定 1 卷 +10 點 |
+| 收成與開墾 | 兩個獨立進度：成果可以多次收成；土地達 100 點才完成開墾並揭開鄰格 |
+| 無成果 session | 格子保留在探索／駐紮狀態，直到使用者手動撤回；不自動逾時 |
+| 行會 | provider 真實額度若可取得就顯示成可調度人力；遠征投入最多的 provider 決定派系風格 |
+| CLI | OMP 是參考 adapter；Codex、Claude Code 需各自 adapter。手寫程式與沒有 adapter 的 shell 不納入 |
 | 分類 | 規則式為預設；LLM 分類器（例如 omp `judge`）是擴充 |
-| 城的身份 | space 資料夾所在 repo 的 git common dir |
+| 城的身份 | cwd 所在 repo 的 canonical git common dir；worktree 屬於原 repo 的同一座城 |
 | 格子 | 斜俯視 3/4 方格、四邊相鄰；邏輯座標與投影分開 |
-| 平台 | 本機 macOS + omp；只有單一 `appHome()` |
-| 產值 | API 等值，放在次要統計，不當成就 |
+| 平台 | 本機 macOS；只有單一 `appHome()` |
+| 產值與用量 | API 等值放在次要統計，不當成就；token 只影響派系、造價與研究羊皮卷，不產生木材、石材或鐵料 |
 
 ## 2. 定位與架構
 
@@ -38,241 +39,265 @@
 
 | | herdr-traveler | world-of-codecraft | 本提案 |
 |---|---|---|---|
-| 主體 | 側欄角色卡 | 固定的等角像素村莊 | 隨工作開墾的城鎮 |
-| 強項 | agent 狀態、HP / SP | agent 的即時活動演出 | 可以回看的工作史 |
-| 累積 | 無 | 只有 4 筆事件紀錄 | 每張工單一棟建築，附成果與歷程 |
+| 主體 | 側欄角色卡 | 固定的等角像素村莊 | session 自動遠征、隨成果成長的城鎮 |
+| 強項 | agent 狀態、HP / SP | agent 的即時活動演出 | 可以回看的 session、投入與成果史 |
+| 累積 | 無 | 戰報保存最多 40 筆、畫面顯示 4 筆；不保存 session ID 與成果 | 每個 session 一格，可多次收成並持續開墾 |
 
-本提案**不跟 world-of-codecraft 比 agent 演出**，差別在於：城鎮來自驗收過的真實成果，而且可以回看。
+本提案**不跟 world-of-codecraft 比 agent 演出**，差別在於：城鎮來自真實 session、驗收成果與可觀測投入，而且可以回看。
+
+另有三個同類 layout（herdr-kaiju、herdr-middle-earth、frieren）；五者的逐項比較與可借用做法見 [competitor-analysis.md](competitor-analysis.md)。截至 2026-11-19，沒有任何一個做跨 session 的成果累積。
 
 ### 2.2 架構
 
 - **一個新的 mod**，不 clone 內建 mod，也不綁定特定 layout。
-- **城鎮地圖是一個 mod tab**：用 `tab.new {mod, props}` 開啟（`AGENTS.md:584-586`），可以放進 main、traveler、world-of-codecraft 任何一個 layout。
-- **mod tab 不是唯一實例**，平台不保證一個 space 只有一個，要自己處理：
-  - 「開啟城鎮」時，已經開著就切過去，沒有才新開。
-  - 關掉 tab 只是關掉畫面，城還在。
-  - 同時開著的多個畫面共用同一份帳本，靠 CAS 防止重複寫入（§13）。
-- **一個 omp extension**：負責把 terminal 對到 session，並記錄用量（§6、§10）。
+- **城鎮地圖是一個 mod tab**：可以放進 main、traveler、world-of-codecraft 等 layout。
+- **一個 adapter protocol**：各 CLI adapter 將 session ID、cwd、active interval、用量與 parent session 關係寫成同一格式（§6）。
+  - OMP extension 是參考實作。
+  - Codex、Claude Code 必須先驗證各自可取得的 hook 與用量欄位；缺少能力時明示未知，不推估。
+- **兩層資料**
+  - adapter state：由 CLI 程序持續寫；herdr 關閉時也照常累積。
+  - city ledger：由 mod 寫入格子、收成、資源與建築；同時開啟的多個畫面靠 CAS 防止重複寫入。
 - **繪製**
-  - herdr 用 gpui-kit：JS 描述元件，由 Rust 用原生 GPU 繪製；沒有 HTML、CSS、WebGL，也沒有 3D API（`AGENTS.md:35-47`）。
-  - 立體感只能靠預先做好的圖片。
+  - herdr 用 gpui-kit：JS 描述元件，由 Rust 用原生 GPU 繪製；沒有 HTML、CSS、WebGL，也沒有 3D API。
+  - 立體感靠預先做好的靜態圖片；進度條以原生元件呈現。
 
 ## 3. 核心循環
 
 ```mermaid
 flowchart LR
-  Frontier[點可開墾的空地] --> Dispatch[派工<br/>在城的 checkout 開 omp]
-  Outside[從 terminal 直接開的 session] --> Unassigned[未分配探險隊]
-  Dispatch --> Explore[探索中]
-  Explore --> Card[結案卡<br/>確認成果、截點、分類]
-  Unassigned --> Card
-  Card --> Cleared[已開墾空地<br/>揭開鄰格]
-  Card --> Stock[建材庫存 +1<br/>類型依成果]
-  Stock --> Build[在已開墾空地蓋房<br/>花一份建材]
-  Cleared --> Build
-  Cleared --> Frontier
-  Build --> Review[點格子回看歷程]
-  Cleared --> Review
+  Seen[adapter 發現新的<br/>city + root session] --> Reserve[自動預留最近空格]
+  Reserve --> Explore[agent active<br/>每分鐘 +1 開墾點]
+  Explore --> Idle[session idle／駐紮]
+  Idle --> Explore
+  Explore --> Harvest[驗收未認領成果]
+  Harvest --> Material[木材／石材／鐵料]
+  Harvest --> Scroll[文件或研究<br/>羊皮卷]
+  Scroll --> Boost[消耗羊皮卷<br/>加速任一遠征格]
+  Explore --> Ready{開墾點 >= 100}
+  Boost --> Ready
+  Ready --> Cleared[完成開墾<br/>揭開鄰格]
+  Cleared --> Build[支付配方蓋房]
+  Build --> Review[回看 session、投入與收成]
 ```
 
-沒有建材時只能開墾、不能蓋房，但開墾永遠不消耗任何東西，所以真實工作不會被卡住。
+成果產量與投入時間／token 分開：短時間完成有效成果仍能立即收成；只是土地可能尚未完成開墾。羊皮卷提供遊戲內的加速選擇，但不影響真實工作能否繼續。
 
 ## 4. 地圖規則
 
 | 項目 | 規則 |
 |---|---|
-| 座標 | 邏輯座標 `(x, y)` 是無限平面，只畫出看得到的部分；投影與邏輯分開，之後要換等角或六角，只換投影與點擊判定 |
+| 座標 | 邏輯座標 `(x, y)` 是無限平面，只畫出看得到的部分；投影與邏輯分開 |
 | 相鄰 | 只算上下左右 4 格 |
-| 初始狀態 | 中心 `(0,0)` 是城鎮中心；上下左右 4 格可以開墾，其餘蓋迷霧 |
-| 舊 repo | 開城時已經有 HEAD 的 repo，中心改用固定的「舊城區」圖，不依規模變化，也不回推歷史 |
-| 揭開 | **結案時**（變成已開墾空地的那一刻），曼哈頓距離 1 以內的格子變成可開墾；蓋房不會揭開；已經揭開或已經佔用的格子不變 |
-| 點擊 | 以地面格子為準，屋頂只是裝飾（`on_click` 綁在格子上） |
-| 導覽 | MVP 只用原生雙軸捲動（`overflow_scroll`）；拖曳和縮放延後 |
-| 非 git space | 沒有地圖；工單仍可結案、保存成果，但不給地圖獎勵 |
+| 初始狀態 | 中心 `(0,0)` 是城鎮中心；新遠征以 BFS 選最近的未佔用格，同距離固定依北、東、南、西排序 |
+| 預留 | 預留格可以位於迷霧中，顯示遠征標記；預留不揭開鄰格，也不算正式領土 |
+| 揭開 | 遠征格達 100 點時完成開墾，曼哈頓距離 1 以內的格子變成可見；既有格不變 |
+| 舊 repo | 開城時已經有 HEAD 的 repo，中心使用固定「舊城區」圖，不回推歷史 |
+| 點擊 | 以地面格子為準，屋頂只是裝飾；點格子可看進度、收成、投入與建築 |
+| 導覽 | MVP 只用原生雙軸捲動；拖曳和縮放延後 |
+| 非 git cwd | 不建立 city 或遠征格；adapter 可以保留 session 狀態，但不納入地圖 |
 
 ## 5. 狀態機
 
-### 5.1 格子與工單的對應
+### 5.1 遠征格
 
-| 格子狀態 | 工單狀態 | 離開條件 |
+| 格子狀態 | session 狀態 | 行為 |
 |---|---|---|
-| 迷霧 | 無 | 被揭開 → 可開墾 |
-| 可開墾 | 無 | 點擊 → 啟動中（先預留這一格） |
-| 啟動中 | pending：已建立，尚未綁定 session | 綁定成功 → 探索中；失敗或取消 → 釋放這一格 |
-| 探索中 | 施工中 / 暫停 / 失聯 | 開始結案 → 結案確認中；放棄 → 釋放這一格 |
-| 結案確認中 | 已凍結結案快照，尚未提交 | 確認 → 已開墾空地；取消 → 回到施工中，不給任何東西 |
-| 已開墾空地 | 至少有一張已結案工單 | 花一份建材蓋房 → 已建；開關聯工單 → 續作中 |
-| 已建 | 至少有一張已結案工單 | 開關聯工單 → 續作中 |
-| 續作中 | 有一張進行中的關聯工單 | 結案 → 歷程 +1、建材 +1，回到原本的狀態（空地或已建）；放棄 → 回到原本的狀態 |
+| 預留 | 第一次發現 `(cityId, rootSessionId)` | 自動配置最近空格，記錄 baseline 與首次觀測時間 |
+| 探索中 | root 或可歸戶 subagent 有 active interval | active interval 聯集每滿一分鐘 +1 點；顯示目前 provider |
+| 駐紮 | root session idle、關閉或移到其他 city | 保留格子與進度；`/resume` 後繼續，不自動撤回 |
+| 可收成 | 有尚未認領的成果候選 | 可以在未滿 100 點時收成；收成不會自動完成土地 |
+| 已開墾空地 | 開墾點 ≥100 | 揭開鄰格；可以蓋房；session 之後仍可 resume 與再次收成 |
+| 已建 | 已支付完整建築配方 | 建築保留；後續收成加入同一格歷程 |
+| 已撤回 | 使用者手動放棄、尚未開墾且從未收成 | 釋放座標、封存這一代遠征；不退回已用羊皮卷，也不再吸收後續活動 |
 
 ### 5.2 不變量
 
-- 每一格最多只有一張還沒結束的工單；同一個 session 不能同時綁兩張工單。
-- agent 的 `working / blocked / done / idle` 只拿來顯示，**不會自動結案**（`done` 只是「完成了但你還沒看」）。
-- 放棄的工單照樣保存已經發生的費用，但不算進成果產值。
-- 「歷程次數」只算成功結案的工單，不帶來任何加成。
-- 已經結案的成果快照不能再改：之後的 commit 不會讓它重新分類，修改規則表也不會回頭改既有建築。
-- 一格的歷程只包含**在這一格施工過的工單**。建材只是庫存數字，不追蹤來源。
-- 地面外觀依這一格**第一張工單的成果類型**呈現（§14），所以就算蓋上別種建築，看得出這塊地原本是怎麼開墾出來的。
+- 同一座城的 `(cityId, rootSessionId)` 同時最多一格；`/resume` 回到目前這一代遠征。
+- subagent 只有在 adapter 能提供 parent 關係時才併入 root；不為 subagent 建格。無法分辨 child 的 adapter 只能輸出 top-level session。
+- 同一 root session `/move` 到另一座城時，舊格變成駐紮；新 `(cityId, rootSessionId)` 建立或恢復另一格。移回舊城時繼續舊格。
+- session 沒有自動「完成」狀態；成果可以多次收成，每次只處理未認領的 claim key。
+- 格子達 100 點只完成開墾，不自動產生資源；資源只來自驗收成果。
+- active time 使用 root 與可觀測 subagent interval 的**聯集**，不把平行 agent 的分鐘相加。
+- provider token／費用不產生木材、石材或鐵料。
+- 只有「未開墾且從未收成」的格子能撤回。撤回後 resume 保持忽略；手動重新派遣會建立 `generation + 1`，自然點與加速點歸零，以當下 usage 游標與 checkout baseline 重新開始。忽略期間的時間、用量與成果不回補。
 
-## 6. 派工與 session 綁定
+## 6. Session 遠征與 adapter
 
-### 6.1 派工流程
+### 6.1 共同 adapter 格式
 
-1. 點擊可開墾的格子，先寫入一張 **pending 工單**，預留這一格。
-2. 執行 `run("tab.new", {space, folder: <城的 checkout 路徑>, name: "開墾-<工單ID>", argv: ["env", "HERDR_RECLAIM_ORDER=<工單ID>", "omp"], focus: false})`。
-   - 一定要帶 `folder`：新 tab 預設會跟著目前 focus 的 pane 的目錄，可能已經切到別的 repo（技術 R2 F3；S1 實測 space 的 `folder` 指向別的 repo）。
-   - `cityId` 是 git common dir，代表城的身份；`folder` 是實際的 checkout，兩者分開存。
-3. `run()` 回傳 `null`，所以靠 extension 回報綁定（S1 驗證過）：
-   - extension 從環境變數讀到工單 ID，寫進 `terminals/<terminal>.json`。
-   - mod 找到帶有這個工單 ID、而且更新時間晚於工單建立時間的對應檔，存下 terminal 位址與 session ID。tab 名稱只當顯示用。
-   - 同一個 terminal 之後 `/new` 出來的 session 也帶同一個工單 ID，所以只綁**第一個**。
-4. 綁定逾時就顯示失敗並釋放格子。連點同一格只會建立一張工單。
+每個 adapter 最少輸出：
 
-### 6.2 omp extension 的對應檔
+```ts
+interface HerdrActivity {
+  cli: "omp" | "codex" | "claude";
+  sessionId: string;
+  parentSessionId?: string;
+  visits: Array<{
+    visitId: string;
+    seq: number;
+    cwd: string;
+    startedAt: number;
+    endedAt?: number;
+    activeStartedAt?: number;
+    lastHeartbeatAt?: number;
+    activeIntervals: Array<{ start: number; end?: number }>;
+    usageAtStart?: Record<string, Usage>;
+    usageCurrent?: Record<string, Usage>;
+  }>;
+  ackedThroughSeq: number;
+  updatedAt: number;
+}
+```
 
-- 新寫一個 extension，不沿用內建的 `herdr-omp-agent-state.ts`：內建的只在 `HERDR_ENV`、`HERDR_PANE_ID` 存在時啟用，而且是經由 socket 回報；herdr-app 裡實際可用的環境變數是 `HC_TERMINAL_ID`。
-- 在 `session_start`、`session_switch`、`agent_start` 時寫出 `{terminal, sessionId, generation, updatedAt}`，並保留內建版排除 nested omp 的邏輯。
-- **以 session ID 為主鍵，不依賴路徑。**
-  - `/move` 不會觸發 `session_switch`（技術 R2 F1），所以路徑可能失效。
-  - session 檔名本身就含 session ID（`<時間戳>_<id>.jsonl`），路徑失效時可以用 ID 重新找到檔案。
-- 綁定建立後，工單就固定綁這個 session ID。`/resume` 換成別的 session 時，新 session 的費用不算到這張工單。
+- `sessionId` 必須能在 resume 後維持相同；只有 top-level session 會建立遠征格。
+- 每次 cwd 改變都結束舊 visit 並新增一筆，即使新舊 cwd 屬於同一 city；mod 再以 canonical git common dir 決定各 visit 的 city。
+- 每筆 visit 保存 cwd、interval 與累計 usage 的起訖快照，因此 herdr 關閉期間多次 `/move` 仍可重播分界。
+- `parentSessionId` 存在時，activity 併入 root；adapter 無法提供 parent 關係時，不得把可能的 child 當成獨立 top-level session 輸出。
+- `usageCurrent` 是可選能力；缺少時顯示未知。
+- adapter 只能在 mod 以 CAS 保存 visit、interval 與 usage 後提高 `ackedThroughSeq`；之後才可刪除已確認的原始事件。city ledger 保留合併後 interval，避免 late child 重疊造成重算錯誤。
 
-### 6.3 未分配探險隊
+### 6.2 OMP 事件
 
-| 項目 | 規則 |
+- `session_start`、`session_switch`：建立或切換 session 身份；只有 `hasUI: true` 的 root 自動建格。
+- `agent_start`：若 cwd 與上一筆不同，先以當下累計 usage 結束舊 visit，再以相同值建立新 visit；接著寫入 `activeStartedAt` 與第一個 heartbeat。
+- agent active 時每分鐘更新 `lastHeartbeatAt`，避免程序在長回合中崩潰而遺失整段時間。
+- `agent_end`：以最後 heartbeat／結束時間封閉 interval 並更新 `usageCurrent`。
+- `turn_end`、`session_shutdown`：刷新完整用量與最後狀態；未正常封閉的 interval 最多只算到最後 heartbeat。
+- herdr 是否開啟不影響 extension 累積；mod 重開後依 visit seq 重播，不能只讀最後 cwd。
+- OMP 參考實作會使用 `hasUI`、`getSessionId()`、`getCwd()`、`getEntries()`、`getHeader().parentSession` 等專用介面；其他 CLI 不能假定具備同等資料。
+
+### 6.3 `/new`、`/resume`、worktree 與 `/move`
+
+- `/new`：新的 root session ID，在目前 city 自動預留另一格。
+- `/resume`：相同 root session ID；在目前 city 恢復目前 generation。已撤回的配對保持忽略，除非使用者手動重新派遣。
+- worktree：實際 checkout 路徑不同，但 canonical git common dir 相同，所以仍是同一座城；cwd 改變仍建立新 visit 與獨立 checkout baseline。
+- `/move`：不要求指令本身發事件；下一個 `agent_start` 以新 cwd 建立 visit。移動發生於 agent idle 時，usage 起訖快照把下一輪完整歸到新 visit。
+- 從 herdr 外直接啟動的支援 CLI session 也會自動出現在城裡，不需要先從地圖派工。
+- 手寫程式與沒有 adapter 的 shell 明確排除；不以檔案監聽猜測 session。
+
+## 7. 收成卡
+
+session 不需要結案。每次有新成果時，城主可以建立一筆不可變的收成快照。
+
+### 7.1 截點與成果候選
+
+- 每一代遠征依 checkout 保存獨立 baseline：首次遇到該 checkout 時記錄 realpath、HEAD（或沒有 HEAD）與逐路徑 blob／缺席狀態。
+- 切換到同 repo 的另一個 worktree 只建立新 visit，不覆蓋舊 checkout baseline；未收成果仍留在原 checkout 的候選清單。
+- 收成卡按 checkout 分組，列出各自 baseline 後的 commit、staged、unstaged、untracked、deleted 成果。
+- 收成後只把**已勾選路徑**的 baseline 推進到當下 blob／缺席狀態；未勾選路徑維持原 baseline，避免其他 session 的變更被吃掉。
+- 同一 checkout 有多個 session 時，候選可能混在一起；城主勾選真正屬於這格的成果，不按時間範圍自動歸屬。
+- agent 還在 active 時可以收成，但必須確認；截點使用完整事件游標與當下成果內容。
+- 已被同一座城其他格認領的 claim key 只能連結歷程，不能再次發資源。
+
+### 7.2 一般成果
+
+- 依 §8 規則把每一項勾選成果分類；混合成果可以同時取得多種資源。
+- 收成卡顯示資源向量，例如 `{木材: 10, 石材: 20, 鐵料: 0, 羊皮卷: 1}`。
+- 代表成果類型只決定地面外觀：預設取產量最高的類型，同分依分類優先序；城主可以覆寫。
+- 收成不要求土地已滿 100 點，也不改變 active time。
+
+### 7.3 無檔案變更的研究
+
+- 必須保存可回看的研究成果，例如結論、比較、決策或附摘要的連結；空白不能收成。
+- 只計算這個 visit 在**前一次任何收成**之後尚未結算的 `input + output` token；cache read／write 不算，程式成果期間的用量不能留到之後改報研究。
+- 暫定每累積 100,000 合格 token 產生羊皮卷 ×1，不足部分留在該 city 的研究計量器；這是投入指標，不代表研究品質。
+- 讀取失敗不能冒充研究；用量未知的 adapter 只能保存研究歷程，不能自動換算羊皮卷。
+
+### 7.4 原子提交
+
+- 一次 CAS 提交：收成快照、claim key、逐 checkout／逐路徑 baseline 更新、分類與規則版本、資源向量、代表成果類型、usage 結算游標、派系投資、研究 token 餘額。
+- operation ID 防同一次提交重送；claim key 防同一成果重複收成。
+
+### 7.5 蓋房與加速
+
+- 蓋房：只列出庫存符合完整配方的建築；一次扣除木材、石材與鐵料，保存配方版本與實付向量。
+- 加速：同一座城的羊皮卷可以用在任一未滿 100 點的遠征格；暫定每卷 +10 點，一次 CAS 扣卷並增加點數。
+- active time 與羊皮卷點數分開保存，回看時能看出自然投入與加速投入。
+- 土地達 100 點後不再接受羊皮卷；溢出點數不退回，也不帶到下一格。
+
+## 8. 分類、資源與建築
+
+### 8.1 試玩基準
+
+以下數值只供試玩，不代表難度或品質；規則表可版本化調整。
+
+| 成果類型 | 判定（repo 相對路徑，大小寫不分） | 每個成果單位 | 地面外觀 |
+|---|---|---:|---|
+| 測試 | `**/tests/**`、`**/__tests__/**`、`**/test_*`、`**/*_test.*`、`**/*.spec.*`、`**/*.test.*` | 石材 ×10 | 採石地 |
+| 文件 | `**/*.md`、`**/*.rst`、`**/docs/**` | 羊皮卷 ×1 | 抄寫地 |
+| 設定 | `**/*.json`、`**/*.yml`、`**/*.yaml`、`**/*.toml`、`**/.*` | 鐵料 ×5 | 礦地 |
+| 程式 | 不符合以上任何一項 | 木材 ×10 | 伐木地 |
+| 研究 | 經驗收且沒有檔案成果 | 每 100,000 未結算非 cache token 給羊皮卷 ×1 | 勘查地 |
+| 其他 | 城主手動分類 | 由城主指定 | 一般空地 |
+
+例如修改 1 個程式檔、新增 2 個測試檔、新增 1 份文件，預覽為 `{木材: 10, 石材: 20, 鐵料: 0, 羊皮卷: 1}`。
+
+| 建築 | 暫定配方 |
 |---|---|
-| 範圍 | 本機上、第一次被看到時就在這座城的 checkout 裡、還沒綁定工單的**主** session |
-| 排除 | subagent、其他城的 session、已經處理過的 session；不自動匯入歷史檔 |
-| 持久性 | 以 session ID 追蹤；terminal 關掉，紀錄還在 |
-| 可做的處理 | 結案並放到某一格、「稍後布置」、「不納入城鎮」。任何一種都不用假結案 |
+| 工坊 | 木材 ×30、鐵料 ×5 |
+| 城牆 | 石材 ×40 |
+| 圖書館 | 木材 ×20、石材 ×20、鐵料 ×5 |
+| 倉庫 | 木材 ×20、石材 ×20、鐵料 ×10 |
+| 民居 | 木材 ×20、石材 ×10 |
 
-## 7. 結案卡
+羊皮卷不參與任何建築配方，只用來加速開墾。
 
-一張卡片完成所有步驟：
+### 8.2 計算與防重複
 
-### 7.1 截點
+- **分類優先序**：測試 > 文件 > 設定 > 程式。每個成果路徑只歸一類，例如 `tests/README.md` 算測試。
+- **成果單位**：一個勾選的不重複路徑算一單位；新增、修改、刪除都可計入。內容未變的 rename 不發資源。
+- **不計入**：預設排除 generated、vendor、依賴目錄與 lockfile；覆寫時要留在快照。
+- **claim key**：檔案成果以 `cityId + path + baseline blob + result blob` 識別；研究成果以 `cityId + normalized content + sorted links` 雜湊識別。
+- **邊界**：檔案數只能衡量成果範圍，不能判斷難度、品質或商業價值；最後仍由城主驗收。
+- **規則版本**：成果權重、研究匯率、羊皮卷加速值與建築配方都有版本號，操作時使用的版本存進快照。
 
-- agent 還在跑時顯示警告，確認後才能繼續。
-- 截點是**各來源已讀到的完整事件游標**，不是牆上時鐘的時間。
-- 截點之後產生的費用不會改動這張工單，而是記為「未分配」，之後可以追查。
+## 9. 行會、額度與派系風格
 
-### 7.2 成果候選
+- **真實人力**：只顯示 provider 或 CLI 明確回報的額度、重置週期與更新時間；拿不到或過期時顯示未知。
+- 累計 token、API 等值與剩餘額度不能互相推算；額度提示不由 mod 另行封鎖派工。
+- **投資**：每格只計該 `(cityId, rootSessionId)` visit 內的 provider 用量，包含可歸戶的 subagent。
+  - 費用全部已知時，用 API 等值比較。
+  - 有費用未知時，改用不含 cache 的 `input + output` token。
+- **風格**：累積投資最多的 provider 決定建築派系；同分取 root session provider，完全未知時用無派系。
+- 派系不影響開墾點、成果資源、研究匯率或建築配方。
 
-- 開工時記錄：checkout 路徑、HEAD（或「沒有 HEAD」）、當時已有的未 commit 變更。
-- 結案時列出：
-  - 基準之後的 commit
-  - staged、unstaged、untracked 檔案（扣掉開工時就已存在的那些）
-- **城主勾選哪些屬於這張工單。** 同一個 repo 同時有別的工單時，候選清單會混在一起，不用時間範圍自動歸屬。
-- 清單是空的時，要分兩種情況：
-  - 你確認這次沒有改程式 → 可以走研究型
-  - 讀取失敗 → 顯示錯誤，**不能冒充成研究**
+## 10. 投入、用量與造價
 
-### 7.3 研究型工單
+- **自然投入**：adapter 的 active interval 聯集換算成分鐘；每滿一分鐘 +1 開墾點，未滿一分鐘的毫秒餘額保留。
+- **加速投入**：羊皮卷另記 `boostPoints`；總開墾點 = `floor(activeMs / 60_000) + boostPoints`。
+- **用量**：各 provider token 與 API 等值按 visit 累計；subagent 以 parent 關係歸戶，不重複加入 task 彙總。
+- **造價**：格子的造價顯示已知 API 等值、未知部分、active time 與已消耗羊皮卷；不把它們換算成成果價值。
+- **本月統計**：依收成月份、Asia/Taipei 計算「本月已驗收 API 等值 ÷ 月費」；無月費或未知成本時明示限制。
 
-- 必須填結論，空白不能提交；也可以附上連結。
-- 給一份羊皮卷，可以拿來蓋圖書館。那一格的地面是「勘查地」，可以續作，也有造價。
+## 11. 資源與羊皮卷
 
-### 7.4 分類與建材類型
-
-- 依 §8 的規則表算出成果類型，只列分數大於 0 的，最多 3 個，再固定加一個「其他」。
-- 城主一定要親自選一個。混合型的工單也只給**一份**建材，不按比例拆成好幾份。
-- 選「其他」時，由城主指定給哪一種建材。
-
-### 7.5 提交
-
-- 一次提交以下所有東西，一起成功或一起失敗：工單終態、成果快照、分類結果、規則版本、建材 +1、格子變成已開墾空地、揭開的範圍、計費游標與金額。
-- 未分配探險隊結案時，要先選一塊可開墾的格子當它的空地；選「不納入城鎮」就沒有空地，也沒有建材。
-
-### 7.6 蓋房（獨立動作）
-
-- 點一塊已開墾空地 → 只列出庫存夠的建築 → 選定後扣一份建材。
-- 一次提交：建材 −1、格子變成已建、建築類型、派系風格。
-- 庫存是零時，蓋房按鈕停用，並提示「可以先去開墾」。
-
-## 8. 分類規則與建築對照
-
-### 8.1 成果類型、建材與建築
-
-| 成果類型 | 判定（路徑 glob，大小寫不分，比對 repo 相對路徑） | 建材 | 地面外觀 |
-|---|---|---|---|
-| 測試 | `**/tests/**`、`**/__tests__/**`、`**/test_*`、`**/*_test.*`、`**/*.spec.*`、`**/*.test.*` | 石材 | 採石地 |
-| 文件 | `**/*.md`、`**/*.rst`、`**/docs/**` | 羊皮卷 | 抄寫地 |
-| 設定 | `**/*.json`、`**/*.yml`、`**/*.yaml`、`**/*.toml`、`**/.*` | 鐵料 | 礦地 |
-| 程式 | 不符合以上任何一項 | 木材 | 伐木地 |
-| 研究 | 城主確認沒有程式變更，並填寫結論 | 羊皮卷 | 勘查地 |
-| 其他 | 城主手動選 | 城主指定 | 一般空地 |
-
-| 建築 | 需要的建材 |
+| 情況 | 變化 |
 |---|---|
-| 工坊 | 木材 ×1 |
-| 城牆 | 石材 ×1 |
-| 圖書館 | 羊皮卷 ×1 |
-| 倉庫 | 鐵料 ×1 |
-| 民居 | 任何一種 ×1（萬用建築，避免為了湊稀有建材刻意開某類工單） |
-
-### 8.2 計算規則
-
-- **優先序**：測試 > 文件 > 設定 > 程式。每個檔案只歸一類，例如 `tests/README.md` 算測試、`docs/config.json` 算文件。
-- **分數**：該類在勾選檔案中所佔的比例，以不重複的路徑計算。
-- **rename**：以新路徑為準；**刪除的檔案**也照樣計入。
-- **同分**：依上面的優先序排列。
-- **規則表**：可以編輯，有版本號；分類時用的版本會存進成果快照。
-
-## 9. 派系風格（行會的位置）
-
-- **投資**：一張工單裡，各 provider 的投入。
-  - 費用全部已知時，用 API 等值計算。
-  - 只要有一個費用未知，例如 Databricks 的 cost 是 0，就一律改用「不含 cache 的輸入 + 輸出 token」比較。
-  - subagent 也算進去。
-- **風格**：一棟建築的派系風格，取**這一格**所有工單的累積投資最多的 provider，與蓋房時花的建材是從哪裡來的無關。續作讓另一個 provider 超過時，會顯示「改建」，風格跟著換。
-- **同分**：取主 session 的 provider。
-- **完全不影響**揭開範圍、建材或任何規則，所以不會讓你為了遊戲改選 model。
-- **美術**：每種建築 × 每個派系各一張圖，另外準備一套「無派系」風格，給無法判定的情況用。
-
-## 10. 產值（API 等值）
-
-- **來源**（S2 驗證過）：omp extension 在 `turn_end`、`agent_end` 等時機，從記憶體中的 `sessionManager.getEntries()` 依 provider 累加用量，寫出 `sessions/<sessionId>.json`。
-  - 只算 assistant 的 `message.usage` 和 `model_usage` 兩種事件，不加總 task 的彙總。
-  - subagent 也會載入 extension，自己寫摘要，用 `rootSessionId` 歸到主 session。
-  - 不需要解析 session 檔，所以 `readTextFile` 1 MiB、`exec` 8 MiB 的上限都不成問題。
-  - 工單的區間增量 = 截點時的累計 − 綁定時的累計（以 provider 為單位）。
-- **造價**
-  - 一棟建築的造價 = 這一格所有已結案工單的**區間增量**總和。
-  - 續作只計新增的區間，不重算整個 session。
-  - 已知金額和未知部分分開存；有未知時只顯示「已知部分」。
-- **本月統計**
-  - 依結案月份，時區固定為 Asia/Taipei，標示為「本月已驗收 API 等值 ÷ 月費」。
-  - 沒有填月費，或月費 ≤ 0 時，顯示「無法計算」。
-  - 放在次要統計，不當成就指標：重試越多、用越貴的 model，這個數字就越高。
-
-## 11. 建材（有類型）
-
-| 情況 | 建材變化 |
-|---|---|
-| 一般工單或續作結案 | 依成果類型 +1 |
-| 蓋房 | 依建築 −1 |
-| 未分配探險隊選「不納入城鎮」 | 0 |
-| 取消結案、放棄 | 0 |
-| 重複操作 | 不重複收支 |
+| 一般成果收成 | 依未認領成果分類，加入木材、石材、鐵料與文件羊皮卷 |
+| 無檔案研究收成 | 驗收結論後，依未結算非 cache token 加入羊皮卷並保留餘額 |
+| 蓋房 | 依配方扣除木材、石材、鐵料 |
+| 加速土地 | 每卷羊皮卷暫定 +10 點 |
+| 沒有成果、取消收成 | 0 |
+| 重複 claim key 或 operation ID | 不重複收支 |
 
 **限制**
 
-- 一張工單只給一份，與 diff 大小、token、行數無關。
-- 一定有萬用建築（民居），手上有什麼都能蓋。
-- 沒有匯率、沒有被動產出、沒有庫存上限；**開墾永遠免費**，不會擋到任何真實工作。
-- 建材就是各類型的計數，不記錄來源、也不追蹤用在哪裡；去重靠 operation ID（§13）。
-- **試玩要觀察**：會不會為了蓋圖書館、倉庫，刻意多開研究或設定類的工單（§17.2）。
+- 木材、石材、鐵料只依成果，不依 token、時間、session 數或 model。
+- 羊皮卷是可消耗的加速資源，不是建築材料；文件直接產生，研究則按低比例 token 產生。
+- 研究 token 必須附在經驗收的結論上，單純讓 agent 空轉不會自動入庫。
+- 沒有被動產出、沒有匯率、沒有庫存上限；所有匯率都是可版本化的試玩參數。
+- MVP 不做機率掉落。每累積 1,000,000 token 觸發特殊道具或 treasure roll 列為後續候選，避免第一版增加不可重現的隨機狀態。
 
 ## 12. 回看
 
-點任何一棟建築，打開歷程面板：
+點任何遠征格或建築，打開歷程面板：
 
-- 每一張工單的目標、結論、勾選的成果檔案與 commit
-- 分類與規則版本
-- 截點、造價（已知 / 未知）
-- 地面的成果類型；有蓋房的話，蓋了什麼建築、花了哪一種建材
-- 派系投資比例
+- CLI、session ID、各 city visit 與實際 checkout／worktree
+- active interval、自然點數、羊皮卷加速點數與目前開墾進度
+- 每次收成的結論、成果檔案、commit、claim key、資源向量與規則版本
+- provider 投資比例、API 等值與可取得時的額度快照
+- `/new`、`/resume`、`/move`、駐紮與手動撤回事件
+- 建築類型、配方版本、實付資源與落成時間
 
 這是本提案和其他 layout 的主要差別，必須在 MVP 裡做到。
 
@@ -280,48 +305,56 @@ flowchart LR
 
 ### 13.1 檔案與寫入
 
-- 每座城一份小 ledger，放在 `appHome()/data/<mod>/cities/<cityId-hash>.json`。
-- 不存原始 transcript，避免檔案超過 1 MiB 讀不回來。
-- 每次操作都整份檔案用 `writeTextFile(path, text, expected)` 做 CAS 提交（技術 R1 F5、R2 存檔）。發生衝突時：重讀 → 重新檢查前提 → 套用同一個 operation ID。
+- 每座城一份 ledger，放在 `appHome()/data/<mod>/cities/<cityId-hash>.json`。
+- adapter state 另放共用狀態目錄；不存原始 transcript。
+- mod 對 ledger 的每次操作都用 `writeTextFile(path, text, expected)` 做 CAS；衝突時重讀、重查前提，再以同一 operation ID 套用。
 
 ### 13.2 欄位
 
 | 層級 | 欄位 |
 |---|---|
-| 城 | `schemaVersion`、`rulesVersion`、`cityId`、checkout 路徑、格型、相鄰規則、時區、月費 |
-| 格子 | 座標、狀態、地面成果類型、建築類型、派系、已結案工單 ID 清單、進行中的工單 ID |
-| 建材庫存 | 各類型的數量：木材、石材、羊皮卷、鐵料 |
-| 工單 | ID、格子 ID、關聯工單 ID、狀態、session ID、terminal 位址、tab ID、checkout、基準（HEAD 與 dirty baseline）、計費游標 |
-| 結案快照 | 勾選的成果、結論、分類與規則版本、所選成果類型（給出的建材類型）、截點、已知金額與未知部分、派系投資、結案時間 |
-| 未分配紀錄 | session ID、首次觀測時間、所屬的城、處理狀態 |
-| 已處理 operation ID | 用來去重 |
+| 城 | `schemaVersion`、`rulesVersion`、`cityId`、已知 checkout、格型、相鄰規則、時區、月費、研究 token 餘額 |
+| 遠征格 | 座標、`rootSessionId`、generation、狀態、首次觀測、忽略／重新派遣狀態、自然 active ms、毫秒餘額、加速點數、合併後 interval、代表成果類型、建築與收成 ID |
+| checkout baseline | generation、checkout realpath、HEAD、逐路徑 baseline blob／缺席狀態、最後收成游標 |
+| visit | visit ID、seq、`cityId`、`rootSessionId`、generation、CLI、cwd、開始／停止、usage 起訖快照、adapter ack 狀態 |
+| adapter activity | session ID、parent session、visit seq、cwd、active start、last heartbeat、待處理 interval、usage 累計、`ackedThroughSeq` |
+| 收成快照 | operation ID、成果、claim key、結論、分類與規則版本、資源向量、逐路徑 baseline 更新、usage 結算游標、研究 token 結算、代表類型、派系投資、收成時間 |
+| 資源庫存 | 木材、石材、鐵料、羊皮卷 |
+| 加速快照 | operation ID、格子 ID、generation、羊皮卷數量、每卷點數、規則版本、套用時間 |
+| 蓋房快照 | operation ID、格子 ID、建築、派系、配方版本、實付資源、落成時間 |
+| 額度快照 | provider、原始回報、重置週期、擷取時間 |
+| 已處理 operation ID | 用來去重提交 |
+
+合併後 interval 是 active time 的正本；`naturalActiveMs` 與毫秒餘額由它計算並一併保存。adapter 只有在 ledger CAS 成功且 ack 已持久化後才能 compact 原始 interval。
 
 ## 14. 美術（mock 主題包）
 
 | 素材 | 數量 |
 |---|---|
-| 地形：草地、迷霧、可開墾標記 | 3 |
+| 地形：草地、迷霧、預留標記 | 3 |
 | 城鎮中心、舊城區 | 2 |
-| 已開墾空地：伐木地、採石地、抄寫地、礦地、勘查地、一般空地 | 6 |
+| 地面：伐木地、採石地、抄寫地、礦地、勘查地、一般空地 | 6 |
 | 建築：5 種 × 4 套派系風格（Anthropic、OpenAI、Google、無派系） | 20 |
-| 建材圖示：木材、石材、羊皮卷、鐵料 | 4 |
-| 探索中標記、結案確認中標記 | 2 |
-| **合計** | **約 37 張** |
+| 資源圖示：木材、石材、鐵料、羊皮卷 | 4 |
+| 遠征狀態：探索中、駐紮、可收成、已撤回 | 4 |
+| **合計** | **約 39 張** |
 
 - 透明背景、固定寬度，建築可以往上超出格子。
-- 素材放在 `mods/<mod>/themes/<name>/`；存檔就會自動重載（`AGENTS.md:903-906`）。
-- 全部是靜態圖，沒有動畫 timer。
+- 素材放在 `mods/<mod>/themes/<name>/`，使用靜態圖；進度變化由原生元件呈現，不需要動畫 timer。
 
 ## 15. 先行技術驗證
 
-正式開工前先做以下四項，任何一項不通過就先修改提案：
+正式實作前先做以下七項；S1、S2 已完成，其餘任一不通過就先修改提案。
 
 | # | 驗證什麼 | 最小做法 | 通過條件 |
 |---|---|---|---|
-| S1 | 派工與 session 綁定 | 只做文字狀態面板 + extension | 帶 `folder` 開出 omp；拿到唯一的 terminal 與 session ID；tab 改名不會斷開綁定；`/resume` 不會串帳；`/move` 後立刻結案仍能找到正確的 session 檔。**✅ 2026-11-19 通過**（§15.1） |
-| S2 | 用量紀錄 | extension 寫用量 + 拿既有的大檔對帳 | 和直接解析主檔加子檔的結果一致；兩種事件各只計一次；確認 extension 收不收得到 subagent 的用量。**✅ 2026-11-19 通過**；大型 session resume 的效能未測（§15.1） |
-| S3 | 成果候選與 CAS | 唯讀 git helper；兩個畫面同時操作同一份測試 ledger | 同一個 checkout 有 committed、未 commit、多張工單並行的變更時，候選清單正確；兩個畫面同時結案只會入帳一次；寫到一半重啟後狀態一致 |
-| S4 | 地圖 | 先做 3×3 高矮交錯的 mock 建築，再做 300 格 | 溢出的圖片不會攔錯點擊；捲動與狀態更新的延遲記錄下來，和空白 mod 比較（門檻在開工前固定） |
+| S1 | terminal 與 session 對應 | 文字狀態面板 + OMP extension | 唯一 session ID、tab 改名不斷線、`/new`／`/resume` 可分辨、`/move` 後仍能定位。**✅ 2026-11-19 通過** |
+| S2 | OMP 用量紀錄 | extension 摘要與 session 檔對帳 | assistant／model_usage／subagent 不重複，逐 provider 一致。**✅ 2026-11-19 通過**；大型 session 效能未測 |
+| S3 | 成果候選、claim key 與 CAS | 多 session、多 worktree、兩個 mod 畫面 | checkout baseline 與候選正確；相同成果、收成、加速、蓋房各只生效一次；重啟後一致 |
+| S4 | 地圖 | 300 格與高矮 mock 建築 | 自動 BFS（北東南西）選地穩定、圖片不攔錯點擊、更新與捲動延遲符合開工前門檻 |
+| S5 | provider 額度 | 取得一次原始額度資訊 | 保存原始值、週期與時間；拿不到時顯示未知，不由 token 反推 |
+| S6 | 事件驅動投入 | OMP heartbeat、平行 subagent、herdr 關閉期間跨兩個 repo move、compact 後 late child | visit 可重播；平行 interval 取聯集；毫秒餘額不丟；move 不混帳；compact 不重算 |
+| S7 | Codex／Claude adapter | 各做最小 adapter spike | 至少取得穩定 top-level session ID、cwd、active／idle；缺少 usage 時能降級；無法分辨 child 時不得產生額外遠征格 |
 
 ### 15.1 S1、S2 結果（2026-11-19）
 
@@ -346,111 +379,113 @@ flowchart LR
 | 對帳 | ✅ | `s2-reconcile` 對三個 session 家族逐 provider 比對 token、cost、筆數，全部一致；包含 assistant 與 `model_usage` 兩種事件，以及 Databricks cost=0 的未知價格標記 |
 | 兩個城鎮畫面同時寫 | ✅（修正後） | 第一版出現 `writeTextFile` stale 錯誤（兩個 bindPending 同時寫）。改成序列化並以 CAS 重試後，兩個畫面都正確；沒有寫入動作的畫面也會從檔案刷新 |
 
-**設計因此修改**
+**S1、S2 對 v6 的影響**
 
-- **派工綁定改用環境變數**：`argv: ["env", "HERDR_RECLAIM_ORDER=<工單ID>", "omp"]`，extension 把工單 ID 寫進對應檔，比用 tab 名稱找 terminal 可靠。
-  - 同一個 terminal 之後 `/new` 開的 session 會繼承同一個工單 ID，所以工單只綁**第一個**回報的 session。
-  - `herdr-app do tab.new` 會回傳 tab 與 terminal，但 mod 內的 `run()` 回傳 `null`，所以 mod 端仍要靠 extension 回報。
-- **用量不解析檔案**：extension 直接讀 omp 記憶體中的 `sessionManager.getEntries()`，原本擔心的大檔與 1 MiB / 8 MiB 上限因此不成問題，也不需要額外的 runtime。
-- **城的 checkout 必須自己記**：`SpaceInfo.folder` 只是新 terminal 的預設位置，實測與 space 名稱指向不同 repo。
-
-**未涵蓋**
-
-- 已經在跑的 omp session 要重開才會載入 extension。
-- 大型 session（數千筆 entry）在每個 turn 重新加總的成本未測。
-- Claude Code、Codex 不在範圍內。
+- `HC_TERMINAL_ID`、session ID、cwd 與用量摘要已證明可由 OMP extension 匯出。
+- `/new` 會切換 session ID，`/resume` 會恢復原 ID；v6 因此直接以新 ID 建格、原 ID 回原格，不再綁工單。
+- `/move` 不觸發事件，但下一次 `agent_start` 會帶新 cwd；S6 必須驗證 visit 分界。
+- subagent 會獨立載入 extension，且 `parentSession` 可歸到 root；v6 對 active interval 取聯集，對用量逐 provider 加總。
+- 用量從 `getEntries()` 取得，不解析大型 transcript；大型 session 每回合重算的效能仍未測。
+- 既有 S1 面板是技術 spike，不代表 v6 最終資料模型。
+- Codex、Claude Code 尚未驗證，不能宣稱與 OMP 等價。
 
 ## 16. MVP 範圍
 
-**包含**：§4–§14 的全部內容。
+**包含**
+
+- OMP adapter、共同 adapter schema，以及 S7 驗證後可行的 Codex／Claude 最小 adapter
+- session 自動選地、resume、move、駐紮與手動撤回
+- 事件驅動 active time、開墾點、羊皮卷加速
+- 多次成果收成、研究收成、資源、建築、派系與回看
+- CAS、operation ID、claim key 與重啟恢復
 
 **排除**
 
-- 建築效果、策略取捨
-- 書記官入口、LLM 分類器
-- 熱點、道路
-- 勞動力與額度、issue / MR
-- 等角與六角、拖曳與縮放、動畫
-- 王國地圖、遠端與 Windows、多 client
+- 手寫程式、沒有 adapter 的 shell
+- 建築效果、策略加成、隨機特殊道具
+- 手動選探索路線、地形差異、道路、熱點
+- issue／MR 自動同步、LLM 分類器
+- 自行估算 provider 剩餘額度，或由 mod 額外封鎖派工
+- 等角／六角、拖曳／縮放、遠端、Windows、多 client
 
 ## 17. 驗收
 
 ### 17.1 功能驗收（交給 QA）
 
-1. **初始化與揭開**
-   - 沒有 HEAD 的 repo：中心 `(0,0)`，只有上下左右 4 格可以開墾。
-   - 有 HEAD 的 repo：顯示固定的舊城區圖。
-   - 重開後座標和類型都不變；非 git space 顯示「沒有地圖」，但工單照樣可以結案。
-2. **派工**
-   - 連點同一格只建立一張工單、開一個 omp tab，而且開在城的 checkout。
-   - 啟動或綁定失敗時看得到，格子會被釋放。
-   - agent 的狀態只影響顯示，不會自動結案。
-   - agent 消失後，工單還在，可以恢復或放棄。
-3. **session 切換**
-   - tab 改名不會斷開綁定。
-   - `/resume` 之後產生的費用不算進原工單。
-   - `/move` 後不再對話、直接結案，仍讀得到正確的來源。
-4. **未分配**
-   - 準備四種 session：同一座城、還沒綁定的主 session；別的 repo 的 session；subagent；歷史 session。
-   - 只有第一種出現在清單上。
-   - 認領之後，不能被其他格或其他城再認領。
-5. **成果、分類與建材**
-   - 同一個 checkout 裡同時有：開工前就存在的 dirty 檔、A 工單未 commit 的變更、B 工單的 commit。A 結案時三者都會列為候選，但只保存城主勾選的那些。
-   - `tests/README.md`、`docs/config.json`、`config.yaml`、`src/main.ts` 依優先序分別給石材、羊皮卷、鐵料、木材。
-   - 混合型工單只給一份建材。
-   - 取消結案時，什麼都不會增加。
-   - 讀取失敗時，不能當成研究結案。
-6. **研究、續作與造價**
-   - 研究的結論空白時不能提交。研究結案後地面是勘查地、給一份羊皮卷，揭開範圍與一般工單相同。
-   - 計費情境：
-     - 首張工單：主 session 費用 2 + subagent 1 → 造價 3
-     - 同一個 session 續作，新增 2 → 歷程 2、造價 5（不是 8），建材再 +1
-   - 結案時 agent 還在跑：截點之後的費用不會改動這張工單。
-   - 月份：10 月開工、11 月結案的工單算 11 月；月費 100、產值 3 → 3%；有費用未知時只顯示已知部分。
-7. **蓋房與派系**
-   - 庫存只有羊皮卷時，空地上只列出圖書館和民居；蓋好後羊皮卷 −1。
-   - 庫存是零時，蓋房停用，但開墾照常可以用。
-   - 在任一已開墾空地蓋房，這一格的歷程仍然只有在這格施工過的工單。
-   - 主 session 投資 Anthropic 2、subagent 投資 OpenAI 3 → 風格為 OpenAI。續作後 Anthropic 累積超過 OpenAI → 顯示改建，風格換成 Anthropic。
-   - 派系不會改變任何數值。
-8. **持久與冪等**
-   - 分別在探索中、結案確認中、結案提交前後、蓋房提交前後重啟，結果要嘛全部套用、要嘛全部沒套用，不會只套用一半。
-   - 同一次結案或蓋房送三次，或同時開兩個城鎮畫面，都只會生效一次。
-   - 點任何一格都能回看完整歷程。
+1. **自動選地與身份**
+   - 空城前三個 root session 依序得到北 `(0,-1)`、東 `(1,0)`、南 `(0,1)`；結果可重現。
+   - `/resume` 回到同一格；`/new` 建新格。
+   - 同 repo 的 worktree 仍屬同一 city，但建立不同 visit 與 baseline；`/move` 到另一 repo 後舊格駐紮、新城建格，移回時恢復舊格。
+2. **事件、離線重播與進度**
+   - root active 5 分鐘得到 5 點；root 與兩個 subagent 平行 5 分鐘仍是 5 點，不是 15。
+   - 關閉 herdr，依序在 repo A 工作、move 到 repo B 工作、再移回 A；重開後各 visit 的 active time 與 usage 正確。
+   - 已合併 90 秒並 compact 後再工作 30 秒，累計為 2 點、毫秒餘額 0；late child 重疊 interval 不重複增加。
+   - heartbeat 前後強制終止 adapter，遺失不超過一個 heartbeat 週期。
+   - 格子 99 點不揭開；再增加 1 點後完成開墾並只揭開正確鄰格。
+3. **駐紮、撤回與重新派遣**
+   - 無成果 session 永遠保留，直到手動撤回。
+   - 有收成或已開墾的格不能撤回；未收成、未開墾格撤回會釋放座標且不退已用羊皮卷。
+   - 撤回期間的時間、用量、成果不回補；重新派遣 generation +1、點數歸零，從當下 usage 與 checkout baseline 開始。
+   - session idle、terminal 關閉都不會自動收成或撤回。
+4. **成果收成與 worktree**
+   - 遠征建立時已有 dirty 檔，重啟後不會把它誤列為新成果。
+   - 同一 session 從 worktree A 移到 B，兩邊未收成果都分組保留；收成 A 的一個路徑不會推進 B 或 A 其他未勾選路徑的 baseline。
+   - 修改一個程式檔、新增兩個測試檔、新增一份文件 → 木材 10、石材 20、羊皮卷 1。
+   - 相同 claim key 在同一座城只能發一次；之後只能連結歷程。
+   - 未滿 100 點仍可收成；收成不增加開墾點。
+   - 同一 session resume 後有新成果，可以建立第二筆收成快照。
+5. **研究與羊皮卷**
+   - 無檔案變更但有非空白研究結論，100,000 個未結算 input＋output token → 羊皮卷 1；cache token 不算。
+   - 60,000 token 收成後餘額保留；下一次再有 40,000 時才得到 1 卷。
+   - 用量未知、讀取失敗或結論空白時不產生研究羊皮卷。
+   - 消耗 3 卷使同城指定格 +30 點；重送 operation ID 不重複扣卷或加點。
+6. **資源、建築與派系**
+   - 圖書館配方不含羊皮卷；羊皮卷不能用來補足任何建築配方。
+   - 庫存只夠一種完整配方時只列該建築；確認後一次扣除。
+   - provider 投資只使用該 city visit 的用量；move 前後不混帳。
+   - 派系不改變資源、開墾點、研究匯率或建築配方。
+7. **adapter 降級**
+   - OMP 有 top-level session、cwd、usage、parent；Codex／Claude 若只有 top-level session、cwd、active 仍可建立格與累積自然點。
+   - 缺少 usage 時顯示未知，不假裝為 0，也不能產生研究羊皮卷。
+   - 無法分辨 child 的 adapter 不得把 child 當新遠征；手寫或無 adapter shell 不出現在城裡。
+8. **持久與回看**
+   - 分別在探索、收成、加速、完成開墾、蓋房提交前後重啟；狀態要嘛全部套用、要嘛全部不套用。
+   - 兩個城鎮畫面同時送出相同操作，只生效一次。
+   - 點格子能回看 session、visit、active interval、自然／加速點、收成、資源、派系與建築。
 
-### 17.2 試玩（另外判定；功能全部通過不代表 MVP 成功）
+### 17.2 試玩
 
-- **期間**：連續 5 個工作日，至少完成 10 張真實工單，涵蓋程式、研究、續作，以及從 terminal 直接開的 session。
-- **記錄**：每次結案多花的時間、略過或不納入的原因、是否主動回來看城鎮、能不能從建築找回正確的成果。
-- **建議門檻**（開工前固定）：
-  - 結案額外時間的中位數 ≤ 30 秒
-  - 至少 3 天主動回看
-  - 所有成果都能追溯
-  - 沒有出現「為了城鎮而拆單、改 model、多開研究單」
-  - 願意下一週繼續用
-- **判讀**：試玩不通過時，結論是「流程可用，但收藏價值不成立」，要先改設計，不要繼續擴充。
+- **期間**：連續 5 個工作日，至少 10 個真實 session，涵蓋 `/new`、`/resume`、`/move`、worktree、subagent、研究與多次收成。
+- **記錄**：自動選地是否符合預期、收成耗時、進度與羊皮卷是否容易理解、是否為了資源而改 model 或刻意消耗 token。
+- **建議門檻**：
+  - 收成額外時間中位數 ≤30 秒
+  - 所有成果可追溯且沒有重複領取
+  - active time 分帳沒有可觀察錯誤
+  - 沒有為了羊皮卷刻意讓 agent 空轉或製造低價值研究
+  - 配方與 100 點門檻不會讓城鎮長期停滯
+  - 至少 3 天主動回看，且願意下一週繼續用
+- **判讀**：功能通過但收藏價值、進度或收成流程不成立時，先改設計，不繼續擴充。
 
 ## 18. 後續候選（MVP 驗證後再排序）
 
-- **策略取捨**：同樣揭開格數，選「往一個方向延伸」或「往兩側展開」，地圖上預先標出地標。
-- **書記官入口**：先討論需求，再用 decide 分類，核准後才派工。
+- **地形與路線**：加入地形差異後，讓使用者手動選擇遠征方向。
+- **特殊快轉道具**：每累積 1,000,000 個合格研究 token 給一次 deterministic milestone 或 treasure roll；若採機率，必須保存 seed、roll 次數與 pity，確保可重現。
+- **書記官入口**：先討論需求，再建立指定 CLI session。
 - **LLM 分類器**：外部命令或 omp `judge`。
-- **熱點提示**：掛在改過該檔案的建築上。
-- **道路**：兩張工單改過同一批檔案時自動連線。
-- **額度資訊**：`omp usage`，例如「錯過的開墾機會」，只顯示、不懲罰。
-- **其他**：issue / MR 接入、王國地圖（machine 與 space）、等角或六角投影、動畫（要附開關）。
+- **熱點與道路**：依共同成果檔案連線。
+- **更多 adapter 與額度來源**：擴充 CLI／provider；只採來源明確的原始資料。
+- **其他**：issue／MR、王國地圖、等角／六角投影、動畫。
 
 ## 19. 審查紀錄
 
 | 輪次 | 判定 | 主要問題 | 處理 |
 |---|---|---|---|
-| R1 設計 | 值得做小型縱切 | 虛構稅收混在真實帳裡；把檔案存在當成品質；修理反而提高熱點；研究交不出成果 | 改成開墾模式；砍掉稅收；研究要有結論 |
-| R1 技術 | blocker | `lsof` 不可靠；大檔超過讀取上限；計費事件有兩種；平台差異 | extension 以 session ID 綁定；記錄用量；只做本機 macOS |
-| R1 規格 | 不完整 | 身份、生命週期、對帳區間、存檔沒定義 | §5、§7、§13 |
-| R2 設計 | 只能驗證收藏 | 建材沒有出口；研究和續作有拆單誘因；缺回看 | 建材改為落成時扣除；研究揭開範圍與一般相同；歷程不給加成；新增 §12 |
-| R2 技術 | incorrect（0.90） | `/move` 不會觸發事件；成果歸屬混雜；派工沒帶 `folder` | §6.1、§6.2、§7.2、§15 |
-| R2 規格 | incorrect（0.96） | 狀態機、揭開規則、分類對照、續作計費、未分配範圍、存檔 | §4、§5、§6.3、§8、§10、§13、§17 |
-| v5.1 使用者 | — | 建材要有類型、限制能蓋什麼；開地和蓋房分開，但一塊地只對應它自己的 session | §1、§3、§5、§7.4–7.6、§8.1、§11、§17 |
+| R1 設計 | 值得做小型縱切 | 虛構稅收、檔案存在當品質、研究無成果 | 改成開墾模式、砍稅收、研究要有結論 |
+| R1 技術／規格 | blocker／不完整 | session 對應、大檔、平台、身份與存檔 | extension、session ID、用量摘要、CAS |
+| R2 設計／技術／規格 | 只能驗證收藏／incorrect | 成果歸屬、`/move`、回看、生命週期 | 補成果快照、狀態機、技術 spike 與驗收 |
+| v5.1 | — | 資源類型、開地與蓋房分離 | 多類資源與建築配方 |
+| v5.2 | 待收斂流程 | session／terminal／worktree／手寫歸屬 | 拆分身份，保留成果帳本 |
+| v6 使用者 | 待 S3–S7 | 新 session 自動探索；resume／move 依 city-session 歸戶；事件驅動投入；羊皮卷加速；手寫排除 | §3–§18 |
 
 ## 附錄 A：放棄的方案
 
@@ -458,7 +493,8 @@ flowchart LR
 |---|---|
 | 一個檔案一格 | 舊 repo 一開就是滿城，看不出哪些是這次做的；大 repo 有上千格；座標生命週期複雜；檔案大小會鼓勵寫長檔案 |
 | 冒險者與等級 | 等級改變不了真實能力，選誰去的取捨其實是選 model |
-| 國庫與稅收 | 虛構收入和真實費用混在同一本帳；訂閱制用戶真正的限制是 rate limit |
-| 勞動力（rate limit）機制 | 開墾模式下花費都在探索階段，派哪個行會不影響結果；讓行會影響產出會扭曲 model 選擇 |
+| 國庫與稅收 | 虛構收入和真實費用混在同一本帳；保留真實 provider 額度提示與成果資源，但不做被動稅收 |
+| 用量或額度變成遊戲懲罰 | 會扭曲 provider 選擇，也可能與真實限制重複；額度只顯示，不影響資源、建築或派工權限 |
 | 城內迷霧 | 城主轄下不應該有看不到的建築；新專案也沒有意義 |
 | 用 `lsof` 對應 session | 同一個 process 會同時開著 subagent 的檔案；切換 session 時會先關檔 |
+| 工單作為核心身份 | CLI 可自由 `/new`、`/resume`、`/move`，工單綁定增加操作且仍不能證明成果歸屬；v6 改用 session 遠征與多次收成 |
