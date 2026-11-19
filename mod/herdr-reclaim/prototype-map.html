@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>開墾城鎮地圖原型</title>
+  <!-- 三款「herdr 開墾城鎮」地圖介面，使用 ?variant=A|B|C 切換；只回答畫面應該長什麼樣，不是正式實作。 -->
+  <style>
+    :root {
+      color-scheme: dark;
+      --ink: #efe4ca;
+      --muted: #a99d87;
+      --deep: #111613;
+      --panel: #20261f;
+      --panel-2: #293027;
+      --line: #4e5648;
+      --gold: #d0a85c;
+      --green: #78935e;
+      --green-2: #536b47;
+      --earth: #806247;
+      --stone: #87908a;
+      --wood: #b37a43;
+      --paper: #c8aa73;
+      --iron: #9aa1a0;
+      --active: #a8c77d;
+      --warn: #c98a52;
+      --shadow: rgba(0, 0, 0, .42);
+      font-family: ui-serif, Georgia, "Noto Serif TC", serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 1040px; min-height: 100vh; color: var(--ink); background: var(--deep); overflow: hidden; }
+    button, input { font: inherit; }
+    button { color: inherit; }
+    .prototype-note {
+      position: fixed; top: 10px; left: 50%; z-index: 30; transform: translateX(-50%);
+      padding: 5px 10px; border: 1px solid #776544; border-radius: 999px;
+      color: #d9c79e; background: rgba(24, 25, 20, .9); font: 11px ui-monospace, monospace;
+      letter-spacing: .08em; text-transform: uppercase;
+    }
+    .app { height: 100vh; }
+    .eyebrow { color: var(--gold); font: 11px ui-sans-serif, sans-serif; letter-spacing: .13em; text-transform: uppercase; }
+    h1, h2, h3, p { margin-top: 0; }
+    h1 { font-size: 29px; line-height: 1.1; margin-bottom: 8px; }
+    h2 { font-size: 18px; margin-bottom: 12px; }
+    h3 { font-size: 14px; margin-bottom: 7px; }
+    p, li { color: var(--muted); font: 13px/1.55 ui-sans-serif, system-ui, sans-serif; }
+    .mono { font-family: ui-monospace, SFMono-Regular, monospace; }
+    .panel { border: 1px solid var(--line); background: color-mix(in srgb, var(--panel) 94%, transparent); box-shadow: 0 14px 35px var(--shadow); }
+    .resource { display: flex; align-items: center; gap: 8px; min-width: 86px; }
+    .resource-mark { width: 19px; height: 19px; border: 1px solid rgba(255,255,255,.25); transform: rotate(45deg); }
+    .wood { background: var(--wood); } .stone { background: var(--stone); } .paper { background: var(--paper); } .iron { background: var(--iron); }
+    .resource strong { display: block; font: 700 14px ui-sans-serif, sans-serif; }
+    .resource small { display: block; color: var(--muted); font: 10px ui-sans-serif, sans-serif; }
+    .progress { height: 7px; overflow: hidden; border: 1px solid #3d4439; border-radius: 999px; background: #111511; }
+    .progress > span { display: block; height: 100%; background: linear-gradient(90deg, var(--green-2), var(--active)); }
+    .status { display: inline-flex; align-items: center; gap: 6px; color: var(--active); font: 11px ui-sans-serif, sans-serif; }
+    .status::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; box-shadow: 0 0 0 3px rgba(168,199,125,.13); }
+    .status.idle { color: #a39a86; }
+    .map-stage { position: relative; min-height: 0; overflow: hidden; background: radial-gradient(circle at 50% 42%, #3d4934 0, #263126 42%, #171d19 76%); }
+    .map-stage::before {
+      content: ""; position: absolute; inset: 0; pointer-events: none; opacity: .18;
+      background-image: linear-gradient(25deg, transparent 45%, rgba(255,255,255,.08) 46%, transparent 47%), linear-gradient(155deg, transparent 45%, rgba(0,0,0,.3) 46%, transparent 47%);
+      background-size: 23px 23px;
+    }
+    .map-stage::after { content: ""; position: absolute; inset: 0; pointer-events: none; box-shadow: inset 0 0 100px rgba(0,0,0,.55); }
+    .world { position: absolute; left: 50%; top: 48%; width: 760px; height: 540px; transform: translate(-50%, -50%); }
+    .tile {
+      --x: 0; --y: 0; --lift: 0px; position: absolute; left: calc(50% + (var(--x) - var(--y)) * 69px); top: calc(42% + (var(--x) + var(--y)) * 35px - var(--lift));
+      width: 132px; height: 76px; border: 0; padding: 0; cursor: pointer; transform: translate(-50%, -50%); background: transparent; z-index: calc(30 + var(--x) + var(--y));
+    }
+    .tile-ground { position: absolute; inset: 0; transform: rotate(30deg) skewX(-30deg) scaleY(.86); border: 1px solid rgba(225,221,183,.22); background: #506543; box-shadow: 7px 9px 0 #34452f, 10px 13px 15px rgba(0,0,0,.32); transition: filter .15s, transform .15s; }
+    .tile:hover .tile-ground, .tile:focus-visible .tile-ground { filter: brightness(1.22); transform: rotate(30deg) skewX(-30deg) scaleY(.86) translate(-2px,-2px); }
+    .tile:focus-visible { outline: 2px solid var(--gold); outline-offset: 7px; }
+    .tile.fog .tile-ground { background: #252c27; border-style: dashed; box-shadow: 7px 9px 0 #181e1a; opacity: .64; }
+    .tile.reserve .tile-ground { background: #4f5b43; border: 1px dashed var(--gold); }
+    .tile.work .tile-ground { background: #536b47; }
+    .tile.library .tile-ground { background: #756b4d; }
+    .tile.wall .tile-ground { background: #5f6964; }
+    .tile.market .tile-ground { background: #6e5941; }
+    .building { position: absolute; left: 50%; bottom: 40px; width: 62px; height: 54px; transform: translateX(-50%); filter: drop-shadow(8px 10px 5px rgba(0,0,0,.35)); pointer-events: none; }
+    .building::before { content: ""; position: absolute; left: 7px; bottom: 0; width: 48px; height: 33px; border: 1px solid #b3a57f; background: #8c7656; }
+    .building::after { content: ""; position: absolute; left: 1px; top: 2px; width: 60px; height: 31px; clip-path: polygon(50% 0,100% 70%,88% 100%,12% 100%,0 70%); background: #6f3f32; border-bottom: 4px solid #4d2c27; }
+    .building.tower::before { left: 17px; width: 31px; height: 52px; background: #767d78; }
+    .building.tower::after { left: 12px; top: -11px; width: 42px; background: #555d59; }
+    .building.hall { width: 88px; height: 73px; bottom: 38px; }
+    .building.hall::before { left: 10px; width: 68px; height: 45px; background: #a08258; }
+    .building.hall::after { width: 86px; height: 42px; background: #6d4432; }
+    .building.market-stall::before { left: 10px; width: 44px; height: 24px; background: #856346; }
+    .building.market-stall::after { left: 2px; top: 10px; width: 62px; height: 20px; clip-path: polygon(0 0,100% 0,90% 100%,10% 100%); background: repeating-linear-gradient(90deg,#b68653 0 10px,#ede0bb 10px 20px); }
+    .banner { position: absolute; left: 50%; bottom: 104px; transform: translateX(-50%); padding: 4px 7px; white-space: nowrap; border: 1px solid #706548; background: rgba(19,22,18,.9); color: var(--ink); font: 10px ui-sans-serif, sans-serif; pointer-events: none; }
+    .tile.reserve .banner { color: var(--gold); }
+    .variant-switcher {
+      position: fixed; z-index: 50; left: 50%; bottom: 16px; display: flex; align-items: center; gap: 5px; transform: translateX(-50%);
+      padding: 6px; border: 1px solid #a98a51; border-radius: 999px; background: #0d100e; box-shadow: 0 10px 35px rgba(0,0,0,.6); font-family: ui-sans-serif, system-ui, sans-serif;
+    }
+    .variant-switcher button { width: 38px; height: 34px; border: 0; border-radius: 50%; background: #2d332b; cursor: pointer; }
+    .variant-switcher button:hover, .variant-switcher button:focus-visible { background: #4a5344; outline: 2px solid var(--gold); }
+    .variant-label { min-width: 205px; text-align: center; font-size: 12px; }
+    .variant-label strong { color: var(--gold); }
+
+    /* A — immersive town */
+    .a-shell { position: relative; height: 100%; }
+    .a-shell .map-stage { position: absolute; inset: 0; }
+    .a-brand { position: absolute; z-index: 4; left: 30px; top: 32px; width: 280px; padding: 22px 23px; border-left: 3px solid var(--gold); background: linear-gradient(90deg, rgba(17,22,19,.93), rgba(17,22,19,.6), transparent); }
+    .a-brand p { max-width: 225px; }
+    .a-resources { position: absolute; z-index: 4; right: 28px; top: 32px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; padding: 15px 17px; }
+    .a-selected { position: absolute; z-index: 4; left: 28px; right: 28px; bottom: 72px; display: grid; grid-template-columns: 1.1fr 1fr 1fr auto; gap: 22px; align-items: center; padding: 15px 18px; border-top: 1px solid #6d654e; background: rgba(19,23,19,.9); box-shadow: 0 -8px 35px rgba(0,0,0,.25); }
+    .a-selected h2 { margin: 3px 0 0; }
+    .a-stat { border-left: 1px solid var(--line); padding-left: 18px; }
+    .a-action { padding: 10px 14px; border: 1px solid #a68752; color: #f4e6c8; background: #59452d; }
+
+    /* B — chronicle split */
+    .b-shell { height: 100%; display: grid; grid-template-rows: 74px 1fr; background: #161b17; }
+    .b-header { display: flex; align-items: center; justify-content: space-between; padding: 0 24px; border-bottom: 1px solid var(--line); background: #20261f; }
+    .b-header h1 { margin: 1px 0 0; font-size: 21px; }
+    .b-resources { display: flex; gap: 22px; }
+    .b-main { min-height: 0; display: grid; grid-template-columns: minmax(620px, 1fr) 390px; }
+    .b-map-wrap { position: relative; min-width: 0; border-right: 1px solid var(--line); }
+    .b-map-wrap .map-stage { height: 100%; }
+    .b-map-caption { position: absolute; z-index: 4; left: 18px; bottom: 66px; padding: 10px 12px; background: rgba(18,22,18,.85); border: 1px solid var(--line); font: 12px ui-sans-serif, sans-serif; }
+    .b-chronicle { min-height: 0; padding: 24px 22px 80px; overflow: auto; background: #1b201b; }
+    .b-search { width: 100%; margin-bottom: 22px; padding: 10px 12px; border: 1px solid var(--line); color: var(--ink); background: #101410; }
+    .day { color: var(--gold); font: 10px ui-sans-serif, sans-serif; letter-spacing: .12em; text-transform: uppercase; }
+    .event { position: relative; margin: 12px 0 0 8px; padding: 0 0 18px 22px; border-left: 1px solid #4d5848; }
+    .event::before { content: ""; position: absolute; left: -5px; top: 4px; width: 9px; height: 9px; border-radius: 50%; background: var(--green); }
+    .event h3 { margin: 0 0 3px; }
+    .event p { margin: 0; font-size: 12px; }
+    .loot { display: inline-flex; margin-top: 7px; padding: 3px 6px; border: 1px solid #675e49; color: #d9c49a; font: 10px ui-sans-serif, sans-serif; }
+
+    /* C — command board */
+    .c-shell { height: 100%; display: grid; grid-template-rows: 86px 1fr; background: #121612; }
+    .c-top { display: grid; grid-template-columns: 260px 1fr 230px; align-items: center; gap: 22px; padding: 0 20px; border-bottom: 1px solid var(--line); background: linear-gradient(#262d24,#1d231d); }
+    .c-top h1 { margin: 2px 0 0; font-size: 21px; }
+    .c-stock { display: flex; justify-content: center; gap: 26px; }
+    .c-guild { text-align: right; }
+    .c-body { min-height: 0; display: grid; grid-template-columns: 250px 1fr 292px; }
+    .c-left, .c-right { min-height: 0; padding: 19px 16px 80px; overflow: auto; background: #1c221c; }
+    .c-left { border-right: 1px solid var(--line); }
+    .c-right { border-left: 1px solid var(--line); }
+    .c-map .map-stage { height: 100%; }
+    .c-map .world { transform: translate(-50%,-50%) scale(.86); }
+    .expedition { width: 100%; margin-bottom: 8px; padding: 12px; border: 1px solid #424a3f; text-align: left; color: var(--ink); background: #262d25; cursor: pointer; }
+    .expedition.active { border-color: #879b65; background: #2d3728; }
+    .expedition strong, .expedition small { display: block; }
+    .expedition small { margin-top: 5px; color: var(--muted); font: 11px ui-sans-serif, sans-serif; }
+    .detail-block { margin-bottom: 15px; padding-bottom: 15px; border-bottom: 1px solid #3c443a; }
+    .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .metric { padding: 9px; background: #252c24; }
+    .metric strong, .metric small { display: block; }
+    .metric strong { font: 18px ui-sans-serif, sans-serif; color: #ebd7ac; }
+    .metric small { color: var(--muted); font: 10px ui-sans-serif, sans-serif; }
+    .primary { width: 100%; padding: 11px; border: 1px solid #9f8050; color: #f3e4c4; background: #5e472d; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <div class="prototype-note">Throwaway UI prototype · no persistence</div>
+  <main id="app" class="app"></main>
+  <nav id="switcher" class="variant-switcher" aria-label="原型版本切換">
+    <button id="prev" type="button" aria-label="上一個版本">←</button>
+    <div class="variant-label" aria-live="polite"><strong id="variant-key"></strong> <span id="variant-name"></span></div>
+    <button id="next" type="button" aria-label="下一個版本">→</button>
+  </nav>
+  <script>
+    const variants = [
+      { key: 'A', name: '沉浸式城鎮全景' },
+      { key: 'B', name: '城鎮與工作歷程' },
+      { key: 'C', name: '遠征指揮桌' },
+    ];
+    const tiles = [
+      { x: 0, y: 0, kind: 'work', building: 'hall', label: '舊城區' },
+      { x: 0, y: -1, kind: 'work', building: '', label: 'API 整理', status: 'active' },
+      { x: 1, y: 0, kind: 'library', building: '', label: '文件重構', status: 'idle' },
+      { x: 0, y: 1, kind: 'wall', building: 'tower', label: '測試補強', status: 'idle' },
+      { x: -1, y: 0, kind: 'market', building: 'market-stall', label: '市集' },
+      { x: 1, y: -1, kind: 'work', building: 'house', label: '登入修復', status: 'idle' },
+      { x: -1, y: 1, kind: 'reserve', building: '', label: '新遠征 42%', status: 'active' },
+      { x: 1, y: 1, kind: 'fog', building: '', label: '迷霧' },
+      { x: -1, y: -1, kind: 'fog', building: '', label: '迷霧' },
+      { x: 0, y: -2, kind: 'fog', building: '', label: '迷霧' },
+      { x: 2, y: 0, kind: 'fog', building: '', label: '迷霧' },
+      { x: 0, y: 2, kind: 'fog', building: '', label: '迷霧' },
+      { x: -2, y: 0, kind: 'fog', building: '', label: '迷霧' },
+    ];
+    const resources = `
+      <div class="resource"><i class="resource-mark wood"></i><span><strong>80</strong><small>木材</small></span></div>
+      <div class="resource"><i class="resource-mark stone"></i><span><strong>50</strong><small>石材</small></span></div>
+      <div class="resource"><i class="resource-mark iron"></i><span><strong>15</strong><small>鐵料</small></span></div>
+      <div class="resource"><i class="resource-mark paper"></i><span><strong>7</strong><small>羊皮卷</small></span></div>`;
+
+    function map(title = '開墾城鎮地圖') {
+      const items = tiles.map((t, index) => `
+        <button class="tile ${t.kind}" style="--x:${t.x};--y:${t.y};--lift:${t.building ? 8 : 0}px" aria-label="${t.label}" data-tile="${index}">
+          <span class="tile-ground"></span>
+          ${t.building ? `<span class="building ${t.building}"></span>` : ''}
+          ${t.kind !== 'fog' ? `<span class="banner">${t.status === 'active' ? '● ' : ''}${t.label}</span>` : ''}
+        </button>`).join('');
+      return `<section class="map-stage" aria-label="${title}"><div class="world">${items}</div></section>`;
+    }
+
+    function variantA() {
+      return `<div class="a-shell">
+        ${map('沉浸式城鎮全景')}
+        <header class="a-brand"><div class="eyebrow">herdr reclaim</div><h1>青石河領</h1><p>讓城鎮自己長出來。工作、提交，然後回來看看今天多了什麼。</p><span class="status">2 支遠征進行中</span></header>
+        <section class="a-resources panel" aria-label="城鎮庫存">${resources}</section>
+        <section class="a-selected" aria-label="目前選取的遠征">
+          <div><div class="eyebrow">目前選取</div><h2>API 整理</h2></div>
+          <div class="a-stat"><span class="status">探索中</span><p>OMP · 1 小時 14 分</p></div>
+          <div class="a-stat"><div class="progress"><span style="width:68%"></span></div><p>開墾 68 / 100 · 最近收成 12 分鐘前</p></div>
+          <button class="a-action" type="button">查看歷程</button>
+        </section>
+      </div>`;
+    }
+
+    function variantB() {
+      return `<div class="b-shell">
+        <header class="b-header"><div><div class="eyebrow">青石河領</div><h1>城鎮與工作歷程</h1></div><div class="b-resources">${resources}</div></header>
+        <div class="b-main">
+          <section class="b-map-wrap">${map('城鎮與歷程並排地圖')}<div class="b-map-caption"><span class="status">API 整理正在開墾</span><br>68 / 100 點 · OMP</div></section>
+          <aside class="b-chronicle" aria-label="工作歷程">
+            <div class="eyebrow">工作歷程</div><h2>今天的城鎮變化</h2>
+            <input class="b-search" type="search" placeholder="搜尋 session、commit 或路徑" aria-label="搜尋工作歷程">
+            <div class="day">今天</div>
+            <article class="event"><h3>測試補強完成收成</h3><p>新增登入流程回歸測試<br><span class="mono">commit 8f3c2a1</span></p><span class="loot">石材 +20 · 開墾 +20</span></article>
+            <article class="event"><h3>API 整理持續探索</h3><p>累積工作 74 分鐘，土地進度來到 68%。</p></article>
+            <article class="event"><h3>文件重構完成收成</h3><p>更新安裝與 adapter 說明<br><span class="mono">commit 5a81b72</span></p><span class="loot">羊皮卷 +2 · 開墾 +20</span></article>
+            <div class="day">昨天</div>
+            <article class="event"><h3>登入修復建成民居</h3><p>支付木材 20、石材 10。</p></article>
+          </aside>
+        </div>
+      </div>`;
+    }
+
+    function variantC() {
+      return `<div class="c-shell">
+        <header class="c-top"><div><div class="eyebrow">遠征指揮桌</div><h1>青石河領</h1></div><div class="c-stock">${resources}</div><div class="c-guild"><div class="eyebrow">主要行會</div><strong>OpenAI 工匠團</strong></div></header>
+        <div class="c-body">
+          <aside class="c-left" aria-label="遠征列表"><div class="eyebrow">現役遠征</div><h2>4 支隊伍</h2>
+            <button class="expedition active" type="button"><span class="status">探索中</span><strong>API 整理</strong><small>68 / 100 · OMP</small></button>
+            <button class="expedition" type="button"><span class="status idle">駐紮</span><strong>文件重構</strong><small>已開墾 · Claude</small></button>
+            <button class="expedition" type="button"><span class="status idle">駐紮</span><strong>測試補強</strong><small>已建城牆 · Codex</small></button>
+            <button class="expedition" type="button"><span class="status idle">駐紮</span><strong>登入修復</strong><small>已建民居 · OMP</small></button>
+          </aside>
+          <section class="c-map">${map('遠征指揮桌地圖')}</section>
+          <aside class="c-right" aria-label="遠征詳情">
+            <div class="eyebrow">遠征詳情</div><h2>API 整理</h2>
+            <div class="detail-block"><span class="status">探索中</span><p>目前 checkout<br><span class="mono">feature/adapter-cleanup</span></p><div class="progress"><span style="width:68%"></span></div></div>
+            <div class="detail-block detail-grid"><div class="metric"><strong>74m</strong><small>工作時間</small></div><div class="metric"><strong>2</strong><small>有效收成</small></div><div class="metric"><strong>28</strong><small>自然點數</small></div><div class="metric"><strong>40</strong><small>收成點數</small></div></div>
+            <div class="detail-block"><h3>下一步</h3><p>再 32 點完成開墾。可使用 4 張羊皮卷立即完成。</p><button class="primary" type="button">使用羊皮卷加速</button></div>
+          </aside>
+        </div>
+      </div>`;
+    }
+
+    function currentKey() {
+      const key = new URLSearchParams(location.search).get('variant')?.toUpperCase();
+      return variants.some(v => v.key === key) ? key : 'A';
+    }
+    function render() {
+      const key = currentKey();
+      document.getElementById('app').innerHTML = key === 'A' ? variantA() : key === 'B' ? variantB() : variantC();
+      const item = variants.find(v => v.key === key);
+      document.getElementById('variant-key').textContent = item.key;
+      document.getElementById('variant-name').textContent = `（${item.name}）`;
+      document.querySelectorAll('[data-tile]').forEach(button => button.addEventListener('click', () => {
+        const tile = tiles[Number(button.dataset.tile)];
+        if (tile.kind !== 'fog') button.querySelector('.banner').textContent = `已選取：${tile.label}`;
+      }));
+    }
+    function cycle(direction) {
+      const index = variants.findIndex(v => v.key === currentKey());
+      const next = variants[(index + direction + variants.length) % variants.length];
+      const url = new URL(location.href); url.searchParams.set('variant', next.key); history.replaceState({}, '', url); render();
+    }
+    document.getElementById('prev').addEventListener('click', () => cycle(-1));
+    document.getElementById('next').addEventListener('click', () => cycle(1));
+    addEventListener('keydown', event => {
+      const target = event.target;
+      if (target.matches('input, textarea, [contenteditable="true"]')) return;
+      if (event.key === 'ArrowLeft') cycle(-1);
+      if (event.key === 'ArrowRight') cycle(1);
+    });
+    if (!(location.protocol === 'file:' || ['localhost', '127.0.0.1'].includes(location.hostname))) document.getElementById('switcher').hidden = true;
+    render();
+  </script>
+</body>
+</html>
