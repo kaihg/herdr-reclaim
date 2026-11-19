@@ -474,7 +474,7 @@ herdr 一次只能讀 1 MiB（`herdr.d.ts:27-29`），所以**每個檔案都必
 - top-level fork 被歸入來源 root，而非自己的新 root。
 - 同 session 兩次 writer 更新只留下最後 snapshot（input 7 被 input 3 覆蓋），沒有 per-epoch activity 目錄。此為事件層 fixture，不冒充兩個真實 terminal 的競態驗收。
 
-基線也沒有 `writerEpoch`／events／ack／compact／visit／heartbeat 寫入協定。因此雙 terminal resume、ack 延遲及 compact 中斷、離線 A→worktree→B 後刪 worktree、崩潰後 heartbeat 截止等條件**尚無可測的 v6.1 adapter 實作**；不能以 S1/S2 通過替代。依本輪「不開 subagent」限制，child live 情境未重跑。
+基線也沒有 `writerEpoch`／events／ack／compact／visit／heartbeat 寫入協定，不能以 S1/S2 通過替代 v6.1。後續已另建隔離協定驗證器（§15.6）執行 ack、compact、離線重播等案例；這不是已安裝 adapter 的端到端驗收。依本輪「不開 subagent」限制，child live 情境未重跑。
 
 S2b 只量到現有全量掃描：10k entries 8.04 ms、heap delta 327,680 bytes；100k entries 5.38 ms、heap delta 0。各一個樣本，包含寫檔；有 JIT／GC 影響，不能拿兩點比較成長率，heap delta 不是配置量。尚無增量實作可比對。
 
@@ -491,6 +491,46 @@ S2b 只量到現有全量掃描：10k entries 8.04 ms、heap delta 327,680 bytes
 - Claude 樣本混合 2.1.83／2.1.296／2.1.308：675 筆 assistant usage 只有 377 個 message ID，其中有相同 usage 重複三次的實例。以 message ID 保留最新值；126 個 ID 欄位不完整，明確標 unknown，不補零。已知部分合計 non-cache input 500、cache read 134,282,986、cache write 3,901,078、output 306,507；不是完整 session 總量。
 - 另一份 2.1.317 紀錄沒有 assistant usage，只有請求／cost-state 等事件；沒有可用回應用量不代表零消耗。
 - 純文字／工具回合、resume、child、abort 的 **live adapter** 情境，以及兩個 CLI 的 bash session 環境變數，仍未驗證；本輪不把讀檔成功當作完整 S7 通過。
+
+### 15.6 S6：隔離協定驗證與用量歧義反例（2026-11-19）
+
+**本輪協定調查已完成，S6 整體仍未通過：跨 epoch 用量缺少去重身分。** 可重跑：`bun spikes/s6/verify-protocol.ts`。使用真正的檔案、CAS 與 Git worktree；所有資料在 `/tmp/reclaim-s6-*`，結束清除。沒有啟動模型、child agent 或改已安裝 extension。
+
+| 情境 | 執行結果 |
+|---|---|
+| root／print／RPC／fork／child 事件投影 | root 與互動 fork 共兩格；print／RPC 不建格；child 用量歸 root，不另建格 |
+| 兩個 OS process 寫同 session | 留下兩個 epoch 檔；0–60 與 30–90 的區間取聯集為 90，不算成 120 |
+| journal 提交前中斷 | 沒有 ack、沒有入帳 |
+| journal 提交後、ack 前中斷 | 重播不重複入帳；恢復後才補 ack |
+| ack 延遲、compact rename 前／後中斷 | 未 ack 的第 5 筆保留；已入帳第 1–4 筆不重複；重播用量為 7+5=12 |
+| 新 epoch 遇到舊 epoch 的 ack | 新事件不被 compact 掉 |
+| 已關閉區間收到 heartbeat=999 | 不重開、不延長；另一 epoch 的未關閉區間只算到自己的最後 heartbeat |
+| 離線 A→暫存 worktree→B，刪 worktree 後才讀取 | 三個 visit、兩座城；A 與 worktree 歸同城；時間 120／60、用量 10／5 |
+
+上述是**隔離協定實作**，不是實際兩個 OMP terminal 的 resume 整合；child 只重播角色資料，不冒充 live child 驗收。journal 分段與容量仍以 S3 的失敗結果為準。
+
+**用量歧義反例（測試已重現）**：
+
+- 歷史 A：writer a、b 都讀到 source-1（100 tokens），正確總額 100。
+- 歷史 B：a 讀 source-1、b 讀 source-2（各 100 tokens），正確總額 200。
+- 去掉來源 entry ID 後，§6.1 的兩組 usage 事件逐欄相同。按 epoch 加總會把 A 重算；取最大值則會漏算 B。ack 只證明這個 writer 的事件已處理，不能證明來源用量未被別的 writer 回報。
+- **待修規格**：usage 必須攜帶跨 epoch 穩定的來源 key（例如 CLI + session ID + usage entry ID），並定義同 key 更新的版本／取代語意；或明確限制同 session 的唯一用量寫入者。不能僅靠 `writerEpoch + eventSeq` 宣稱不重複計費。本輪不偷偷改成單 writer，也不把未知用量補零。
+
+**OMP API 的補充證據**：
+
+- 18.22.0 CLI 已實測 `ctx.mode` 與 `ctx.agent`（§15.4）；已安裝原始碼套件為 **18.16.0**，以下 source 結論不可假裝是另一個版本的 live 證據。
+- `ExtensionAgentIdentity.kind` 是 `main | sub`；source 明確說 depth=0 也可能是 sub（例如 `/tan`）。新版 adapter 應優先用該欄位區分身分，不能用 PID、depth 或 hasUI 代替。
+- 同份 source 的 `SessionManager.fork()` 把 `parentSession` 寫成 **session ID**，`createBranchedSession()` 則寫成 **session 檔路徑**。因此 §6.1 的路徑啟發式不足以涵蓋所有 fork；不能假設 `parentSession` 一定是檔案路徑。
+- `getEntries()` 每次建立淺拷貝；只把 reducer 改成增量，仍無法免除全量陣列配置。`getUsageStatistics()` 使用增量索引，但沒有 provider／來源 entry 身分，且會含 task 摘要，不能直接套到目前的歸戶規則。
+
+**S2b 補測**：執行 `bun spikes/s6/usage-cost.ts <已安裝原始碼的 session/session-manager.ts>`，真正呼叫 `SessionManager.inMemory()`、`appendMessage()`、`appendModelUsage()`、`getEntries()` 與 `getUsageStatistics()`。兩種入口各佔一半；索引與獨立全量掃描的四種 token 數相同，追加一筆之後仍相同。每種方法暖機一次、量測 20 次：
+
+| entries | 全量掃描中位 ms | 索引快照中位 ms | 每次全量讀取複製的 references |
+|---|---|---|---|
+| 10,000 | 0.115751 | 0.000084 | 10,000 |
+| 100,000 | 0.564437 | 0.000166 | 100,000 |
+
+heap delta 本次均為 0，**不代表沒有配置**；配置結構由實作及回傳陣列身分斷言確認：每次全量讀取新建一個 N-element array，索引讀取只複製固定欄位的統計物件。極短時間受時鐘解析度影響，不宣稱數千倍的實際產品加速。這個 source probe 不包含 provider 分桶、fork 基線扣除與跨 epoch 去重，尚不能當作正式增量 adapter。
 
 ## 16. MVP 範圍
 
@@ -605,6 +645,7 @@ S2b 只量到現有全量掃描：10k entries 8.04 ms、heap delta 327,680 bytes
 | v6.1 複核 | 2 個 P1、7 個 P2 | 主檔仍會無限增長；分片存在被當成已提交；merge 走 post-merge 而漏收；merge 的比較基準；沒裝 hook 時把手動 commit 誤歸給 agent；兩個寫入者互相覆蓋；研究在 commit 待確認時先結算；commit 沒有依時間歸 generation；土地階段規則矛盾；市集與建材來源矛盾 | §13 改為 journal 加衍生資料；§7.1 三個 hook 加 reflog 補捉；§7.3 只跟第一個父節點比較；§7.2 沒裝 hook 時不自動收成；§6.2 每個 epoch 一個檔案；§7.4 待結算；§5.3 依時間決定 generation；§5.1 只能往前推進；§11 措辭 |
 | v6.1 第二、三次複核 | 2 個 P1、3 個 P2 | journal 換段時兩個寫入者可能各寫一段；雜湊桶與大型內容檔仍會超過 1 MiB；HEAD 差異（即使縮到單次工具呼叫）仍無法證明提交來源；初始 commit 的指令無效 | §13.1 先 CAS 封段再換段；可延長前綴分頁與內容切塊；§7.2 沒裝 hook 時只給建議卡；§7.3 初始 commit 改用 `--root` |
 | v6.1 循序技術驗證 | S3、S8 未通過；S5 CLI 通過；S6／S7 部分證據 | OMP commit 工具缺 session env；hook 超過 50 ms；中斷帳本原型 5 項失敗；S1/S2 adapter 不符合 v6.1 協定 | §15.2–15.5 保存命令、數字、失敗案例與未驗證邊界；未宣稱整體完成 |
+| v6.1 S6 隔離驗證 | 協定情境可行；用量去重存在 blocker | 兩個 epoch 回報同一筆或兩筆等量 usage，在現格式下無法分辨；parentSession 可能是 ID 或路徑 | §15.6 保存可重跑反例、ack／compact／離線證據與真實 SessionManager 效能資料；來源 key 與更新語意仍待修訂 |
 
 ## 附錄 A：放棄的方案
 
