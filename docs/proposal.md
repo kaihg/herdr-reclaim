@@ -407,6 +407,91 @@ herdr 一次只能讀 1 MiB（`herdr.d.ts:27-29`），所以**每個檔案都必
 
 **S1、S2 沒有驗證到的部分**：v6.1 的 adapter 協定（S6）、git hook（S8）、Codex 與 Claude（S7）。S1 的面板只是技術 spike，資料模型和 v6.1 不同。
 
+### 15.2 循序驗證：S8、S5（2026-11-19）
+
+**S8 尚未通過。** 可重跑：`sh spikes/s8/hook-matrix.sh`。測試使用暫存 repo，隔離全域 Git 設定，結束自動清除；沒有安裝到使用者的城。
+
+| 操作（Apple Git 2.50.1） | 實際 hook |
+|---|---|
+| 初始／一般 commit、cherry-pick、revert、解衝突後 commit | `post-commit` |
+| amend | `post-commit`、`post-rewrite amend` |
+| rebase（本次 merge backend、一筆重播） | `post-commit`、`post-rewrite rebase` |
+| `merge --no-ff` 自動完成 | `post-merge` |
+| rename、empty commit | `post-commit`；diff 分別為 `R100`、空清單 |
+
+- 第一父節點 diff、初始 commit `--root`、rewrite 的舊／新 SHA 對照均有斷言通過。amend／rebase 會重複通知，不能按 hook 次數發資源。
+- 測試安裝器尊重 repo-local `core.hooksPath`；既有 hook 收到原參數與 rewrite stdin，即使回傳 7，記錄器仍回傳 0；Husky／已追蹤的 hook 路徑會拒絕直接安裝。這是 spike，不是正式安裝器。
+- OMP **bash** 路徑的 hook 有 `PI_SESSION_ID`、`PI_TOOL_CALL_ID`。同一次 bash 工具呼叫內，模擬 IDE 提交只保留 `HC_TERMINAL_ID`、移除 session 變數，該 SHA 沒有 agent 身分；不能用 terminal ID 自動歸戶。
+- OMP **eval `commit` namespace** 的隔離實測：`post-commit` 有執行，但 `PI_SESSION_ID` 與 `PI_TOOL_CALL_ID` 都是空值，只有 `HC_TERMINAL_ID=t58`。**因此目前主要提交工具不能自動收成**；依 §7.2 必須進例外卡，不能用相鄰工具呼叫推定來源。測試提交 `10a36617b5395ca0a8ad819ed68e532d70e4a31b` 位於一次性 repo，並非本專案歷史。
+- 關閉 hook 的提交可由 reflog 找到，但沒有來源證據。正式帳本尚未接線，所以「不發資源」目前僅是規格，沒有端到端驗證。
+- Python spike 記錄器 50 次：中位數 **61.27 ms**、p95 **64.34 ms**、最大 **66.01 ms**，未達 50 ms。這只量測新記錄器；既有 hook 的執行時間不受本 mod 控制，§7.1 的總耗時保證仍須釐清。
+
+**S5 CLI spike 通過；正式城鎮 UI 尚未接線。** 指令：`omp usage --json --redact --no-extensions`，`generatedAt=1795082919780`。原始數值與擷取時間保存在 `spikes/s5/observed.json`（移除帳號識別欄位）；執行 `python3 spikes/s5/show.py`，已觀察到 Databricks 顯示「未知（沒有 provider report）」、無額度的 Codex 帳號另列未知，不和已知帳號合併。
+
+| provider／週期 | used / limit / remaining | fetchedAt | resetsAt |
+|---|---|---|---|
+| openai-codex／7d | 12 / 100 / 88 | 1795082918586 | 1795420897000 |
+| anthropic／5h | 16 / 100 / 84 | 1795082919165 | 1795098000040 |
+| anthropic／7d | 81 / 100 / 19 | 1795082919165 | 1795212000040 |
+
+另有一個 Codex account 出現在 `accountsWithoutUsage`；Databricks 沒有出現在 reports。這兩種情況都不能解讀成剩餘 0 或 100，也不能據此斷定前次 fallback 是額度耗盡。
+
+### 15.3 S3：中斷原型的獨立執行驗證（2026-11-19）
+
+**未通過，不可直接移入正式 mod。** 本輪沒有再啟動 subagent；對前一輪留下的 `spikes/s3/lib/` 加上獨立斷言，執行 `bun spikes/s3/verify.ts`，結果 **5 pass / 5 fail**，exit 1。保留失敗案例作為原型修復的驗收，不降低標準。
+
+| 檢查 | 結果 |
+|---|---|
+| 城級 claim、operation ID 去重 | 通過：兩支遠征看到同一 claim，只發一次 |
+| 兩個 writer 搶同一庫存 | 通過：一成功、一個重讀後 `insufficient_wood` |
+| 內容已寫、journal 未提交即中斷 | 通過：重啟不入帳；重試沿用 blob、只入帳一次 |
+| 2 萬路徑內容切塊回讀 | 失敗：原始 2,428,891 bytes，讀回的是 369-byte manifest |
+| 前綴頁滿拆分與查詢 | 通過：1 萬 key，72 次拆分、1,356 頁；每筆可查回 |
+| 封段與舊 writer 競態 | 通過：舊 snapshot CAS 失敗，重新檢查庫存後拒絕支出 |
+| 封段仍須遵守容量上限 | 失敗：1,024-byte 測試上限產生 1,039-byte 段 |
+| 收成點數 +20 | 失敗：原型仍加 100 |
+| 重新派遣後拒絕舊 generation 的收成 | 失敗：gen 1 的收成被套入 gen 2 |
+| 1 萬遠征／10 萬操作／checkpoint | 重播一致，但容量失敗：4 個 journal 段超過 256 KiB |
+
+容量執行約 **103.57 秒**，39 段、38 個封段標記、journal 共 9,963,387 bytes，最大段 **262,161 bytes**（上限 262,144）；569 個檔案。checkpoint 最大檔案 141,313 bytes；head 由 95 變成 100 bytes（固定欄位不等於固定字節數）。所有暫存資料於驗證後清除。
+
+定位：`content.ts` 把 manifest 再交給 `put()`，最後寫成 `.l`，`get()` 便當成原始內容回傳；`ledger.ts` 換段前沒有預留 seal 的序列化空間；`applyEntry()` 仍使用 +100；`precheck()` 沒有核對收成的 generation。這些是**未完成 spike 的實作缺陷**，不能據此宣稱 journal/CAS 方案不可行，也不能拿先前「零 finding」的文件複核當作執行通過。
+
+### 15.4 S6／S2b：Runtime 能力與基線差距（2026-11-19）
+
+**部分能力已實測，S6、S2b 尚未通過。** `python3 spikes/s6/probe.py` 啟動隔離 OMP 18.22.0；不送 prompt、不呼叫模型、不開 task child，也不載入使用者 extension。
+
+| 實際模式 | `ctx.mode` | `ctx.hasUI` | `ctx.agent` |
+|---|---|---|---|
+| 真正 PTY 的互動 TUI | `tui` | true | `kind=main, depth=0` |
+| print | `print` | false | `kind=main, depth=0` |
+| headless RPC（`--no-ui`） | `rpc` | false | `kind=main, depth=0` |
+
+三者的 `ctx.setInterval` 在 110 ms 觀察窗內都執行 5 次（測試間隔 20 ms），然後清除並正常 shutdown。這證明 timer API 可用，不代表 60 秒 heartbeat 的崩潰結算已通過。print／RPC 的隔離環境須指定模型與無效測試 key 才能完成啟動；無 prompt，未送出推論請求。
+
+`bun spikes/s6/verify-baseline.ts` 直接呼叫現有 S1/S2 extension 的事件 handler，得到兩項契約失敗：
+
+- top-level fork 被歸入來源 root，而非自己的新 root。
+- 同 session 兩次 writer 更新只留下最後 snapshot（input 7 被 input 3 覆蓋），沒有 per-epoch activity 目錄。此為事件層 fixture，不冒充兩個真實 terminal 的競態驗收。
+
+基線也沒有 `writerEpoch`／events／ack／compact／visit／heartbeat 寫入協定。因此雙 terminal resume、ack 延遲及 compact 中斷、離線 A→worktree→B 後刪 worktree、崩潰後 heartbeat 截止等條件**尚無可測的 v6.1 adapter 實作**；不能以 S1/S2 通過替代。依本輪「不開 subagent」限制，child live 情境未重跑。
+
+S2b 只量到現有全量掃描：10k entries 8.04 ms、heap delta 327,680 bytes；100k entries 5.38 ms、heap delta 0。各一個樣本，包含寫檔；有 JIT／GC 影響，不能拿兩點比較成長率，heap delta 不是配置量。尚無增量實作可比對。
+
+另以隔離 `HERDR_APP_HOME` 執行 `herdr-app check spikes/s6/fs-probe`：成功在 appHome 外的同層暫存路徑寫入 `first`，證明 mod 可以寫 adapter 目錄。**check 提早結束，沒有跑完後續 async CAS 鏈**；`check passed` 不能當成整條非同步驗證完成。
+
+### 15.5 S7：外部 CLI 唯讀能力盤點（2026-11-19）
+
+**尚未通過完整 adapter 驗收。** 沒有啟動額外 agent；只讀既有 hook、CLI help 和去識別的 transcript 結構，未修改 `~/.codex/**`／`~/.claude/**`。
+
+- 安裝版本：Codex 0.156.1、Claude Code 2.1.317。
+- Codex 的既有 herdr hook 只處理 SessionStart，讀 stdin 的 `session_id`／`transcript_path`，並檢查繼承的 `CODEX_THREAD_ID`。這不是本輪 bash 注入的實測證據。
+- Claude 的既有 hook 只處理 SessionStart，遇到 `agent_id` 直接跳過；沒有把 session ID 注入後續 bash。不能直接把該 hook 當成完整 adapter。
+- `spikes/s7/usage_probe.py` 是**離線用量探針**，不是完整生命週期 adapter。Codex 樣本 89 筆 `token_usage_record`，以 response ID 歸一後與最後一筆 `token_count.total_token_usage` 對帳一致：non-cache input 136,613、cache read 7,918,848、output 24,776。不能把兩種記錄再相加。
+- Claude 樣本混合 2.1.83／2.1.296／2.1.308：675 筆 assistant usage 只有 377 個 message ID，其中有相同 usage 重複三次的實例。以 message ID 保留最新值；126 個 ID 欄位不完整，明確標 unknown，不補零。已知部分合計 non-cache input 500、cache read 134,282,986、cache write 3,901,078、output 306,507；不是完整 session 總量。
+- 另一份 2.1.317 紀錄沒有 assistant usage，只有請求／cost-state 等事件；沒有可用回應用量不代表零消耗。
+- 純文字／工具回合、resume、child、abort 的 **live adapter** 情境，以及兩個 CLI 的 bash session 環境變數，仍未驗證；本輪不把讀檔成功當作完整 S7 通過。
+
 ## 16. MVP 範圍
 
 **包含**
@@ -519,6 +604,7 @@ herdr 一次只能讀 1 MiB（`herdr.d.ts:27-29`），所以**每個檔案都必
 | v6.1 使用者 | — | commit 收成用 git hook；研究自動累積；加市集；排除非互動 session | §7、§11、§1 |
 | v6.1 複核 | 2 個 P1、7 個 P2 | 主檔仍會無限增長；分片存在被當成已提交；merge 走 post-merge 而漏收；merge 的比較基準；沒裝 hook 時把手動 commit 誤歸給 agent；兩個寫入者互相覆蓋；研究在 commit 待確認時先結算；commit 沒有依時間歸 generation；土地階段規則矛盾；市集與建材來源矛盾 | §13 改為 journal 加衍生資料；§7.1 三個 hook 加 reflog 補捉；§7.3 只跟第一個父節點比較；§7.2 沒裝 hook 時不自動收成；§6.2 每個 epoch 一個檔案；§7.4 待結算；§5.3 依時間決定 generation；§5.1 只能往前推進；§11 措辭 |
 | v6.1 第二、三次複核 | 2 個 P1、3 個 P2 | journal 換段時兩個寫入者可能各寫一段；雜湊桶與大型內容檔仍會超過 1 MiB；HEAD 差異（即使縮到單次工具呼叫）仍無法證明提交來源；初始 commit 的指令無效 | §13.1 先 CAS 封段再換段；可延長前綴分頁與內容切塊；§7.2 沒裝 hook 時只給建議卡；§7.3 初始 commit 改用 `--root` |
+| v6.1 循序技術驗證 | S3、S8 未通過；S5 CLI 通過；S6／S7 部分證據 | OMP commit 工具缺 session env；hook 超過 50 ms；中斷帳本原型 5 項失敗；S1/S2 adapter 不符合 v6.1 協定 | §15.2–15.5 保存命令、數字、失敗案例與未驗證邊界；未宣稱整體完成 |
 
 ## 附錄 A：放棄的方案
 

@@ -1,0 +1,22 @@
+{
+  "command": "omp usage --json --redact --no-extensions",
+  "generatedAt": 1795082919780,
+  "selection": "Provider limit records copied verbatim; identity metadata and reset credits omitted",
+  "reports": [
+    {
+      "provider": "openai-codex",
+      "fetchedAt": 1795082918586,
+      "limits": [{"id":"openai-codex:primary","label":"7 days","scope":{"provider":"openai-codex","windowId":"7d","shared":true},"window":{"id":"7d","label":"7 days","durationMs":604800000,"resetsAt":1795420897000},"amount":{"used":12,"limit":100,"remaining":88,"usedFraction":0.12,"remainingFraction":0.88,"unit":"percent"},"status":"ok"}]
+    },
+    {
+      "provider": "anthropic",
+      "fetchedAt": 1795082919165,
+      "limits": [
+        {"id":"anthropic:5h","label":"Claude 5 Hour","scope":{"provider":"anthropic","windowId":"5h","shared":true},"window":{"id":"5h","label":"5 Hour","durationMs":18000000,"resetsAt":1795098000040},"amount":{"used":16,"limit":100,"remaining":84,"usedFraction":0.16,"remainingFraction":0.84,"unit":"percent"},"status":"ok"},
+        {"id":"anthropic:7d","label":"Claude 7 Day","scope":{"provider":"anthropic","windowId":"7d","shared":true},"window":{"id":"7d","label":"7 Day","durationMs":604800000,"resetsAt":1795212000040},"amount":{"used":81,"limit":100,"remaining":19,"usedFraction":0.81,"remainingFraction":0.18999999999999995,"unit":"percent"},"status":"ok"}
+      ]
+    }
+  ],
+  "accountsWithoutUsage": [{"provider":"openai-codex","type":"oauth"}],
+  "disabledCredentials": []
+}
