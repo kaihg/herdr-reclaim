@@ -44,6 +44,8 @@ const MAX_LEFT_W = 240;
 const MIN_RIGHT_W = 108;
 const MAX_RIGHT_W = 292;
 const TOP_H = 104;
+/** 選取入畫時，格子方框再加這個安全邊（mock 地物與標籤的視覺外框）。 */
+const CELL_MARGIN = 6;
 
 const RESOURCES = [
   { key: "wood", label: "木材", color: "ansi3" },
@@ -936,7 +938,7 @@ export default class Town extends View {
     // 先夾在畫得出來的範圍（用整個地圖框，平移不被圖例限制），再保證選取的那一格
     // （含最高的 mock 建築外框，它畫在格子方框內）完整落在**可見區**裡。
     this.camera = { ...this.camera, ...clampCamera(this.camera, size, area) };
-    this.camera = { ...this.camera, ...ensureVisible(this.anchorCell, this.camera, visible, MAP_RADIUS, tile) };
+    this.camera = { ...this.camera, ...ensureVisible(this.anchorCell, this.camera, visible, MAP_RADIUS, tile, CELL_MARGIN) };
     this.focusCell = null;
     return mapView({
       city,
@@ -948,6 +950,15 @@ export default class Town extends View {
       viewport: area,
       legendOpen: this.legendOpen,
       camera: this.camera,
+      // 圖例（左上覆蓋層）把**量到的大小**回報給畫面：尺寸一變就重新對位（窄 pane 會換行變高）。
+      onLegendSize: (size, cx2) => {
+        const changed = this.legendSize?.height !== size.height || this.legendSize?.width !== size.width;
+        this.legendSize = size;
+        if (changed) {
+          this.requestFocus(this.selection);
+          cx2.notify();
+        }
+      },
       onToggleLegend: (cx2) => {
         this.legendOpen = !this.legendOpen;
         cx2.notify();
@@ -991,7 +1002,14 @@ export default class Town extends View {
       .bg(t.popover)
       .border(1)
       .border_color(t.border)
-      .on_size_change((size) => { this.metricsSize = size; })
+      .on_size_change((size, cx2) => {
+        const changed = this.metricsSize?.height !== size.height || this.metricsSize?.width !== size.width;
+        this.metricsSize = size;
+        if (changed) {
+          this.requestFocus(this.selection);
+          cx2.notify();
+        }
+      })
       .child(div().text_size(9).text_color(t.dim).child("量測（門檻：點選 150／面板 500／操作 300 ms）"))
       .children(MEASURES.map(([kind, label]) => {
         const list = this.metrics.samples[kind];
@@ -1004,7 +1022,7 @@ export default class Town extends View {
       .child(div().text_size(9).text_color(this.metrics.scroll?.events ? t.muted : t.dim)
         .child(`捲動：${this.metrics.scroll?.events ?? 0} 次 · Δx ${Math.round(this.metrics.scroll?.sumX ?? 0)} · Δy ${Math.round(this.metrics.scroll?.sumY ?? 0)} · 相機 ${Math.round(this.camera?.x ?? 0)},${Math.round(this.camera?.y ?? 0)}`))
       .child(div().text_size(9).text_color(t.dim)
-        .child(`可見區 ${Math.round(this.viewport?.x ?? 0)},${Math.round(this.viewport?.y ?? 0)} ${Math.round(this.viewport?.width ?? 0)}×${Math.round(this.viewport?.height ?? 0)} · 置中格 ${this.anchorCell?.x ?? "—"},${this.anchorCell?.y ?? "—"}`))
+        .child(`可見區 ${Math.round(this.viewport?.x ?? 0)},${Math.round(this.viewport?.y ?? 0)} ${Math.round(this.viewport?.width ?? 0)}×${Math.round(this.viewport?.height ?? 0)} · 圖例 ${Math.round(this.legendSize?.width ?? 0)}×${Math.round(this.legendSize?.height ?? 0)} · 量測 ${Math.round(this.metricsSize?.height ?? 0)} · 置中格 ${this.anchorCell?.x ?? "—"},${this.anchorCell?.y ?? "—"}`))
   }
 
   // ---- 右側：選取遠征或格子的詳情（§12 的入口）

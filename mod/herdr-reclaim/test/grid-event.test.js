@@ -117,7 +117,12 @@ describe("選取入畫（可見區＝地圖框扣掉覆蓋層）", () => {
     return { width: Math.max(80, paneWidthUi - leftW - rightW), height: paneHeightUi - 104 };
   };
   // 圖例與量測面板的尺寸是 render 量到的（窄 pane 文字換行 → 比較高）。
-  const legends = { "圖例 62px": { width: 300, height: 62 }, "圖例 104px（窄 pane 換行）": { width: 280, height: 104 } };
+  const CELL_MARGIN = 6; // 與 main.js 相同：格子方框再加這個安全邊（mock 地物／標籤外框）
+  const legends = {
+    "圖例 62px": { width: 300, height: 62 },
+    "圖例 112px（真視窗量到的換行高度）": { width: 280, height: 112 },
+    "圖例未知（首幀還沒量到）": { width: 0, height: 0 },
+  };
   const viewports = { "600 UI px": mapAreaOf(599), "820 UI px": mapAreaOf(819), "寬版 1200 UI px": mapAreaOf(1200) };
   const cells = [
     { x: -9, y: -9 }, { x: 9, y: -9 }, { x: -9, y: 9 }, { x: 9, y: 9 }, // 四角
@@ -137,7 +142,7 @@ describe("選取入畫（可見區＝地圖框扣掉覆蓋層）", () => {
   const cameraOf = (cell, area, visible, tile) => {
     const size = contentSize(MAP_RADIUS, tile);
     const centred = cameraFor(cell, visible, MAP_RADIUS, tile);
-    return ensureVisible(cell, clampCamera(centred, size, area), visible, MAP_RADIUS, tile);
+    return ensureVisible(cell, clampCamera(centred, size, area), visible, MAP_RADIUS, tile, CELL_MARGIN);
   };
 
   for (const [areaName, area] of Object.entries(viewports)) {
@@ -147,23 +152,38 @@ describe("選取入畫（可見區＝地圖框扣掉覆蓋層）", () => {
         const visible = visibleRect(area, legend, null);
         for (const cell of cells) {
           const box = boxOf(cell, cameraOf(cell, area, visible, tile), tile);
-          expect(box.left).toBeGreaterThanOrEqual(visible.x - 0.5);
-          expect(box.top).toBeGreaterThanOrEqual(visible.y - 0.5);
-          expect(box.left + box.width).toBeLessThanOrEqual(visible.x + visible.width + 0.5);
-          expect(box.top + box.height).toBeLessThanOrEqual(visible.y + visible.height + 0.5);
+          // 「格＋地物外框」＝格子方框再加 CELL_MARGIN（與 main.js 同值）。
+          expect(box.left - CELL_MARGIN).toBeGreaterThanOrEqual(visible.x - 0.5);
+          expect(box.top - CELL_MARGIN).toBeGreaterThanOrEqual(visible.y - 0.5);
+          expect(box.left + box.width + CELL_MARGIN).toBeLessThanOrEqual(visible.x + visible.width + 0.5);
+          expect(box.top + box.height + CELL_MARGIN).toBeLessThanOrEqual(visible.y + visible.height + 0.5);
         }
       });
     }
   }
 
+  test("首幀還沒量到圖例時，可見區會少扣圖例高度——尺寸一變就必須重新對位", () => {
+    const area = mapAreaOf(599);
+    const tile = tileOf(area);
+    const unknown = visibleRect(area, null, null);
+    const measured = visibleRect(area, legends["圖例 112px（真視窗量到的換行高度）"], null);
+    expect(unknown.y).toBe(12); // 圖例高度未知 → 只扣了 6+6
+    expect(measured.y).toBe(124); // 量到 112 之後要扣掉
+    const before = cameraOf({ x: -9, y: -9 }, area, unknown, tile);
+    const after = cameraOf({ x: -9, y: -9 }, area, measured, tile);
+    expect(after.y).not.toBe(before.y); // 相機必須跟著改
+    const box = boxOf({ x: -9, y: -9 }, after, tile);
+    expect(box.top - CELL_MARGIN).toBeGreaterThanOrEqual(measured.y - 0.5);
+  });
+
   test("辨識力：可見區若用整個地圖框（舊假設），(-9,-9) 這種上緣格就會落在圖例下面", () => {
     const area = mapAreaOf(599);
     const tile = tileOf(area);
-    const legend = legends["圖例 104px（窄 pane 換行）"];
+    const legend = legends["圖例 112px（真視窗量到的換行高度）"];
     const visible = visibleRect(area, legend, null);
     // 舊假設：可見區＝整個地圖框。內容區最上面那一列（y=-9）本來就貼著內容上緣，
     // 相機最多只能到 0，所以那一列的格子會被釘在框頂＝圖例底下。
-    const naive = ensureVisible({ x: -9, y: -9 }, clampCamera(cameraFor({ x: -9, y: -9 }, area, MAP_RADIUS, tile), contentSize(MAP_RADIUS, tile), area), area, MAP_RADIUS, tile);
+    const naive = ensureVisible({ x: -9, y: -9 }, clampCamera(cameraFor({ x: -9, y: -9 }, area, MAP_RADIUS, tile), contentSize(MAP_RADIUS, tile), area), area, MAP_RADIUS, tile, CELL_MARGIN);
     const naiveBox = boxOf({ x: -9, y: -9 }, naive, tile);
     expect(naiveBox.top).toBeLessThan(visible.y); // ← 會被圖例蓋住（舊行為）
     const fixedBox = boxOf({ x: -9, y: -9 }, cameraOf({ x: -9, y: -9 }, area, visible, tile), tile);
