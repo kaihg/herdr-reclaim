@@ -1,0 +1,7 @@
+# herdr-app 寫進 mod 資料夾的檔案（check／載入時自己產生，不是原始碼）
+mod/*/*.d.ts
+mod/*/jsconfig.json
+mod/*/tsconfig.json
+mod/*/*/*.d.ts
+mod/*/*/jsconfig.json
+mod/*/*/tsconfig.json

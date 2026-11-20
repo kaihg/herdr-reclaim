@@ -152,12 +152,14 @@ interface HerdrActivity {
     at: number;
     visit?: { visitId: string; cwd: string; commonDir: string | null; checkout: string | null };
     usage?: Record<string, NormalizedUsage>;
-    turnId?: string;                     // turn_end 事件帶上，供研究結算對應
+    sourceEntryId?: string;                // omp entry ID，供用量跨 epoch 去重
+    turnId?: string;                       // turn_end 事件帶上，供研究結算對應
   }>;
   updatedAt: number;
 }
 
 interface NormalizedUsage {
+  sourceKey: string;                       // 穩定身份：cli + sessionId + source entry id（§15.6）
   inputNonCache: number;
   cacheRead: number;
   cacheWrite: number;
@@ -183,8 +185,10 @@ interface NormalizedUsage {
 ### 6.2 ack、compact 與寫入者
 
 - **使用範圍（使用者確認）**：多視窗使用不同 session；不支援同一個 session 同時在兩個視窗工作，也不為此增加切換記帳視窗的操作。仍須支援先結束舊程序、之後 resume 同一個 session，且不重算先前用量。
+- **WriterEpoch**：同一程序以 PID + 啟動時間為基底；程序內切換 session 時也須使用新 epoch，避免 `/new` 後再 `/resume` 覆寫舊檔。
 - **每個寫入者一個檔案**：adapter 寫 `activity/<sessionId>/<writerEpoch>.json`。舊程序結束後 resume 時，新程序使用新的 `writerEpoch`，保留舊檔以供離線重播；這不是同 session 多視窗同時工作的支援承諾。
-- **ack 也按 epoch 分開**：mod 在帳本提交成功後寫 `acks/<sessionId>/<writerEpoch>.json`，內容是 `{ackedEventSeq, journalSeq}`。adapter 只讀自己 epoch 的 ack，並且只能刪掉 `eventSeq ≤ ackedEventSeq` 的事件。
+- **ack 也按 epoch 分開**：mod 在城帳本提交成功後寫 `cities/<cityId hash>/acks/<sessionId>/<writerEpoch>.json`，內容是 `{ackedEventSeq, journalSeq}`。adapter 只讀自己的 epoch ack，且只能刪掉 `eventSeq ≤ ackedEventSeq` 的事件。
+- mod 把 compact 後的新尾巴合併回 journal 已保存的同一 writer 事件；一個 epoch 可能在多座城的帳本各有一份 activity entry。重播以穩定 `NormalizedUsage.sourceKey`（`cli + sessionId + source entry id`）去重。
 - mod 合併所有 epoch 的事件：interval 取聯集，晚到的 heartbeat 只能延長**自己 epoch** 內尚未關閉的 interval；跟已保存區間重疊的部分不重算。
 - **heartbeat**：OMP 用 `ctx.setInterval`，每 60 秒更新一次。沒有正常關閉的 interval，只算到最後一次寫入磁碟的 heartbeat。系統休眠或事件迴圈卡住時，heartbeat 不會準時觸發；規則只保證「不多算」。
 
