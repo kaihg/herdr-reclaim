@@ -236,6 +236,8 @@ export function readTownFromLedger(replay = {}) {
           building: entry.building ?? null,
           scrollsUsed: entry.scrollsUsed ?? 0,
           harvests: entry.harvests ?? [],
+          // 有過 commit 收成的格不能撤回或封存（§5.2）：旗標要跟著盤面傳進公開模型。
+          harvested: entry.harvested === true,
         }
       : null;
   });
@@ -281,6 +283,7 @@ export function readTownFromLedger(replay = {}) {
         building: entry.building ?? null,
         scrollsUsed: entry.scrollsUsed ?? 0,
         harvests: entry.harvests ?? [],
+        harvested: entry.harvested === true,
       }),
     );
   }
@@ -470,6 +473,7 @@ function newTile(session, city, visit, planned) {
     building: planned.building ?? null,
     scrollsUsed: planned.scrollsUsed ?? 0,
     harvests: planned.harvests ?? [],
+    harvested: planned.harvested === true,
   };
 }
 
