@@ -255,6 +255,52 @@ describe("Claude Code adapter：hook 事件重播到城鎮模型", () => {
     expect(tileOf(quietTown.town).usage).toMatchObject({ inputNonCache: 0, costUnknownEntries: 0 });
   });
 
+  test("同 message ID 的 usage 在 flush 與 compact 邊界以完整快照取代 partial，亂序不回退", async () => {
+    const t = 1_800_000_000_000;
+    const full = { input_tokens: 11, cache_read_input_tokens: 3, cache_creation_input_tokens: 2, output_tokens: 9 };
+    const partial = { input_tokens: 11, output_tokens: 1 };
+
+    const first = setupRepo("usage-flush-replacement");
+    const firstHome = path.join(first.base, "apphome");
+    const firstFire = hook(firstHome, 5500);
+    const incremental = writeTranscript(first.base, "incremental", [
+      transcriptLine("assistant", { id: "msg_incremental", at: t + 1, usage: partial }),
+    ]);
+    firstFire("SessionStart", { source: "startup", transcript_path: incremental, cwd: first.repo }, t);
+    firstFire("UserPromptSubmit", { transcript_path: incremental, cwd: first.repo }, t + 1);
+    firstFire("PreCompact", { transcript_path: incremental, cwd: first.repo }, t + 2);
+    firstFire("SessionStart", { source: "compact", transcript_path: incremental, cwd: first.repo }, t + 3);
+    fs.writeFileSync(incremental, [
+      transcriptLine("assistant", { id: "msg_incremental", at: t + 1, usage: partial }),
+      transcriptLine("assistant", { id: "msg_incremental", at: t + 4, usage: full }),
+    ].join("\n") + "\n");
+    firstFire("Stop", { transcript_path: incremental, cwd: first.repo }, t + 5);
+
+    const afterCompact = await townOf(firstHome);
+    const compactTile = tileOf(afterCompact.town);
+    expect(compactTile.usage).toMatchObject({ inputNonCache: 11, cacheRead: 3, cacheWrite: 2, output: 9, costUnknownEntries: 1 });
+    const corrections = usageEvents(firstHome);
+    expect(corrections.map((event) => event.sourceEntryId)).toEqual(["msg_incremental", "msg_incremental"]);
+    expect(new Set(corrections.map((event) => event.usage.anthropic.sourceKey))).toHaveLength(1);
+    expect("unknownFields" in compactTile.usage).toBe(false);
+
+    const second = setupRepo("usage-reversed-snapshot");
+    const secondHome = path.join(second.base, "apphome");
+    const secondFire = hook(secondHome, 5501);
+    const reversed = writeTranscript(second.base, "reversed", [
+      transcriptLine("assistant", { id: "msg_reversed", at: t + 4, usage: full }),
+      transcriptLine("assistant", { id: "msg_reversed", at: t + 1, usage: partial }),
+    ]);
+    secondFire("SessionStart", { source: "startup", transcript_path: reversed, cwd: second.repo }, t);
+    secondFire("UserPromptSubmit", { transcript_path: reversed, cwd: second.repo }, t + 1);
+    secondFire("Stop", { transcript_path: reversed, cwd: second.repo }, t + 5);
+
+    const afterReverse = await townOf(secondHome);
+    const reverseTile = tileOf(afterReverse.town);
+    expect(reverseTile.usage).toMatchObject({ inputNonCache: 11, cacheRead: 3, cacheWrite: 2, output: 9, costUnknownEntries: 1 });
+    expect("unknownFields" in reverseTile.usage).toBe(false);
+  });
+
   test("worktree 與 /cd 之後的 visit 用工作當下保存的 repo 身分，worktree 刪掉後仍歸同一座城", async () => {
     const { base, repo } = setupRepo("worktree");
     const appHome = path.join(base, "apphome");

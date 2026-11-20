@@ -16,8 +16,8 @@
 //   PreCompact → 壓縮前先把用量收乾淨
 //   SessionEnd(reason) → 收尾：用量、interval_close、visit_end
 //
-// 用量：同一個 message ID 會在多筆紀錄、不同 epoch（resume）重複出現；以 message ID 當穩定來源，
-// 只保留最後一次看到的快照（§6.1）。欄位不完整的紀錄標進 unknownFields，不補 0；
+// 同一 message ID 會在多筆紀錄、不同 epoch（resume）重複出現；以 message ID 當穩定來源，
+// 同一 epoch 保留欄位最完整的快照（同完整度以較晚快照更新）。欄位不完整的紀錄標進 unknownFields，不補 0；
 // 沒有 assistant usage 的紀錄不會產生用量事件（不是 0 消耗）。
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -114,6 +114,7 @@ interface WriterState {
   parentSessionId?: string;
   visit: Visit | null;
   intervalOpen: boolean;
+  usageByMessage?: Record<string, NormalizedUsage>;
 }
 
 export function rootOf(appHome: string) {
@@ -177,13 +178,40 @@ export function normalizeUsage(usage: Record<string, unknown>, sourceKey: string
   return normalized;
 }
 
+/** Usage is a message snapshot: newer, more complete snapshots supersede partial ones, never regress. */
+function mergeUsageSnapshots(previous: NormalizedUsage, candidate: NormalizedUsage): NormalizedUsage {
+  const knownCount = (usage: NormalizedUsage) => USAGE_FIELDS.filter((field) => usage[field] !== undefined).length;
+  if (knownCount(candidate) < knownCount(previous)) return previous;
+
+  const merged: NormalizedUsage = {
+    ...candidate,
+    costUnknownEntries: Math.max(previous.costUnknownEntries, candidate.costUnknownEntries),
+  };
+  for (const field of USAGE_FIELDS) {
+    if (merged[field] === undefined && previous[field] !== undefined) merged[field] = previous[field];
+  }
+  const unknownFields = USAGE_FIELDS.filter((field) => merged[field] === undefined);
+  if (unknownFields.length) merged.unknownFields = unknownFields;
+  else delete merged.unknownFields;
+  return merged;
+}
+
+function sameUsageSnapshot(left: NormalizedUsage, right: NormalizedUsage) {
+  return left.sourceKey === right.sourceKey &&
+    left.costKnown === right.costKnown &&
+    left.costUnknownEntries === right.costUnknownEntries &&
+    USAGE_FIELDS.every((field) => left[field] === right[field]) &&
+    USAGE_FIELDS.filter((field) => left.unknownFields?.includes(field))
+      .join(",") === USAGE_FIELDS.filter((field) => right.unknownFields?.includes(field)).join(",");
+}
+
 export interface TranscriptUsage {
   messageId: string;
   usage: NormalizedUsage;
 }
 
 /**
- * 從 transcript 的行裡挑出 assistant usage。同一個 message ID 只留最後一次看到的快照。
+ * 從 transcript 的行裡挑出 assistant usage。同一個 message ID 留欄位最完整的快照；完整度相同以較後面紀錄更新。
  * `since` 之後才有紀錄屬於這個 epoch：resume 時舊帳不重算（§6.2）。
  */
 export function transcriptUsage(
@@ -212,9 +240,11 @@ export function transcriptUsage(
     if (!usage || typeof usage !== "object") continue;
     const at = typeof record.timestamp === "string" ? Date.parse(record.timestamp) : Number.NaN;
     if (options.since !== undefined && Number.isFinite(at) && at < options.since) continue;
+    const candidate = normalizeUsage(usage as Record<string, unknown>, `${CLI}#${options.sessionId}#${messageId}`);
+    const previous = byId.get(messageId);
     byId.set(messageId, {
       messageId,
-      usage: normalizeUsage(usage as Record<string, unknown>, `${CLI}#${options.sessionId}#${messageId}`),
+      usage: previous ? mergeUsageSnapshots(previous.usage, candidate) : candidate,
     });
   }
   return { entries: [...byId.values()], seenVersion };
@@ -368,6 +398,13 @@ export class HookRun {
       if (typeof existing?.role === "string") state.role = existing.role as Role;
       if (typeof existing?.parentSessionId === "string") state.parentSessionId = existing.parentSessionId;
     }
+    state.usageByMessage = state.usageByMessage && typeof state.usageByMessage === "object" ? state.usageByMessage : {};
+    for (const event of existingEvents) {
+      const usage = event.kind === "usage" && event.sourceEntryId ? event.usage?.anthropic : undefined;
+      if (!usage) continue;
+      const previous = state.usageByMessage[event.sourceEntryId!];
+      state.usageByMessage[event.sourceEntryId!] = previous ? mergeUsageSnapshots(previous, usage) : usage;
+    }
     state.seq = Math.max(state.seq, existingEvents.reduce((latest, event) => Math.max(latest, event.eventSeq ?? 0), 0));
     if (input.hook_event_name === "SubagentStart" || input.hook_event_name === "SubagentStop") {
       state.role = "child";
@@ -464,9 +501,6 @@ export class HookRun {
     } catch {
       return; // transcript 還沒出現：不是 0 消耗，只是還沒有可證明的用量
     }
-    const already = new Set(
-      this.activity.events.filter((event) => event.kind === "usage" && event.sourceEntryId).map((event) => event.sourceEntryId as string),
-    );
     const { entries, seenVersion } = transcriptUsage(lines, {
       sessionId: this.sessionId,
       includeSidechain,
@@ -474,9 +508,13 @@ export class HookRun {
     });
     if (seenVersion && this.activity.cliVersion === "unknown") this.activity.cliVersion = seenVersion;
     for (const entry of entries) {
-      if (already.has(entry.messageId)) continue;
-      already.add(entry.messageId);
-      this.emit("usage", at, { usage: { anthropic: entry.usage }, sourceEntryId: entry.messageId });
+      const previous = this.state.usageByMessage?.[entry.messageId];
+      const usage = previous ? mergeUsageSnapshots(previous, entry.usage) : entry.usage;
+      this.state.usageByMessage ??= {};
+      this.state.usageByMessage[entry.messageId] = usage;
+      if (previous && sameUsageSnapshot(previous, usage)) continue;
+      // A correction keeps sourceKey; readTown uses the last snapshot for that source.
+      this.emit("usage", at, { usage: { anthropic: usage }, sourceEntryId: entry.messageId });
     }
   }
   /** 收尾 visit：區間還開著就先關，再結束這一段。 */
