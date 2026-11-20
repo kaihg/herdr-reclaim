@@ -8,6 +8,7 @@
 // 「還沒有收成」與「沒有額度來源」。
 import { CENTER, bfsNextTile, keyOf } from "./grid.js";
 import { BOOST_POINTS_PER_PARCHMENT, CLEAR_POINTS, RECIPES, RESEARCH_TOKENS_PER_PARCHMENT, RESOURCE_LABELS, TRADE_RATE, buildableRecipes } from "./rules.js";
+import { basisNote, factionOf, formatFaction, investmentsOf, mergeInvestments, quotaLines } from "./provider-stats.js";
 
 export const SCHEMA = 1;
 
@@ -93,7 +94,7 @@ function usageBySource(records) {
       if (event.kind !== "usage") continue;
       for (const [provider, usage] of Object.entries(event.usage ?? {})) {
         const source = usage.sourceKey ?? (event.sourceEntryId ? `${origin}#${event.sourceEntryId}` : `${origin}#${record.writerEpoch ?? ""}#${event.eventSeq}`);
-        bySource.set(`${source}#${provider}`, { ...usage, cityId, at: event.at });
+        bySource.set(`${source}#${provider}`, { ...usage, provider, cityId, at: event.at });
       }
     }
   }
@@ -314,6 +315,14 @@ export function readTownFromLedger(replay = {}) {
     city.market = replay.market?.[city.cityId] ?? city.market;
     city.unharvestedCommits = replay.unharvestedCommits?.[city.cityId] ?? [];
   }
+  // 城的「主要行會」（§9）：把每一格的投資併起來，投入最多的 provider 就是這座城的行會。
+  for (const city of town.cities) {
+    city.investment = mergeInvestments(city.tiles.map((tile) => tile.investment));
+    city.guild = city.investment.providers.length ? factionOf(city.investment) : null;
+  }
+  // 額度是帳號層級（同一帳號的多個 pane 共用一份），所以放在城鎮模型的最上層（§9）。
+  // 沒有回報檔時不憑空多一個欄位（#11 的慣例）：畫面看到的就是「未知」。
+  if (replay.quotas) town.quotas = replay.quotas;
   town.unresolvedActivities = replay.unresolvedActivities ?? [];
   return town;
 }
@@ -400,21 +409,26 @@ function replayTown(replay, place) {
     city.tiles = city.tiles.map(finishTile);
     city.name = cityNameOf(city.cityId, city.checkout);
     city.unharvestedCommits = replay.unharvestedCommits?.[city.cityId] ?? [];
+    // 城的「主要行會」（§9）：併起每一格的投資，投入最多的 provider。
+    city.investment = mergeInvestments(city.tiles.map((tile) => tile.investment));
+    city.guild = city.investment.providers.length ? factionOf(city.investment) : null;
   }
-
+  // 額度是帳號層級（§9）：replay 有帶回報檔才出現這個欄位，沒有就是未知。
   return {
     schema: SCHEMA,
     unresolvedActivities: replay.unresolvedActivities ?? [],
+    ...(replay.quotas ? { quotas: replay.quotas } : {}),
     cities: [...cities.values()].map((city) => ({
       cityId: city.cityId,
       name: city.name,
       center: centerOf(city.cityId, repoFacts),
-      // 收成（#4／#5）之前，庫存是空的；行會沒有額度來源時顯示未知（§9）。
+      // 收成（#4／#5）之前，庫存是空的（§10）。
       resources: { wood: 0, stone: 0, iron: 0, parchment: 0 },
       // 研究計量器與市集統計由帳本模式的 replay 帶進來（#8）。
       research: { tokens: 0 },
       market: { in: { wood: 0, stone: 0, iron: 0, parchment: 0 }, out: { wood: 0, stone: 0, iron: 0, parchment: 0 } },
-      guild: null,
+      guild: city.guild,
+      investment: city.investment,
       unharvestedCommits: city.unharvestedCommits,
       tiles: city.tiles,
     })),
@@ -463,22 +477,6 @@ function newTile(session, city, visit, planned) {
 export const ZERO_USAGE = { inputNonCache: 0, cacheRead: 0, cacheWrite: 0, output: 0, costKnown: 0, costUnknownEntries: 0 };
 
 /**
- * 一格（或一支遠征）的用量：root 加上併進來的 child，同一把來源 key 只算一次（§6.1、§15.6）。
- * 每筆用量依發生時的 cityId 歸城；child 的用量依 S1 歸到 root 遠征。
- */
-function sumUsage(sources, cityId, startedAt = -Infinity, endedAt = Infinity) {
-  const total = { ...ZERO_USAGE };
-  const unknownFields = new Set();
-  for (const session of sources) {
-    for (const usage of session.usage.values()) {
-      if (usage.cityId !== cityId || usage.at < startedAt || usage.at >= endedAt) continue;
-      for (const key of Object.keys(total)) total[key] += Number(usage[key]) || 0;
-      for (const field of usage.unknownFields ?? []) unknownFields.add(field);
-    }
-  }
-  if (unknownFields.size) total.unknownFields = [...unknownFields].sort();
-  return total;
-}
 
 function providerUsage(sources, cityId, startedAt, endedAt) {
   const byProvider = new Map();
@@ -514,6 +512,16 @@ function finishTile(tile) {
   const boostPoints = tile.boostPoints ?? 0;
   const points = workPoints + harvestPoints + boostPoints;
   const derivedStage = points >= CLEAR_POINTS ? "cleared" : "reserved";
+  // §9 的投資：一格只算自己的 visit 與可歸戶 child 的用量，並依 provider 分開。
+  const investment = investmentsOf(tile.sources, tile.cityId, startedAt, endedAt);
+  const rootInvestment = investmentsOf(
+    tile.sources.filter((session) => session.sessionId === tile.rootSessionId),
+    tile.cityId,
+    startedAt,
+    endedAt,
+  );
+  // 投入最多的 provider 決定派系；同分時取 root session 的 provider（§9）。
+  const faction = factionOf(investment, factionOf(rootInvestment).provider);
   return {
     cityId: tile.cityId,
     x: tile.x,
@@ -535,7 +543,9 @@ function finishTile(tile) {
     scrollsUsed: tile.scrollsUsed ?? 0,
     harvests: tile.harvests ?? [],
     providerUsage: providerUsage(tile.sources, tile.cityId, startedAt, endedAt),
-    usage: sumUsage(tile.sources, tile.cityId, startedAt, endedAt),
+    investment,
+    faction,
+    usage: investment.total,
     harvested: tile.harvested === true,
     landStage: tile.landStage ?? derivedStage,
     status: intervals.some((interval) => interval.open) ? "active" : "idle",
@@ -578,7 +588,7 @@ export function selectionDetail(town, selection) {
   if (selection?.kind === "tile") {
     const tile = city.tiles.find((candidate) => candidate.x === selection.x && candidate.y === selection.y);
     if (tile) return expeditionDetail(city, tile);
-    if (selection.x === city.center.x && selection.y === city.center.y) return centerDetail(city);
+    if (selection.x === city.center.x && selection.y === city.center.y) return centerDetail(city, town.quotas);
     return detail("fog", city, { x: selection.x, y: selection.y }, "迷霧", null, []);
   }
 
@@ -599,6 +609,11 @@ function detail(kind, city, tile, title, statusLabel, fields) {
     buildable: [],
     boost: null,
     market: marketDetail(city),
+    // 派系、投入與行會人力只影響顯示（§9）：遠征給自己的，中央格給整座城與帳號額度。
+    faction: null,
+    investment: null,
+    investmentNote: null,
+    quota: [],
     fields,
   };
 }
@@ -650,6 +665,10 @@ function expeditionDetail(city, tile) {
     buildable: tile.landStage === "cleared" ? buildableRecipes(city.resources) : [],
     boost: boostDetail(city, tile),
     market: marketDetail(city),
+    // §9：這一格的投資（依 provider 分開）決定建築派系；畫面要標明比較基準的限制。
+    faction: tile.faction,
+    investment: tile.investment,
+    investmentNote: basisNote(tile.investment),
     fields: [
       { label: "工作時間", value: formatDuration(tile.workMs) },
       { label: "工作區間", value: `${formatTimestamp(tile.activatedAt)} – ${tile.deactivatedAt == null ? "進行中" : formatTimestamp(tile.deactivatedAt)}` },
@@ -667,6 +686,7 @@ function expeditionDetail(city, tile) {
       })),
       { label: "點數", value: `工作 ${tile.workPoints} · 收成 ${tile.harvestPoints} · 加速 ${tile.boostPoints}` },
       { label: "用量", value: formatUsage(tile.usage) },
+      { label: "派系", value: formatFaction(tile.faction) },
       { label: "土地", value: stageLabel },
       ...(tile.building ? [{
         label: "建築",
@@ -714,9 +734,11 @@ function formatCosts(costs = {}) {
   return Object.entries(costs).map(([key, amount]) => `${RESOURCE_LABELS[key] ?? key}${amount}`).join("・");
 }
 
-function centerDetail(city) {
+function centerDetail(city, quotas = null) {
   const stock = city.resources;
   const inventory = `木材 ${stock.wood} · 石材 ${stock.stone} · 鐵料 ${stock.iron} · 羊皮卷 ${stock.parchment}`;
+  // 行會人力（§9）：這座城投入過的 provider，加上回報檔裡的其他 provider；沒有的顯示未知。
+  const providers = (city.investment?.providers ?? []).map((entry) => entry.provider);
   return {
     kind: "center",
     cityId: city.cityId,
@@ -726,11 +748,13 @@ function centerDetail(city) {
     statusLabel: null,
     points: null,
     pointsTarget: null,
+    quota: quotaLines(quotas, { providers }),
     fields: [
       { label: "身份", value: city.center.label },
       { label: "座標", value: `${city.center.x}, ${city.center.y}` },
       { label: "遠征", value: `${city.tiles.length} 支` },
       { label: "庫存", value: inventory },
+      { label: "主要行會", value: city.guild ? formatFaction(city.guild) : "未知" },
       { label: "研究", value: formatResearch(city.research) },
       { label: "市集", value: formatMarket(city.market) },
       { label: "城的身份", value: city.cityId },

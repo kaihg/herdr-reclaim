@@ -152,3 +152,5 @@ merge_hooks install
 printf 'installed: %s\n' "$SCRIPT"
 printf 'installed: %s (12 個生命週期 hook)\n' "$HOOKS"
 printf 'next: 在 %s/config.toml 設 [features] hooks = true，並讓 Codex 信任這些 hook\n' "$TARGET"
+printf '      信任項由 Codex 自己記在 %s/config.toml 的 [hooks.state]，鍵是 "<hooks.json 路徑>:<事件>:<索引>:0"\n' "$TARGET"
+printf '      第一次跑 Codex 會問；自動化可用 codex --dangerously-bypass-hook-trust（本安裝器不代寫信任）\n' "$TARGET"

@@ -27,16 +27,18 @@ import { CasConflict, CityLedger, cityDir } from "./core/ledger.js";
 import { installHooks, removeHooks } from "./core/hooks.js";
 import { RESEARCH_TOKENS_PER_PARCHMENT, RESOURCE_LABELS, RULES_VERSION } from "./core/rules.js";
 import { defaultSelection, parseUi, resolveSelection, selectionOf, serializeUi, withSelection } from "./core/selection.js";
+import { readQuotas } from "./core/provider-stats.js";
 import { CLEAR_POINTS, formatResearch, readTown, readTownFromLedger, selectionDetail } from "./core/town.js";
 import { firstExpedition } from "./scenarios/first-expedition.js";
 import { searchHistory } from "./core/history.js";
 import { historyPanel } from "./ui/history.js";
+import { factionTag, guildBlock, investmentSection, quotaSection } from "./ui/standing.js";
 
 const MIN_LEFT_W = 96;
 const MAX_LEFT_W = 240;
 const MIN_RIGHT_W = 108;
 const MAX_RIGHT_W = 292;
-const TOP_H = 84;
+const TOP_H = 92;
 
 const RESOURCES = [
   { key: "wood", label: "木材", color: "ansi3" },
@@ -249,7 +251,23 @@ async function loadTown(io) {
     market,
     unresolvedActivities,
     unharvestedCommits: unharvested,
+    quotas: await loadQuotas(io),
   });
+}
+
+/**
+ * 額度回報檔（§9）：adapter 或外部工具把 provider 明確回報的額度寫成 S5 的形狀
+ * （spikes/s5/observed.json：`omp usage --json --redact` 的輸出）。mod 只讀這個檔案，
+ * 不讀任何 provider 憑證、也不自己向 provider 查詢；讀不到或讀壞了就是「未知」。
+ */
+async function loadQuotas(io) {
+  const text = await io.read(`${adapterRoot(appHome())}/quotas.json`);
+  if (text === null) return readQuotas(null);
+  try {
+    return readQuotas(JSON.parse(text), { now: Date.now() });
+  } catch {
+    return readQuotas(null);
+  }
 }
 
 /** 選取狀態的檔案（不是城的帳本）：選取不產生資源，也不改變土地。 */
@@ -538,7 +556,7 @@ export default class Town extends View {
         cx2.notify();
       })
       .children([
-        this.topBar(city, t, leftW),
+        this.topBar(city, t, leftW, rightW, width),
         h_flex().flex_1().min_h(0).children([
           this.expeditionList(city, t, cx, leftW),
           this.map(city, t, cx, mapArea),
@@ -573,7 +591,26 @@ export default class Town extends View {
       cx2.notify();
     });
   }
-  topBar(city, t, leftW) {
+  topBar(city, t, leftW, rightW, width) {
+    // 窄 pane：中央那塊的內容比剩下的寬度還寬時，會蓋到左右兩塊。改成上下兩排，
+    // 並且一律 overflow_hidden，寧可裁掉也不畫在別人上面（§14.1 的四個區塊都要在）。
+    const blockW = Math.round(clamp(96, rightW * 0.62, 176));
+    const centerW = Math.max(60, width - leftW - blockW - 52);
+    const stacked = centerW < 430;
+    const stock = h_flex()
+      .gap(10)
+      .items_center()
+      .child(div().text_size(10).text_color(t.dim).child("庫存"))
+      .children(RESOURCES.map((resource) => resourceChip(resource, city.resources[resource.key], t)));
+    // §7.4 的研究計量器：每滿 100,000 換 1 張羊皮卷，餘數按城保留。
+    const research = h_flex()
+      .gap(6)
+      .items_center()
+      .child(div().text_size(10).text_color(t.dim).child("研究"))
+      .child(div().text_size(12.5).child(`${city.research?.tokens ?? 0} / ${RESEARCH_TOKENS_PER_PARCHMENT}`));
+    const center = stacked
+      ? v_flex().flex_1().min_w(0).overflow_hidden().gap(2).child(stock).child(research)
+      : h_flex().flex_1().min_w(0).overflow_hidden().items_center().justify_center().gap(14).child(stock).child(research);
     return h_flex()
       .id("top")
       .flex_none()
@@ -588,28 +625,20 @@ export default class Town extends View {
         v_flex()
           .w(leftW)
           .flex_none()
+          .overflow_hidden()
           .child(div().text_size(10).text_color(t.dim).child("遠征指揮桌"))
-          .child(div().text_size(17).font_semibold().truncate().child(city.name)),
-        h_flex()
-          .flex_1()
-          .min_w(0)
-          .items_center()
-          .justify_center()
-          .gap(14)
-          .child(div().text_size(10).text_color(t.dim).child("庫存"))
-          .children(RESOURCES.map((resource) => resourceChip(resource, city.resources[resource.key], t)))
-          // §7.4 的研究計量器：每滿 100,000 換 1 張羊皮卷，餘數按城保留。
-          .child(div().text_size(10).text_color(t.dim).child("研究"))
-          .child(div().text_size(12.5).child(`${city.research?.tokens ?? 0} / ${RESEARCH_TOKENS_PER_PARCHMENT}`)),
+          .child(div().text_size(stacked ? 13 : 17).font_semibold().truncate().child(city.name)),
+        center,
         v_flex()
-          .w(176)
+          // 窄 pane 不跟中央那塊搶寬度：右側區塊也有下限，文字自己 truncate。
+          .w(blockW)
           .flex_none()
+          .overflow_hidden()
           .items_end()
-          .gap(4)
-          .child(div().text_size(10).text_color(t.dim).child("主要行會"))
-          .child(div().text_size(12.5).child(city.guild ? city.guild.name : "未知"))
-          .child(div().text_size(9).text_color(t.dim).child(`規則 v${RULES_VERSION}`))
-          .child(h_flex().gap(5).children([
+          .gap(3)
+          .children(guildBlock(city, this.town?.quotas, t))
+          .child(h_flex().gap(6).items_center().children([
+            div().text_size(9).text_color(t.dim).child(`規則 v${RULES_VERSION}`),
             hookButton("安裝收成", t, (cx2) => this.manageHooks(city, false, cx2)),
             hookButton("移除", t, (cx2) => this.manageHooks(city, true, cx2)),
           ]))
@@ -681,6 +710,7 @@ export default class Town extends View {
           .child(div().text_size(11).text_color(status.color).child(status.label)),
         div().text_size(12.5).font_semibold().truncate().child(`遠征 ${shortId(tile.rootSessionId)} · 第 ${tile.generation} 代`),
         div().text_size(11).text_color(t.muted).truncate().child(`${tile.points} / ${CLEAR_POINTS} · ${tile.cli ?? "未知"}`),
+        factionTag(tile, t),
       ]);
   }
 
@@ -804,6 +834,8 @@ export default class Town extends View {
             ? hookButton("歷程搜尋", t, (cx2) => this.openHistory(cx2))
             : null,
           ...detail.fields.map((field) => fieldRow(field, t)),
+          ...(detail.investment ? investmentSection(detail, t) : []),
+          ...(detail.quota?.length ? quotaSection(detail, t) : []),
           ...(detail.actions ?? []).map((action) =>
             hookButton(actionLabels[action], t, (cx2) => this.operateLand(detail, action, cx2))),
           detail.actionUnavailableReason

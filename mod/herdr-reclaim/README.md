@@ -13,6 +13,8 @@ herdr 的開墾城鎮 mod。這個資料夾是 mod 本體：一個「遠征指�
 | `core/history.js` | 從可重建的 checkpoint 索引與 journal 尾段搜尋提交、收成、活動及格子路徑；結果保留世代跳轉目標 |
 | `ui/history.js` | 只從選取遠征／格子的詳情開啟歷程搜尋，不在中央地圖常駐時間軸 |
 | `core/ingest.js` | 把 §6.1 的活動紀錄與「遠征取得土地」寫進帳本（順序與 `planExpeditions` 相同） |
+| `core/provider-stats.js` | 額度、投入與建築派系（§9）：S5 形狀的 provider 回報 → 顯示模型；一格依 provider 分開的投入與派系；不改變任何數值 |
+| `ui/standing.js` | 主要行會、額度與派系的畫面（上方那條、右側投入區、中央的行會人力清單） |
 | `core/grid.js` | 邏輯座標、BFS 選地與 3/4 投影（投影與規則分開） |
 | `core/host-io.js` | 儲存介面的 host 適配層：herdr 的原生 CAS 衝突 → `CasConflict`（見下） |
 | `core/selection.js` | 選取狀態的保存（不是城的帳本；見下） |
@@ -51,6 +53,11 @@ mod 端由 `core/host-io.js` 把 herdr 的原生錯誤轉成 `CasConflict`（真
   才 compact 已確認的事件。
 
 資料在 `appHome()/data/herdr-reclaim/`：`activity/<sessionId>/<writerEpoch>.json` 是 OMP extension 寫入的活動檔；`cities/<cityId 的雜湊>/` 是每座城的帳本（§13）。
+`quotas.json`（同一個資料目錄）是**選配**的額度回報檔：內容是 provider 明確回報的額度，
+形狀與 `spikes/s5/observed.json` 相同（`omp usage --json --redact` 的輸出：`generatedAt`、
+`reports[].fetchedAt`、`reports[].limits[].amount` 與 `window.resetsAt`）。mod 只讀這個檔案，
+不讀也不會去查任何 provider 憑證；檔案不存在、壞掉、過期，或某個 provider／帳號沒有回報，
+畫面就顯示「未知」，不推算成 0 或 100，也不把沒有額度的帳號與已知帳號合併（§9、§15.2）。
 
 OMP extension 是獨立檔 `omp-extension/herdr-reclaim.ts`，日常互動 session 自動寫活動檔；
 mod 以 `find` 列活動檔，成功寫 journal 後按 epoch 寫 ack，並用 `watchFolder` 監看新活動。
