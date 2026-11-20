@@ -51,7 +51,7 @@ function dedupeEvents(events) {
   return [...bySeq.values()].sort((a, b) => a.eventSeq - b.eventSeq);
 }
 
-/** 一支 session 重播後的樣子：身份、每個 visit、工作區間。 */
+/** 一支 session 重播後的樣子：身份、每個 visit、工作區間、用量。 */
 function sessionOf(records) {
   const first = records[0];
   // 每個 epoch 有自己的時間軸（§6.2）：interval 分開算，再跟其他 epoch 取聯集，
@@ -67,7 +67,36 @@ function sessionOf(records) {
     startedAt: earliestAt(intervals, visits),
     visits,
     intervals,
+    usage: usageBySource(records),
   };
+}
+
+/**
+ * 用量 key 為（cli、sessionId、來源 entry id）。每筆資料也保留發生時的 cityId，
+ * 不能把跨城工作加到每個 visit 的格子裡。
+ */
+function usageBySource(records) {
+  const bySource = new Map();
+  for (const record of records) {
+    const origin = `${record.cli ?? "unknown"}#${record.sessionId}`;
+    let cityId = null;
+    for (const event of record.events) {
+      if (event.kind === "visit_start") {
+        cityId = event.visit?.commonDir ?? null;
+        continue;
+      }
+      if (event.kind === "visit_end") {
+        cityId = null;
+        continue;
+      }
+      if (event.kind !== "usage") continue;
+      for (const [provider, usage] of Object.entries(event.usage ?? {})) {
+        const source = usage.sourceKey ?? (event.sourceEntryId ? `${origin}#${event.sourceEntryId}` : `${origin}#${record.writerEpoch ?? ""}#${event.eventSeq}`);
+        bySource.set(`${source}#${provider}`, { ...usage, cityId });
+      }
+    }
+  }
+  return bySource;
 }
 
 function earliestAt(intervals, visits) {
@@ -79,28 +108,46 @@ function earliestAt(intervals, visits) {
 function visitsOf(events) {
   const visits = [];
   for (const event of [...events].sort((a, b) => a.at - b.at)) {
-    if (event.kind !== "visit_start" || !event.visit) continue;
     const previous = visits[visits.length - 1];
-    if (previous) previous.endedAt = event.at;
-    visits.push({
-      visitId: event.visit.visitId,
-      cwd: event.visit.cwd,
-      commonDir: event.visit.commonDir ?? null,
-      checkout: event.visit.checkout ?? null,
-      startedAt: event.at,
-      endedAt: null,
-    });
+    if (event.kind === "visit_start" && event.visit) {
+      if (previous) previous.endedAt = event.at;
+      visits.push({
+        visitId: event.visit.visitId,
+        cwd: event.visit.cwd,
+        commonDir: event.visit.commonDir ?? null,
+        checkout: event.visit.checkout ?? null,
+        startedAt: event.at,
+        endedAt: null,
+      });
+    } else if (event.kind === "visit_end" && previous && previous.endedAt === null) {
+      previous.endedAt = event.at;
+    }
   }
   return visits;
 }
 
-/** §6.2：heartbeat 只延長自己 epoch 內還沒關閉的 interval；沒關閉的算到最後一次 heartbeat。 */
+/** §6.2：heartbeat 只延長自己 epoch 內尚未關閉、且屬於目前 visit 的 interval。 */
 function intervalsOf(events) {
   const intervals = [];
+  let cityId = null;
   let open = null;
   for (const event of events) {
-    if (event.kind === "interval_open") {
-      open = { start: event.at, end: event.at, open: true };
+    if (event.kind === "visit_start") {
+      if (open) {
+        open.end = Math.max(open.end, event.at);
+        open.open = false;
+        open = null;
+      }
+      cityId = event.visit?.commonDir ?? null;
+    } else if (event.kind === "visit_end") {
+      if (open) {
+        open.end = Math.max(open.end, event.at);
+        open.open = false;
+        open = null;
+      }
+      cityId = null;
+    } else if (event.kind === "interval_open") {
+      open = { start: event.at, end: event.at, open: true, cityId };
       intervals.push(open);
     } else if (event.kind === "heartbeat") {
       if (open) open.end = Math.max(open.end, event.at);
@@ -342,12 +389,28 @@ function newTile(session, city, visit, planned) {
   };
 }
 
+/** 還沒有任何用量時的加總起點。 */
+export const ZERO_USAGE = { inputNonCache: 0, cacheRead: 0, cacheWrite: 0, output: 0, costKnown: 0, costUnknownEntries: 0 };
+
 /**
- * §10：總點數 = floor(自然工作毫秒 / 60_000) + 收成點數（+ 之後的加速點數）。
- * 自然工作毫秒由合併後的 interval 算；收成點數是帳本裡那一格的欄位。
+ * 一格（或一支遠征）的用量：root 加上併進來的 child，同一把來源 key 只算一次（§6.1、§15.6）。
+ * 每筆用量依發生時的 cityId 歸城；child 的用量依 S1 歸到 root 遠征。
  */
+function sumUsage(sources, cityId) {
+  const total = { ...ZERO_USAGE };
+  for (const session of sources) {
+    for (const usage of session.usage.values()) {
+      if (usage.cityId !== cityId) continue;
+      for (const key of Object.keys(total)) total[key] += Number(usage[key]) || 0;
+    }
+  }
+  return total;
+}
+
+/** §10：總點數 = floor(自然工作毫秒 / 60_000) + 收成點數。 */
 function finishTile(tile) {
-  const workMs = unionMs(tile.sources.flatMap((session) => session.intervals));
+  const intervals = tile.sources.flatMap((session) => session.intervals.filter((interval) => interval.cityId === tile.cityId));
+  const workMs = unionMs(intervals);
   const harvestPoints = tile.harvestPoints ?? 0;
   const points = Math.floor(workMs / MINUTE_MS) + harvestPoints;
   return {
@@ -361,11 +424,10 @@ function finishTile(tile) {
     visits: tile.visits,
     workMs,
     points,
+    usage: sumUsage(tile.sources, tile.cityId),
     harvestPoints,
     landStage: points >= CLEAR_POINTS ? "cleared" : "reserved",
-    status: tile.sources.some((session) => session.intervals.some((interval) => interval.open))
-      ? "active"
-      : "idle",
+    status: intervals.some((interval) => interval.open) ? "active" : "idle",
   };
 }
 
@@ -435,6 +497,7 @@ function expeditionDetail(city, tile) {
     pointsTarget: CLEAR_POINTS,
     fields: [
       { label: "工作時間", value: formatDuration(tile.workMs) },
+      { label: "用量", value: formatUsage(tile.usage) },
       { label: "土地", value: tile.landStage === "cleared" ? "已開墾" : "預留" },
       { label: "座標", value: `${tile.x}, ${tile.y}` },
       { label: "CLI", value: tile.cli ?? "未知" },
@@ -476,4 +539,17 @@ export function formatDuration(ms) {
   const hours = Math.floor(minutes / 60);
   const rest = minutes % 60;
   return rest ? `${hours} 小時 ${rest} 分` : `${hours} 小時`;
+}
+
+/** 右側詳情的用量一行：進／出與快取，價格未知時明說，不假裝是 0。 */
+export function formatUsage(usage = ZERO_USAGE) {
+  const parts = [
+    `進 ${usage.inputNonCache}`,
+    `出 ${usage.output}`,
+    `快取讀 ${usage.cacheRead}`,
+    `快取寫 ${usage.cacheWrite}`,
+  ];
+  const cost = usage.costKnown > 0 ? ` · 成本 ${usage.costKnown.toFixed(4)}` : "";
+  const unknown = usage.costUnknownEntries > 0 ? ` · ${usage.costUnknownEntries} 筆價格未知` : "";
+  return `${parts.join(" · ")}${cost}${unknown}`;
 }
