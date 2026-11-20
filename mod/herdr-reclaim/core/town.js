@@ -1,7 +1,10 @@
 // 城鎮讀取模型：把 adapter 的活動紀錄（§6.1）重播成可觀察的城鎮狀態（§4、§5）。
 //
-// 這一票只做 #2 需要的欄位：身份（城、session、格子）、BFS 選地、活動狀態與工作時間。
-// 土地生命週期、commit 收成、建築與額度由 #3／#4 接上；庫存與行會在這裡先固定成
+// 兩個接點共用同一段重播規則：
+//   readTown({ activities, repoFacts })        直接重播活動，格子位置由 §4 的 BFS 決定（#2）
+//   readTownFromLedger({ activities, expeditions, repoFacts })  格子位置由 journal 的
+//                                              「遠征取得土地」entry 決定（#3）
+// 土地生命週期、commit 收成、建築與額度由 #4／#5 接上；庫存與行會在這裡先固定成
 // 「還沒有收成」與「沒有額度來源」。
 import { CENTER, bfsNextTile, keyOf } from "./grid.js";
 
@@ -149,6 +152,93 @@ function centerOf(cityId, repoFacts) {
  * 同一組事件重播幾次、紀錄在陣列裡怎麼排，結果都一樣。
  */
 export function readTown(replay = {}) {
+  return replayTown(replay, autoPlace);
+}
+
+/**
+ * 帳本模式的重播接點（ticket #3）：格子位置由 journal 的「遠征取得土地」entry 決定，
+ * activities 只提供身份、visit 與工作區間。沒有 entry 的遠征不會出現在地圖上。
+ */
+export function readTownFromLedger(replay = {}) {
+  const expeditions = replay.expeditions ?? [];
+  const spots = new Map(expeditions.map((entry) => [`${entry.rootSessionId}@@${entry.cityId}`, entry]));
+  const town = replayTown({ activities: replay.activities, repoFacts: replay.repoFacts }, (session, visit) => {
+    const entry = spots.get(`${session.sessionId}@@${visit.commonDir}`);
+    return entry ? { x: entry.x, y: entry.y, generation: entry.generation ?? 1 } : null;
+  });
+
+  // 帳本有 entry、活動紀錄還沒到的格子也要畫出來（工作時間 0、狀態駐紮）。
+  for (const entry of expeditions) {
+    let city = town.cities.find((candidate) => candidate.cityId === entry.cityId);
+    if (!city) {
+      city = {
+        cityId: entry.cityId,
+        name: cityNameOf(entry.cityId, entry.repo?.checkout ?? null),
+        center: centerOf(entry.cityId, replay.repoFacts ?? {}),
+        resources: { wood: 0, stone: 0, iron: 0, parchment: 0 },
+        guild: null,
+        tiles: [],
+      };
+      town.cities.push(city);
+    }
+    // 同一支遠征可能有不同 generation（#4 的重新派遣），所以兩者都要比。
+    const generation = entry.generation ?? 1;
+    if (city.tiles.some((tile) => tile.rootSessionId === entry.rootSessionId && tile.generation === generation)) {
+      continue;
+    }
+    city.tiles.push(
+      finishTile({
+        cityId: entry.cityId,
+        x: entry.x,
+        y: entry.y,
+        rootSessionId: entry.rootSessionId,
+        generation,
+        cli: entry.cli ?? null,
+        repo: entry.repo ?? { commonDir: entry.cityId, checkout: null },
+        visits: [],
+        sources: [],
+      }),
+    );
+  }
+  return town;
+}
+
+/**
+ * 帳本要寫的「取得土地」清單：順序與 `readTown` 的建格順序相同，
+ * 帳本因此可以用同一套 BFS 規則重建出同一座城。
+ */
+export function planExpeditions(replay = {}) {
+  const plans = [];
+  replayTown(replay, (session, visit, cities) => {
+    const spot = autoPlace(session, visit, cities);
+    plans.push({
+      cityId: visit.commonDir,
+      rootSessionId: session.sessionId,
+      at: session.startedAt,
+      generation: spot.generation,
+      x: spot.x,
+      y: spot.y,
+      cli: session.cli,
+      repo: { commonDir: visit.commonDir, checkout: visit.checkout },
+    });
+    return spot;
+  });
+  return plans;
+}
+
+/** §4 的自動選地：從中心起 BFS，距離相同時依北、東、南、西。 */
+function autoPlace(_session, visit, cities) {
+  const city = cityFor(cities, visit.commonDir, visit.checkout);
+  const spot = bfsNextTile((candidate) => city.taken.has(keyOf(candidate)));
+  city.taken.add(keyOf(spot));
+  return { x: spot.x, y: spot.y, generation: 1 };
+}
+
+/**
+ * 重播的核心。`place(session, visit, cities)` 決定這一格在哪裡；回 null 代表
+ * 「這一次不算建格」（帳本裡沒有這筆 entry）。兩個接點共用同一段規則。
+ */
+function replayTown(replay, place) {
   const repoFacts = replay.repoFacts ?? {};
   const byId = new Map();
   for (const record of mergeActivities(replay.activities)) {
@@ -169,11 +259,13 @@ export function readTown(replay = {}) {
     if (!createsTile(session)) continue;
     for (const visit of session.visits) {
       if (!visit.commonDir) continue; // 非 git 的 cwd 不建城（§4）
-      const city = cityFor(cities, visit.commonDir, visit.checkout);
-      const key = `${session.sessionId}@@${city.cityId}`;
+      const key = `${session.sessionId}@@${visit.commonDir}`;
       let tile = tiles.get(key);
       if (!tile) {
-        tile = newTile(session, city, visit);
+        const planned = place(session, visit, cities);
+        if (!planned) continue;
+        const city = cityFor(cities, visit.commonDir, visit.checkout);
+        tile = newTile(session, city, visit, planned);
         tiles.set(key, tile);
         city.tiles.push(tile);
       }
@@ -200,7 +292,7 @@ export function readTown(replay = {}) {
       cityId: city.cityId,
       name: city.name,
       center: centerOf(city.cityId, repoFacts),
-      // 收成（#3）之前，庫存是空的；行會沒有額度來源時顯示未知（§9）。
+      // 收成（#4／#5）之前，庫存是空的；行會沒有額度來源時顯示未知（§9）。
       resources: { wood: 0, stone: 0, iron: 0, parchment: 0 },
       guild: null,
       tiles: city.tiles,
@@ -223,15 +315,13 @@ function cityFor(cities, cityId, checkout) {
   return city;
 }
 
-function newTile(session, city, visit) {
-  const spot = bfsNextTile((candidate) => city.taken.has(keyOf(candidate)));
-  city.taken.add(keyOf(spot));
+function newTile(session, city, visit, planned) {
   return {
     cityId: city.cityId,
-    x: spot.x,
-    y: spot.y,
+    x: planned.x,
+    y: planned.y,
     rootSessionId: session.sessionId,
-    generation: 1, // 重新派遣（#4）才會往上加
+    generation: planned.generation ?? 1, // 重新派遣（#4）才會往上加
     cli: session.cli,
     repo: { commonDir: city.cityId, checkout: visit.checkout },
     visits: [],

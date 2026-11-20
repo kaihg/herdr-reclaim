@@ -9,13 +9,19 @@
 // 兩側的寬度與格子大小都依這一格 mod 的實際大小算：mod 可以是一整頁，也可以是分割出來
 // 的窄 pane，四個區塊都要在。
 //
-// 資料來源：這一票是固定事件情境（scenarios/first-expedition.js）；#5 之後改成讀
-// adapter 寫的活動檔。畫面本身不需要跟著改。
+// 資料來源（ticket #3）：開啟時把活動紀錄寫進城帳本（core/ledger.js，journal 是唯一完成
+// 依據），再從帳本重建城鎮；關掉再開就得到同一座城。這一票的活動來源是固定事件情境
+// （scenarios/first-expedition.js），#5 之後改成讀 adapter 寫的活動檔，畫面不需要跟著改。
+//
+// 選取狀態不進城的帳本（見 core/selection.js 的說明），存在 mod 資料目錄下的小檔案。
 import { Background, PathBuilder, View, div } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
-import { settings, theme } from "herdr";
+import { appHome, checking, readTextFile, settings, theme, writeTextFile } from "herdr";
 import { MAP_RADIUS, keyOf, projectTile } from "./core/grid.js";
-import { CLEAR_POINTS, readTown, selectionDetail } from "./core/town.js";
+import { ingestScenario } from "./core/ingest.js";
+import { CityLedger, cityDir } from "./core/ledger.js";
+import { defaultSelection, parseUi, resolveSelection, selectionOf, serializeUi, withSelection } from "./core/selection.js";
+import { CLEAR_POINTS, readTown, readTownFromLedger, selectionDetail } from "./core/town.js";
 import { firstExpedition } from "./scenarios/first-expedition.js";
 
 const MIN_LEFT_W = 96;
@@ -43,6 +49,65 @@ function shortId(sessionId) {
   return String(sessionId).slice(0, 8);
 }
 
+/** mod 的資料目錄（在 herdr 的 appHome 底下）。 */
+const DATA_DIR = "data/herdr-reclaim";
+
+/** mod 端的儲存層：herdr 的 readTextFile 與 writeTextFile（CAS，expected 不符就拒絕）。 */
+function storageIo() {
+  return {
+    read: (path) => readTextFile(path),
+    write: (path, text, expected) => writeTextFile(path, text, expected),
+  };
+}
+
+/** 情境碰到的城：一個帳本只管一座城（§13）。 */
+function cityIdsOf(scenario) {
+  const ids = new Set();
+  for (const record of scenario.activities ?? []) {
+    for (const event of record.events ?? []) {
+      if (event.visit?.commonDir) ids.add(event.visit.commonDir);
+    }
+  }
+  return [...ids];
+}
+
+/** 寫進帳本（journal 是唯一完成依據），再從帳本重建城鎮。 */
+async function loadTown(io) {
+  const activities = [];
+  const expeditions = [];
+  for (const cityId of cityIdsOf(firstExpedition)) {
+    const ledger = await new CityLedger({ io, dir: cityDir(`${appHome()}/${DATA_DIR}`, cityId), cityId }).open();
+    await ingestScenario(ledger, firstExpedition, cityId);
+    const state = await ledger.state();
+    activities.push(...state.activities.values());
+    expeditions.push(...state.tiles);
+  }
+  return readTownFromLedger({ activities, expeditions, repoFacts: firstExpedition.repoFacts });
+}
+
+/** 選取狀態的檔案（不是城的帳本）：選取不產生資源，也不改變土地。 */
+const uiPath = () => `${appHome()}/${DATA_DIR}/ui.json`;
+
+/** 讀回上一次的選取；沒有記過就回預設。 */
+async function loadSelection(io, town) {
+  const cityId = town.cities[0]?.cityId ?? null;
+  const saved = cityId ? selectionOf(parseUi(await io.read(uiPath())), cityId) : null;
+  return { selection: resolveSelection(town, saved), saved: Boolean(saved) };
+}
+
+/** 讀、改、CAS 寫；另一個視窗同時寫就重讀再試一次。 */
+async function saveSelection(io, selection) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const before = await io.read(uiPath());
+    try {
+      await io.write(uiPath(), serializeUi(withSelection(parseUi(before), selection.cityId, selection)), before);
+      return;
+    } catch {
+      // 另一個視窗同時寫：重讀再試。
+    }
+  }
+}
+
 /**
  * 一格的地面：2:1 的菱形（等角 3/4）。邏輯範圍固定是 7×7 格，像素大小跟著地圖區域縮放，
  * 所以窄 pane 不會把最外圈裁掉。
@@ -68,23 +133,43 @@ function diamondPaths(tile) {
 }
 
 export default class Town extends View {
-  init() {
-    this.town = readTown(firstExpedition);
+  init(_props, cx) {
     this.rootSize = { width: 0, height: 0 };
-    const city = this.town.cities[0] ?? null;
-    const first = city?.tiles[0] ?? null;
-    // 預設選第一支遠征，指揮桌一打開右邊就有東西。
-    this.selection = first ? { kind: "expedition", cityId: city.cityId, rootSessionId: first.rootSessionId } : null;
+    this.selection = null;
+    this.note = "正在讀取城鎮帳本…";
+    // `herdr-app check` 會真的跑 init：不要動使用者的檔案，只渲染固定情境。
+    if (checking()) {
+      this.town = readTown(firstExpedition);
+      this.selection = defaultSelection(this.town);
+      this.note = null;
+      return;
+    }
+    this.io = storageIo();
+    cx.spawn(async (cx) => {
+      try {
+        this.town = await loadTown(this.io);
+        const loaded = await loadSelection(this.io, this.town);
+        this.selection = loaded.selection;
+        // 第一次開這座城：把當下顯示的選取記下來，重開後回到同一個位置。
+        if (!loaded.saved && this.selection) await saveSelection(this.io, this.selection);
+        this.note = null;
+      } catch (error) {
+        this.town = null;
+        this.note = `城鎮帳本讀取失敗：${error}`;
+      }
+      cx.notify();
+    });
   }
 
   city() {
-    const cities = this.town.cities;
+    const cities = this.town?.cities ?? [];
     const wanted = this.selection?.cityId;
     return (wanted ? cities.find((city) => city.cityId === wanted) : cities[0]) ?? null;
   }
 
   select(selection, cx) {
     this.selection = selection;
+    if (this.io) saveSelection(this.io, selection).catch(() => {});
     cx.notify();
   }
 
@@ -99,7 +184,7 @@ export default class Town extends View {
         .justify_center()
         .bg(t.canvas)
         .text_color(t.muted)
-        .child("還沒有任何城市：互動的 root session 進到一個 Git repo 之後就會出現。");
+        .child(this.note ?? "還沒有任何城市：互動的 root session 進到一個 Git repo 之後就會出現。");
     }
     // 這一格 mod 有多寬決定兩側的欄寬；窄 pane 也看得到四個區塊。
     // on_size_change 給的是實際像素（含畫面縮放），版面用的 .w()/.left() 是 UI 像素。
