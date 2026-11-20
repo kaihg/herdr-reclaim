@@ -43,6 +43,19 @@ export function parseRawDiff(output) {
   }
   return changes;
 }
+/** Extract SHA/repository evidence from reflog only; messages never establish session attribution. */
+export function parseReflogEvidence(output, cityId, checkout) {
+  const records = [];
+  const remoteMerges = new Set();
+  for (const line of output.split(/\r?\n/)) {
+    const [sha, ...parts] = line.split("\t");
+    if (!/^[0-9a-f]{40,64}$/i.test(sha ?? "")) continue;
+    const reflog = parts.join("\t");
+    if (/^(?:pull(?:\s|:)|merge (?:remote-tracking branch|(?:origin|upstream)[/ ])|reset: moving to (?:origin|upstream)\/|commit: Merge pull request\b)/i.test(reflog)) remoteMerges.add(sha);
+    records.push({ schema: 1, sha, hook: "reflog", commonDir: cityId, toplevel: checkout, at: 0, env: {}, reflog });
+  }
+  return { records, remoteMerges };
+}
 
 const sessionIdFromHook = (record) => record.env?.PI_SESSION_ID || record.env?.CODEX_THREAD_ID || record.env?.CLAUDE_SESSION_ID || null;
 
@@ -61,7 +74,7 @@ function attributionFor(sha, hooks, sources) {
   const unique = new Map(identities.map((identity) => [`${identity.cli}:${identity.sessionId}`, identity]));
   if (dirs.length !== 1) return { cityId: dirs[0] ?? null, identity: null, reason: dirs.length > 1 ? "ambiguous-repository" : "no-hook-repository-evidence" };
   if (unique.size !== 1) {
-    const terminalOnly = hookHits.some((record) => record.env?.HC_TERMINAL_ID) && unique.size === 0;
+    const terminalOnly = hookHits.some((record) => record.reason === "terminal-only" || record.env?.HC_TERMINAL_ID) && unique.size === 0;
     return { cityId: dirs[0], identity: null, reason: terminalOnly ? "terminal-only" : unique.size ? "ambiguous-session-source" : "no-session-source" };
   }
   return { cityId: dirs[0], identity: [...unique.values()][0], reason: null };
@@ -81,30 +94,32 @@ function rootSession(sessionId, activities) {
   return current;
 }
 
-export async function ingestCommits({ ledger, hooks, sources, activities, diffForCommit }) {
+export async function ingestCommits({ ledger, hooks, sources, activities, diffForCommit, remoteMerges = new Set() }) {
   const state = await ledger.state();
   const results = [];
   const shas = new Set([...hooks, ...sources].map((record) => record.sha));
   for (const sha of shas) {
     const attribution = attributionFor(sha, hooks, sources);
-    if (!attribution.cityId || attribution.cityId !== ledger.cityId) continue;
-    const rootId = attribution.identity ? rootSession(attribution.identity.sessionId, activities) : null;
+    const isRemoteMerge = remoteMerges.has(sha);
+    const rootId = !isRemoteMerge && attribution.identity ? rootSession(attribution.identity.sessionId, activities) : null;
     const generation = rootId ? state.currentGen.get(`${ledger.cityId}@@${rootId}`) ?? 1 : 1;
     const tile = rootId ? state.tileById.get(`${ledger.cityId}@@${rootId}@@${generation}`) : null;
-    const reason = attribution.reason ?? (!tile ? "no-matching-expedition" : null);
+    const reason = isRemoteMerge ? "remote-merge" : attribution.reason ?? (!tile ? "no-matching-expedition" : null);
     const records = [...hooks, ...sources].filter((record) => record.sha === sha);
     const commitOp = {
-      opId: `commit:${sha}:${reason ?? "verified"}:${attribution.identity?.sessionId ?? "unknown"}`,
+      opId: `commit:${sha}:${reason ?? "verified"}:${isRemoteMerge ? "unknown" : attribution.identity?.sessionId ?? "unknown"}`,
       kind: "commit",
       cityId: ledger.cityId,
       sha,
       repo: attribution.cityId,
       at: Math.min(...records.map((record) => Number(record.at) || Date.now())),
       reason: reason ?? "verified",
-      sessionId: attribution.identity?.sessionId ?? null,
-      cli: attribution.identity?.cli ?? null,
-      basis: attribution.identity?.basis ?? null,
-      hookKinds: hooks.filter((record) => record.sha === sha).map((record) => record.hook),
+      ...(reason ? {} : {
+        sessionId: attribution.identity?.sessionId ?? null,
+        cli: attribution.identity?.cli ?? null,
+        basis: attribution.identity?.basis ?? null,
+        hookKinds: hooks.filter((record) => record.sha === sha).map((record) => record.hook),
+      }),
     };
     if (!state.opSeqs.has(commitOp.opId)) results.push(await ledger.submit(() => commitOp));
     if (reason) continue;
@@ -132,4 +147,21 @@ export async function ingestCommits({ ledger, hooks, sources, activities, diffFo
     }
   }
   return results;
+}
+export function unharvestedCommitReasons({ cityId, hooks, sources, activities, remoteMerges = new Set(), state }) {
+  const reasons = [];
+  const shas = new Set([...hooks, ...sources].map((record) => record.sha));
+  for (const sha of shas) {
+    const attribution = attributionFor(sha, hooks, sources);
+    if (attribution.cityId !== cityId) continue;
+    let reason = remoteMerges.has(sha) ? "remote-merge" : attribution.reason;
+    if (!reason) {
+      const rootId = rootSession(attribution.identity.sessionId, activities);
+      const generation = state.currentGen.get(`${cityId}@@${rootId}`) ?? 1;
+      if (!state.tileById.has(`${cityId}@@${rootId}@@${generation}`)) reason = "no-matching-expedition";
+      else if (!state.opSeqs.has(`harvest:${sha}`)) reason = "no-eligible-changes";
+    }
+    if (reason) reasons.push({ sha, repo: cityId, reason });
+  }
+  return reasons.sort((a, b) => a.sha.localeCompare(b.sha));
 }

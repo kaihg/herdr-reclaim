@@ -18,7 +18,7 @@ import { Background, PathBuilder, View, div } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
 import { appHome, checking, exec, readTextFile, settings, theme, watchFolder, writeTextFile } from "herdr";
 import { ADAPTER_DIR, activityDir, adapterRoot, citiesOf, loadActivities, repoFactsOf } from "./core/adapter.js";
-import { loadCommitEvidence, parseRawDiff, ingestCommits } from "./core/commit-evidence.js";
+import { loadCommitEvidence, parseRawDiff, parseReflogEvidence, ingestCommits, unharvestedCommitReasons } from "./core/commit-evidence.js";
 import { MAP_RADIUS, keyOf, projectTile } from "./core/grid.js";
 import { ingestScenario } from "./core/ingest.js";
 import { hostIo } from "./core/host-io.js";
@@ -40,6 +40,16 @@ const RESOURCES = [
   { key: "iron", label: "鐵料", color: "ansi4" },
   { key: "parchment", label: "羊皮卷", color: "ansi6" },
 ];
+const COMMIT_REASON_LABELS = {
+  "remote-merge": "GitHub 遠端合併",
+  "terminal-only": "只有 terminal ID",
+  "no-session-source": "沒有 session 證據",
+  "ambiguous-session-source": "session 證據不唯一",
+  "ambiguous-repository": "repo 證據不唯一",
+  "no-hook-repository-evidence": "沒有 repo 證據",
+  "no-matching-expedition": "沒有匹配遠征",
+  "no-eligible-changes": "沒有可收成變更",
+};
 
 const clamp = (min, value, max) => Math.max(min, Math.min(max, value));
 
@@ -125,8 +135,26 @@ async function loadTown(io) {
   const repoFacts = await repoFactsOf(io, cityIds);
   const replay = { activities, repoFacts };
   const evidence = await loadCommitEvidence(io, adapterRoot(appHome()), listActivityFiles);
+  const remoteMerges = new Map(cityIds.map((cityId) => [cityId, new Set()]));
+  for (const cityId of cityIds) {
+    const checkouts = new Set(activities.flatMap((record) => (record.events ?? [])
+      .filter((event) => event.visit?.commonDir === cityId && event.visit.checkout)
+      .map((event) => event.visit.checkout)));
+    for (const checkout of checkouts) {
+      const reflog = await exec("git", ["-C", checkout, "reflog", "-n", "64", "--format=%H%x09%gs"]);
+      if (reflog.code !== 0) continue;
+      const parsed = parseReflogEvidence(reflog.stdout, cityId, checkout);
+      for (const sha of parsed.remoteMerges) remoteMerges.get(cityId).add(sha);
+      for (const record of parsed.records) {
+        if (!evidence.hooks.some((existing) => existing.sha === record.sha && existing.commonDir === cityId && existing.hook === "reflog")) {
+          evidence.hooks.push(record);
+        }
+      }
+    }
+  }
   const stored = [];
   const expeditions = [];
+  const unharvested = {};
   const resources = {};
   for (const cityId of cityIds) {
     const ledger = await new CityLedger({ io, dir: cityDir(adapterRoot(appHome()), cityId), cityId }).open();
@@ -137,6 +165,7 @@ async function loadTown(io) {
       ledger,
       ...evidence,
       activities: [...before.activities.values()],
+      remoteMerges: remoteMerges.get(cityId),
       diffForCommit: async (sha, hook) => {
         if (!hook?.toplevel) return [];
         let result = await exec("git", ["-C", hook.toplevel, "diff-tree", "-r", "-M", "--raw", "-z", `${sha}^1`, sha]);
@@ -145,11 +174,18 @@ async function loadTown(io) {
       },
     });
     const state = await ledger.state();
+    unharvested[cityId] = unharvestedCommitReasons({
+      cityId,
+      ...evidence,
+      activities: [...state.activities.values()],
+      remoteMerges: remoteMerges.get(cityId),
+      state,
+    });
     resources[cityId] = state.resources;
     stored.push(...state.activities.values());
     expeditions.push(...state.tiles);
   }
-  return readTownFromLedger({ activities: stored, expeditions, repoFacts, resources });
+  return readTownFromLedger({ activities: stored, expeditions, repoFacts, resources, unharvestedCommits: unharvested });
 }
 
 /** 選取狀態的檔案（不是城的帳本）：選取不產生資源，也不改變土地。 */
@@ -382,6 +418,11 @@ export default class Town extends View {
       .children([
         div().text_size(10).text_color(t.dim).child("現役遠征"),
         div().text_size(13).font_semibold().child(`${city.tiles.length} 支隊伍`),
+        ...(city.unharvestedCommits?.length ? [
+          div().text_size(10).text_color(t.dim).child("未收成（不發資源）"),
+          ...city.unharvestedCommits.map((commit) => div().text_size(9).text_color(t.muted).truncate()
+            .child(`${commit.sha.slice(0, 8)} · ${COMMIT_REASON_LABELS[commit.reason] ?? commit.reason}`)),
+        ] : []),
         ...city.tiles.map((tile) => this.expeditionCard(city, tile, t, cx)),
       ]);
   }

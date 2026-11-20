@@ -45,6 +45,8 @@ describe("Git commit hook 線上證據", () => {
       expect(record.toplevel).toBe(realpathSync(repo));
       expect(record.env.PI_SESSION_ID).toBe("session-exact");
       expect(record.env.PI_TOOL_CALL_ID).toBe("tool-exact");
+      expect(record.reason).toBe("");
+      expect(record.env).not.toHaveProperty("HC_TERMINAL_ID");
     } finally { rmSync(repo, { recursive: true, force: true }); }
   });
   test("Git 操作矩陣記錄 amend/rebase/cherry-pick/revert/conflict/no-ff merge", async () => {
