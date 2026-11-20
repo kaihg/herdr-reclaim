@@ -14,7 +14,7 @@ import {
   serializeUi,
   withSelection,
 } from "../core/selection.js";
-import { AT, CITY, ROOT_SESSION_ID, firstExpedition } from "../scenarios/first-expedition.js";
+import { AT, CITY, ROOT_SESSION_ID, activity, firstExpedition, intervalClose, intervalOpen, visitStart } from "../scenarios/first-expedition.js";
 import { createFileIo } from "./fs-io.js";
 
 const newDir = () => cityDir(fs.mkdtempSync("/tmp/reclaim-3-"), CITY.commonDir);
@@ -208,4 +208,117 @@ describe("帳本重建城鎮", () => {
     expect(generations.map((tile) => [tile.generation, tile.harvestPoints, tile.points, tile.landStage]))
       .toEqual([[1, 20, 94, "withdrawn"], [2, 20, 20, "reserved"]]);
   });
+  test("按 generation 時間窗切分工作與用量；現役 generation 的 /resume 留在同格", async () => {
+    const ledger = await open(newDir());
+    const sessionId = "generation-resume-session";
+    const usage = (sourceEntryId, at, inputNonCache) => ({
+      kind: "usage",
+      at,
+      sourceEntryId,
+      usage: {
+        openai: {
+          sourceKey: `omp#${sessionId}#${sourceEntryId}`,
+          inputNonCache,
+          cacheRead: 0,
+          cacheWrite: 0,
+          output: 0,
+          costKnown: 0,
+          costUnknownEntries: 1,
+        },
+      },
+    });
+    const first = activity({
+      sessionId,
+      writerEpoch: "generation-1",
+      events: [
+        visitStart("generation-1-visit", AT, CITY),
+        intervalOpen(AT),
+        usage("gen1-usage", AT + 30_000, 10),
+        intervalClose(AT + 60_000),
+      ],
+    });
+    await ingestScenario(ledger, { activities: [first], repoFacts: firstExpedition.repoFacts }, CITY.commonDir);
+    expect((await processLand(ledger, {
+      rootSessionId: sessionId, generation: 1, action: "withdraw", at: AT + 60_000,
+    })).status).toBe("applied");
+
+    const afterWithdrawal = activity({
+      sessionId,
+      writerEpoch: "after-withdrawal",
+      events: [
+        visitStart("after-withdrawal-visit", AT + 90_000, CITY),
+        intervalOpen(AT + 90_000),
+        usage("after-withdrawal-usage", AT + 120_000, 99),
+        intervalClose(AT + 150_000),
+      ],
+    });
+    await ingestActivities(ledger, [afterWithdrawal], CITY.commonDir);
+    const withdrawn = (await townOfLedger(ledger)).cities[0].tiles.find((tile) => tile.rootSessionId === sessionId);
+    expect(withdrawn).toMatchObject({ generation: 1, landStage: "withdrawn", workMs: 60_000 });
+    expect(withdrawn.usage.inputNonCache).toBe(10);
+
+    expect((await redispatch(ledger, { rootSessionId: sessionId, at: AT + 180_000 })).status).toBe("applied");
+    const beforeResume = (await townOfLedger(ledger)).cities[0].tiles.find((tile) =>
+      tile.rootSessionId === sessionId && tile.generation === 2);
+    expect(beforeResume).toMatchObject({ generation: 2, landStage: "reserved", workMs: 0, points: 0 });
+    expect(beforeResume.usage.inputNonCache).toBe(0);
+
+    const resumed = activity({
+      sessionId,
+      writerEpoch: "resumed-in-generation-2",
+      events: [
+        visitStart("resumed-visit", AT + 200_000, CITY),
+        intervalOpen(AT + 200_000),
+        usage("generation-2-usage", AT + 220_000, 20),
+        intervalClose(AT + 260_000),
+      ],
+    });
+    await ingestActivities(ledger, [resumed], CITY.commonDir);
+    const afterResume = (await townOfLedger(ledger)).cities[0].tiles.filter((tile) => tile.rootSessionId === sessionId);
+    const current = afterResume.find((tile) => tile.generation === 2);
+    expect(afterResume).toHaveLength(2);
+    expect([current.x, current.y]).toEqual([beforeResume.x, beforeResume.y]);
+    expect(current).toMatchObject({ generation: 2, workMs: 60_000, workPoints: 1, points: 1 });
+    expect(current.usage.inputNonCache).toBe(20);
+  });
+
+  test("非 Git 活動留在未解析清單；修復 repo 身分後可歸入城鎮", async () => {
+    const sessionId = "unresolved-activity-session";
+    const cwd = "/tmp/reclaim-unresolved-project";
+    const unresolvedRecord = activity({
+      sessionId,
+      writerEpoch: "unresolved",
+      events: [{ kind: "visit_start", at: AT, visit: { visitId: "unresolved-visit", cwd, commonDir: null, checkout: null } }],
+    });
+    const unresolved = {
+      sessionId,
+      writerEpoch: "unresolved",
+      eventSeq: 1,
+      cli: "omp",
+      cwd,
+      at: AT,
+      status: "unresolved",
+    };
+    const waiting = readTownFromLedger({
+      activities: [unresolvedRecord],
+      expeditions: [],
+      repoFacts: {},
+      unresolvedActivities: [unresolved],
+    });
+    expect(waiting).toEqual({ schema: 1, cities: [], unresolvedActivities: [unresolved] });
+
+    const repaired = {
+      ...unresolvedRecord,
+      events: unresolvedRecord.events.map((event) => ({
+        ...event,
+        visit: { ...event.visit, cwd: CITY.checkout, commonDir: CITY.commonDir, checkout: CITY.checkout },
+      })),
+    };
+    const ledger = await open(newDir());
+    await ingestScenario(ledger, { activities: [repaired], repoFacts: firstExpedition.repoFacts }, CITY.commonDir);
+    const attributed = await townOfLedger(ledger);
+    expect(attributed.cities[0].tiles.map((tile) => tile.rootSessionId)).toEqual([sessionId]);
+    expect(attributed.unresolvedActivities).toEqual([]);
+  });
+
 });
