@@ -692,7 +692,7 @@ export class CityLedger {
     let from = 0;
     if (head.checkpoint >= 0) {
       try {
-        const loaded = await this.loadCheckpoint(head.checkpoint);
+        const loaded = await this.loadCheckpoint(head.checkpoint, head.checkpointDigest);
         state = loaded.state;
         from = loaded.segment;
       } catch (error) {
@@ -871,19 +871,20 @@ export class CityLedger {
     const dir = this.checkpointDir(seq);
     const index = (part) => new PrefixIndex({ io: this.io, dir: `${dir}/${part}`, limit: this.pageLimit });
 
-    await index("ops").build([...state.opSeqs]);
-    await index("claims").build([...state.claims]);
+    // 每一組索引寫完就拿到「這一組頁面的內容摘要」（build 回傳，不再多讀一次）；
+    // 摘要寫進 manifest，載入時用來確認頁面內容沒被改過（筆數不變但內容換掉也要看得出來）。
+    const built = {};
+    built.ops = await index("ops").build([...state.opSeqs]);
+    built.claims = await index("claims").build([...state.claims]);
     // 格子紀錄整份存進索引（不是挑欄位），所以之後的票加欄位時，
     // 「checkpoint 重播 == 完整 journal 重播」不會因為少抄一個欄位而失效。
-    const expeditions = index("expeditions");
-    await expeditions.build(
+    built.expeditions = await index("expeditions").build(
       await Promise.all(state.tiles.map(async (tile) => [
         tileId(tile.cityId, tile.rootSessionId, tile.generation),
         await this.packRecord(tile),
       ])),
     );
-    const activities = index("activities");
-    await activities.build(
+    built.activities = await index("activities").build(
       await Promise.all([...state.activities].map(async ([key, record]) => [key, await this.packRecord(record)])),
     );
     const historyEntries = [];
@@ -892,11 +893,12 @@ export class CityLedger {
         historyEntries.push([String(entry.journalSeq).padStart(12, "0"), historyRecordOf(entry)]);
       }
     }
-    await index("history").build(historyEntries);
+    built.history = await index("history").build(historyEntries);
 
     // 座標分塊：每塊 32×32 格，只記「畫得出來、佔得住」的格子鍵（遠征資料在 expeditions
     // 索引）。已撤回／已封存的格子只是同一格的歷史，不進分塊——同一個座標同時只會有一格
     // 佔著，所以每一塊的鍵數有界（≤ 32×32），十萬次撤回重用同一格也不會把分塊撐爆。
+    // 分塊的摘要跟著它的鍵數記在 chunk-index 的值裡（分頁索引不隨格數長成一個大檔）。
     const chunks = new Map();
     for (const tile of state.tiles) {
       if (tile.landStage === "withdrawn" || tile.landStage === "archived") continue;
@@ -904,12 +906,13 @@ export class CityLedger {
       if (!chunks.has(name)) chunks.set(name, []);
       chunks.get(name).push(`${tile.rootSessionId}@@${tile.generation}`);
     }
-    await index("chunk-index").build([...chunks].map(([name, ids]) => [name, ids.length]));
     for (const [name, ids] of chunks) {
       const text = JSON.stringify({ t: "chunk", name, tiles: ids });
       if (byteLen(text) >= this.pageLimit) throw new Error(`座標分塊超過上限：${name}`);
       await casWrite(this.io, `${dir}/chunks/${name}.json`, text);
+      chunks.set(name, { n: ids.length, d: hashText(text) });
     }
+    built["chunk-index"] = await index("chunk-index").build([...chunks]);
 
     const manifest = {
       t: "ckpt",
@@ -921,6 +924,8 @@ export class CityLedger {
       resources: state.resources,
       research: state.research,
       market: state.market,
+      // 每一組索引的內容摘要（固定 6 個 16 進位字串；不隨資料量成長）。
+      digests: Object.fromEntries(Object.entries(built).map(([part, result]) => [part, result.digest])),
       counts: {
         tiles: state.tiles.length,
         activities: state.activities.size,
@@ -929,9 +934,12 @@ export class CityLedger {
         chunks: chunks.size,
       },
     };
-    await casWrite(this.io, `${dir}/manifest.json`, JSON.stringify(manifest));
+    const manifestText = JSON.stringify(manifest);
+    await casWrite(this.io, `${dir}/manifest.json`, manifestText);
     const { text, head } = await this.head();
-    await this.updateHead({ head, headText: text }, { checkpoint: seq });
+    // 摘要的根放在 head.json（帳本自己的檔，也是指出「現在用哪個 checkpoint」的那一份）：
+    // manifest 自己不能證明自己，所以它的內容雜湊要跟 head 一起寫、載入時比對。
+    await this.updateHead({ head, headText: text }, { checkpoint: seq, checkpointDigest: hashText(manifestText) });
     return { seq, segment, counts: manifest.counts };
   }
 
@@ -963,15 +971,22 @@ export class CityLedger {
   /**
    * checkpoint → 狀態（不含 checkpoint 之後的 journal）。
    *
-   * checkpoint 是**衍生**索引：manifest 欄位、每一頁的存在與筆數都要對得上，任何一項
-   * 不完整就丟 `CheckpointIncomplete`，由呼叫端整份丟棄、從 journal 重建（Issue #1）。
-   * 缺頁不能當成「沒有資料」——那會讓庫存留著、去重資料卻消失。
+   * checkpoint 是**衍生**索引：不只要驗結構（manifest 欄位、每一頁存在與筆數），也要驗
+   * **內容**——manifest 的內容雜湊要等於 head 記下的根摘要，每一組索引頁的內容摘要要等於
+   * manifest 記下的那一份。任一不符就丟 `CheckpointIncomplete`，由呼叫端整份丟棄、從
+   * journal 重建（Issue #1）。缺頁不能當成「沒有資料」，被改過的頁面也不能當成資料。
+   *
+   * 驗證一次只在**載入**發生（每個帳本實例第一次 rebuild）；submit 的平常路徑只讀尾段。
    */
-  async loadCheckpoint(seq) {
+  async loadCheckpoint(seq, expectedDigest) {
     const dir = this.checkpointDir(seq);
-    const text = await this.io.read(`${dir}/manifest.json`);
     const incomplete = (reason) => new CheckpointIncomplete(seq, reason);
+    const text = await this.io.read(`${dir}/manifest.json`);
     if (text === null) throw incomplete("manifest 不見了");
+    // 摘要的根在 head.json：manifest 的內容雜湊不符（數字被改、JSON 被換掉）就整份丟棄。
+    if (typeof expectedDigest !== "string" || expectedDigest === "" || hashText(text) !== expectedDigest) {
+      throw incomplete("manifest 內容與 head 記下的摘要不符");
+    }
     let manifest;
     try {
       manifest = JSON.parse(text);
@@ -979,55 +994,71 @@ export class CityLedger {
       throw incomplete("manifest 不是合法 JSON");
     }
     const counts = manifest?.counts;
+    const digests = manifest?.digests;
+    const parts = ["ops", "claims", "expeditions", "activities", "history", "chunk-index"];
     const shaped = manifest?.t === "ckpt" && manifest.schema === SCHEMA && Number.isInteger(manifest.seq) &&
       manifest.seq === seq && Number.isInteger(manifest.segment) &&
-      counts && ["tiles", "activities", "ops", "claims", "chunks"].every((key) => Number.isInteger(counts[key]));
+      counts && ["tiles", "activities", "ops", "claims", "chunks"].every((key) => Number.isInteger(counts[key])) &&
+      digests && parts.every((part) => typeof digests[part] === "string" && digests[part] !== "");
     if (!shaped) throw incomplete("manifest 欄位不完整");
     const index = (part) => new PrefixIndex({ io: this.io, dir: `${dir}/${part}`, limit: this.pageLimit });
-    let ops;
-    let claims;
-    let expeditions;
-    let activities;
-    let chunks;
     try {
-      ops = await index("ops").all({ strict: true });
-      claims = await index("claims").all({ strict: true });
-      expeditions = await index("expeditions").all({ strict: true });
-      activities = await index("activities").all({ strict: true });
-      chunks = await index("chunk-index").all({ strict: true });
+      const read = {};
+      for (const part of ["ops", "claims", "expeditions", "activities", "chunk-index"]) {
+        read[part] = await index(part).scan({ strict: true });
+        if (read[part].digest !== digests[part]) throw new Error(`索引內容與摘要不符：${part}`);
+      }
+      const mismatch = read.ops.entries.size !== counts.ops || read.claims.entries.size !== counts.claims ||
+        read.expeditions.entries.size !== counts.tiles || read.activities.entries.size !== counts.activities ||
+        read["chunk-index"].entries.size !== counts.chunks;
+      if (mismatch) throw new Error(`筆數不符（ops ${read.ops.entries.size}/${counts.ops}、claims ${read.claims.entries.size}/${counts.claims}、expeditions ${read.expeditions.entries.size}/${counts.tiles}、activities ${read.activities.entries.size}/${counts.activities}、chunks ${read["chunk-index"].entries.size}/${counts.chunks}）`);
+      const state = emptyState(this.cityId);
+      state.lastSeq = manifest.seq;
+      for (const [, record] of read.expeditions.entries) addTile(state, await this.unpackExpeditionRecord(record));
+      state.tiles.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+      for (const [key, value] of read.ops.entries) state.opSeqs.set(key, value);
+      for (const [key, value] of read.claims.entries) state.claims.set(key, value);
+      for (const [key, packed] of read.activities.entries) state.activities.set(key, await this.unpackRecord(packed));
+      state.resources = manifest.resources ?? state.resources;
+      state.research = manifest.research ?? state.research;
+      state.market = manifest.market ?? state.market;
+      return { state, segment: manifest.segment };
     } catch (error) {
+      // 內容不符、頁面壞掉、內容檔（blob）對不上雜湊…都是「這份 checkpoint 不可信」。
       throw incomplete(String(error?.message ?? error));
     }
-    const mismatch = ops.size !== counts.ops || claims.size !== counts.claims ||
-      expeditions.size !== counts.tiles || activities.size !== counts.activities || chunks.size !== counts.chunks;
-    if (mismatch) throw incomplete(`筆數不符（ops ${ops.size}/${counts.ops}、claims ${claims.size}/${counts.claims}、expeditions ${expeditions.size}/${counts.tiles}、activities ${activities.size}/${counts.activities}、chunks ${chunks.size}/${counts.chunks}）`);
-    const state = emptyState(this.cityId);
-    state.lastSeq = manifest.seq;
-    for (const [, record] of expeditions) addTile(state, await this.unpackExpeditionRecord(record));
-    state.tiles.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
-    for (const [key, value] of ops) state.opSeqs.set(key, value);
-    for (const [key, value] of claims) state.claims.set(key, value);
-    for (const [key, packed] of activities) state.activities.set(key, await this.unpackRecord(packed));
-    state.resources = manifest.resources ?? state.resources;
-    state.research = manifest.research ?? state.research;
-    state.market = manifest.market ?? state.market;
-    return { state, segment: manifest.segment };
   }
 
-  /** checkpoint 不完整時把它從 head 拿掉：之後不會每次讀取都再讀一次壞掉的快照。 */
+  /**
+   * checkpoint 不可信時把它從 head 拿掉（連根摘要一起）：之後不會每次讀取都再讀一次壞掉的
+   * 快照，下一次做 checkpoint 會重新寫一份。記憶體裡的 `head` 也要同步，否則之後的換段寫入
+   * 會把已經丟棄的 checkpoint 又寫回去。
+   */
   async discardCheckpoint() {
     const { text, head } = await this.head();
     if (!(head.checkpoint >= 0)) return;
-    await this.updateHead({ head, headText: text }, { checkpoint: -1 });
+    const next = { ...head, checkpoint: -1, checkpointDigest: null };
+    const nextText = `${JSON.stringify(next)}\n`;
+    try {
+      await this.io.write(this.headPath(), nextText, text);
+      if (this.cache) this.cache.headText = nextText;
+    } catch (error) {
+      rejectUnlessConflict(error); // head 只是快取：寫不進去也不影響這次的重建
+    }
+    if (this.cache) this.cache.head = next;
   }
 
-  /** 最新的 checkpoint（有的話）：目錄、manifest 與代號。manifest 明顯壞掉就當沒有。 */
+  /**
+   * 最新的 checkpoint（有的話）：目錄、manifest 與代號。manifest 壞掉、或被改過（內容雜湊
+   * 與 head 記下的根摘要不符）就當沒有——查詢端會退回「完整重播」那條路。
+   */
   async checkpointInfo() {
     const { head } = await this.head();
     if (!head.checkpoint || head.checkpoint < 0) return null;
     const dir = this.checkpointDir(head.checkpoint);
     const text = await this.io.read(`${dir}/manifest.json`);
     if (text === null) return null;
+    if (typeof head.checkpointDigest !== "string" || hashText(text) !== head.checkpointDigest) return null;
     let manifest;
     try {
       manifest = JSON.parse(text);
@@ -1102,7 +1133,11 @@ export class CityLedger {
       } catch {
         keys = null;
       }
-      readable = listed === null ? keys === null : Array.isArray(keys) && keys.length === listed;
+      // chunk-index 的值同時記著筆數與內容摘要：檔案不見、筆數不符、內容被改過都不可信。
+      const expected = listed && typeof listed === "object" && Number.isInteger(listed.n) && typeof listed.d === "string" ? listed : null;
+      readable = expected === null
+        ? keys === null && (listed === null || listed === undefined)
+        : Array.isArray(keys) && keys.length === expected.n && text !== null && hashText(text) === expected.d;
       const index = this.expeditionIndex(info.dir);
       for (const key of readable ? keys ?? [] : []) {
         const [rootSessionId, generation] = key.split("@@");
@@ -1144,7 +1179,10 @@ export class CityLedger {
     if (info) {
       let indexed = null;
       try {
-        indexed = await new PrefixIndex({ io: this.io, dir: `${info.dir}/history`, limit: this.pageLimit }).all({ strict: true });
+        // 歷程索引也要驗內容摘要（它不在載入路徑上，只在面板查詢時讀）。
+        const scanned = await new PrefixIndex({ io: this.io, dir: `${info.dir}/history`, limit: this.pageLimit }).scan({ strict: true });
+        if (scanned.digest !== info.manifest.digests?.history) throw new Error("歷程索引內容與摘要不符");
+        indexed = scanned.entries;
       } catch {
         indexed = null; // 歷程索引缺頁：整份丟棄，從 journal 重建
         await this.discardCheckpoint();
