@@ -69,35 +69,53 @@ export function originInContent(radius = MAP_RADIUS, tile = TILE) {
 }
 
 /**
- * 螢幕點 → 邏輯格：`projectTile` 的反解，命中範圍就是那格的**菱形**（不是外接矩形）。
+ * 格子內的點 → 相對這一格的位移：命中範圍就是那格的**菱形**（不是外接矩形）。
  * 相鄰格的菱形只共邊、不互相包含，所以「不同高度的建築不攔截地面格點擊」與
  * 「相鄰格不會因為外接矩形重疊而點錯」都只靠這一個函式；建築是純裝飾，沒有事件。
  *
- * 回傳 `{x, y}`；點在 361 格之外（或菱形之間的空隙）回 null，畫面不改選取。
+ * 畫面上每一格自己收事件（`on_mouse_down` 的 local_position 是那一格方框內的座標），
+ * 所以這裡只回相對於該格的位移；菱形之間的角屬於隔壁那格時也一併算對（距離小的贏）。
+ */
+export function cellAtOffset(point, tile = TILE) {
+  // 一格的中心在方框的正中央；u、v 以「半格」為單位，菱形就是 |Δu| + |Δv| ≤ 1。
+  const u = (point.x - tile.w / 2) / (tile.w / 2); // u = x - y
+  const v = (point.y - tile.h / 2) / (tile.h / 2); // v = x + y
+  const around = { x: Math.round((u + v) / 2), y: Math.round((v - u) / 2) };
+  let best = null;
+  // 方框內只可能落在自己或四鄰；距離 ≤ 1 才是真的落在菱形裡（順序固定所以決定性）。
+  for (let ddx = -1; ddx <= 1; ddx++) {
+    for (let ddy = -1; ddy <= 1; ddy++) {
+      const dx = around.x + ddx;
+      const dy = around.y + ddy;
+      const distance = Math.abs(u - (dx - dy)) + Math.abs(v - (dx + dy));
+      if (distance > 1) continue;
+      if (!best || distance < best.distance) best = { dx, dy, distance };
+    }
+  }
+  return best ? { dx: best.dx, dy: best.dy } : { dx: 0, dy: 0 };
+}
+
+/**
+ * 內容座標的點 → 邏輯格（`projectTile` 的反解）：等於把點搬到 (0,0) 那一格再看落點。
+ * 回傳 `{x, y}`；點在 361 格之外回 null，畫面不改選取。
  */
 export function cellAtPoint(point, radius = MAP_RADIUS, tile = TILE) {
   const origin = originInContent(radius, tile);
-  // 一格的左上是 (x-y, x+y) 的半格位移；中心還要再加半格，所以先減掉。
-  const u = (point.x - origin.left - tile.w / 2) / (tile.w / 2); // u = x - y
-  const v = (point.y - origin.top - tile.h / 2) / (tile.h / 2); // v = x + y
-  const around = { x: Math.round((u + v) / 2), y: Math.round((v - u) / 2) };
-  let best = null;
-  // 命中的格一定在四捨五入那格的 3×3 鄰域；菱形距離 ≤ 1 才是真的落在裡面，
-  // 不然就是落在四個角、屬於隔壁那格（用最小的菱形距離決定，順序固定所以決定性）。
-  for (let dx = -1; dx <= 1; dx++) {
-    for (let dy = -1; dy <= 1; dy++) {
-      const x = around.x + dx;
-      const y = around.y + dy;
-      if (Math.abs(x) > radius || Math.abs(y) > radius) continue;
-      const distance = Math.abs(u - (x - y)) + Math.abs(v - (x + y));
-      if (distance > 1) continue;
-      if (!best || distance < best.distance) best = { x, y, distance };
-    }
-  }
-  return best ? { x: best.x, y: best.y } : null;
+  const { dx, dy } = cellAtOffset({ x: point.x - origin.left, y: point.y - origin.top }, tile);
+  if (Math.abs(dx) > radius || Math.abs(dy) > radius) return null;
+  return { x: dx, y: dy };
 }
 
-/** 選取或跳轉時要把某一格帶進畫面：內容區裡第幾個直接子元素（見 main.js 的排出順序）。 */
-export function cellIndex({ x, y }, radius = MAP_RADIUS) {
-  return (x + radius) * (2 * radius + 1) + (y + radius);
+/**
+ * 畫面的相機：把某一格擺到視窗中央時，整張圖要平移多少（絕對定位的子元素都加上它）。
+ * 這樣「地圖一打開就在這座城身上」與「選取／跳轉的那一格帶進畫面」都不必依賴
+ * 捲動容器自己的偏移（scroll_to_item 對絕對定位的子元素沒有作用）。
+ */
+export function cameraFor(cell, viewport, radius = MAP_RADIUS, tile = TILE) {
+  const origin = originInContent(radius, tile);
+  const spot = projectTile(cell, tile);
+  return {
+    x: Math.round(viewport.width / 2 - (origin.left + spot.left + tile.w / 2)),
+    y: Math.round(viewport.height / 2 - (origin.top + spot.top + tile.h / 2)),
+  };
 }

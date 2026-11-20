@@ -598,6 +598,9 @@ export function selectionDetail(town, selection) {
 function detail(kind, city, tile, title, statusLabel, fields) {
   return {
     kind,
+    // §12、§14.1：歷程搜尋由「選取遠征或格子（含中心格、迷霧格）的詳情」進入，
+    // 不常駐擠壓地圖；只有「沒有城」時沒有入口。
+    historyEntry: kind !== "none",
     cityId: city?.cityId ?? null,
     cityName: city?.name ?? null,
     tile,
@@ -650,6 +653,7 @@ function expeditionDetail(city, tile) {
   })[tile.landStage] ?? "預留";
   return {
     kind: "expedition",
+    historyEntry: true,
     cityId: city.cityId,
     cityName: city.name,
     rootSessionId: tile.rootSessionId,
@@ -742,6 +746,7 @@ function centerDetail(city, quotas = null) {
   const providers = (city.investment?.providers ?? []).map((entry) => entry.provider);
   return {
     kind: "center",
+    historyEntry: true,
     cityId: city.cityId,
     cityName: city.name,
     tile: { x: city.center.x, y: city.center.y },

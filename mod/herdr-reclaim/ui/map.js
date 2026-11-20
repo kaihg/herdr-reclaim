@@ -1,65 +1,55 @@
 // 中央的 3/4 城市地圖（proposal §4、§14.1）：固定格大小＋原生雙軸捲動，
 // 邏輯座標與投影分開（core/grid.js），命中一律回到地面菱形。
 //
-// 點擊只在**內容層**收一次（on_mouse_down + local_position → cellAtPoint）：
-// 建築與標籤都是沒有事件的純裝飾，所以「不同高度的建築不攔截地面格點擊」，
-// 相鄰格也不會因為外接矩形重疊而點錯。格子本身沒有事件，捲動是原生 retained scroll。
+// 命中：**每一格自己收事件**（on_mouse_down 的 local_position 是那一格方框內的座標），
+// 再用 core/grid.js 的 cellAtOffset 換成「相對這一格的邏輯位移」——所以
+// 「不同高度的建築不攔截地面格點擊」（建築、標籤沒有事件）與「相鄰格不因外接矩形重疊點錯」
+// （角上的點會算到隔壁那一格）同時成立。
 //
-// 361 格的底層（迷霧／已揭開／空格框線）合成少數幾個向量路徑，
-// 只有真的有遠征的格子才逐一畫（常見的小城元素很少，大城也不會爆）。
+// 效能：361 格的底層（迷霧填色、全部格線）是**靜態幾何**，快取起來重複使用；
+// 每次重繪只重建「已揭開」的少量格與真的有遠征的格子。
 import { Background, PathBuilder, div } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
 
-import { MAP_RADIUS, cellAtPoint, contentSize, keyOf, originInContent, projectTile } from "../core/grid.js";
+import { MAP_RADIUS, cellAtOffset, contentSize, keyOf, originInContent, projectTile } from "../core/grid.js";
 import { GROUND_MOCK, PLOT_DIAMOND, buildingOf, buildingPolygons, factionStyle, groundOf, legendGroups } from "./assets.js";
 
 const LOCAL = { left: 0, top: 0 };
+/** 靜態底層快取：key 只有幾何（半徑與格大小），值是不可變的原生路徑。 */
+let baseCache = { key: null, fog: null, outline: null };
 
+const LOCAL_CELL = { x: 0, y: 0 };
 /**
- * 地圖：內容區是 361 格的投影外框（`contentSize`），格子依 `cellIndex` 的順序排，
- * 所以 `scroll.scroll_to_item(cellIndex(...))` 就能把選取或跳轉的那一格帶進畫面。
+ * 地圖：內容區是 361 格的投影外框（`contentSize`）。`focus` 是要帶進畫面的那一格
+ * （選取或歷程跳轉），由呼叫端設定一次、這裡消費一次。
  */
 export function mapView({
-  city, tiles, revealed, selection, theme: t, tile, scroll, legendOpen,
+  city, tiles, revealed, selection, theme: t, tile, scroll, legendOpen, camera,
   radius = MAP_RADIUS, onToggleLegend, onPick,
 }) {
   const size = contentSize(radius, tile);
   const origin = originInContent(radius, tile);
-  const fog = [];
+  const base = basePaths(radius, tile);
   const open = [];
-  const outlines = [];
   const occupied = [];
   for (let x = -radius; x <= radius; x++) {
     for (let y = -radius; y <= radius; y++) {
       const entry = tiles.get(keyOf({ x, y }));
-      if (entry) {
-        occupied.push(entry);
-        continue;
-      }
-      (revealed.has(keyOf({ x, y })) ? open : fog).push({ x, y });
-      outlines.push({ x, y });
+      if (entry) occupied.push(entry);
+      else if (revealed.has(keyOf({ x, y }))) open.push({ x, y });
     }
   }
-  const content = div()
-    .id("map-content")
-    .relative()
-    .flex_none()
-    .w(size.width)
-    .h(size.height)
-    .children([
-      fullPath(batched(fog, tile, origin), Background.pattern_slash(t.dim, 1, 4), size),
-      fullPath(batched(open, tile, origin), t.background, size),
-      fullPath(stroked(outlines, tile, origin), t.border, size),
-      centerCell(city, t, tile, origin),
-      ...occupied.map((entry) => cell(entry, selection, t, tile, origin)),
-    ])
-    // 命中的唯一入口：local_position 是內容座標，反解成邏輯格（建築、標籤都攔不到）。
-    .on_mouse_down("left", (event, cx) => {
-      const local = event.local_position;
-      if (!local) return;
-      const hit = cellAtPoint(local, radius, tile);
-      if (hit) onPick(hit, cx);
-    });
+  // 直接子元素就是捲動容器的項目：第 0 個是撐出捲動範圍的尺寸方塊，
+  // 之後是底層路徑、中心格、有遠征的格子 —— scroll_to_item 的索引就是這個順序
+  // （絕對定位的子元素不會撐開父層，但仍然是直接子元素，所以帶得進畫面）。
+  const children = [
+    div().id("map-extent").flex_none().w(size.width).h(size.height),
+    fullPath(base.fog, Background.pattern_slash(t.dim, 1, 4), size, camera),
+    fullPath(stroked(open, tile, origin), t.background, size, camera),
+    fullPath(base.outline, t.border, size, camera),
+    centerCell(city, t, tile, origin, radius, onPick, camera),
+    ...occupied.map((entry) => cell(entry, selection, t, tile, origin, radius, onPick, camera)),
+  ];
   return div()
     .id("map")
     .size_full()
@@ -69,10 +59,11 @@ export function mapView({
     .child(
       div()
         .id("map-scroll")
+        .relative()
         .size_full()
         .overflow_scrollbar()
         .track_scroll(scroll)
-        .child(content),
+        .children(children),
     )
     .child(legendPanel(t, legendOpen, onToggleLegend));
 }
@@ -131,13 +122,27 @@ function diamondPoints({ x, y }, tile, origin) {
   ];
 }
 
-/** 許多格合成一條填色路徑（迷霧、已揭開、空格的框線都只有幾個元素）。 */
-function batched(cells, tile, origin) {
-  const builder = PathBuilder.fill();
-  for (const spot of cells) builder.add_polygon(diamondPoints(spot, tile, origin)).close();
-  return builder.build();
+/** 靜態底層：整片迷霧與整張格線只有幾何（半徑、格大小），所以只建一次。 */
+function basePaths(radius, tile) {
+  const key = `${radius}|${tile.w}|${tile.h}`;
+  if (baseCache.key === key) return baseCache;
+  const origin = originInContent(radius, tile);
+  const all = [];
+  for (let x = -radius; x <= radius; x++) {
+    for (let y = -radius; y <= radius; y++) all.push({ x, y });
+  }
+  const fog = PathBuilder.fill();
+  const outline = PathBuilder.stroke(1);
+  for (const spot of all) {
+    const points = diamondPoints(spot, tile, origin);
+    fog.add_polygon(points).close();
+    outline.add_polygon(points).close();
+  }
+  baseCache = { key, fog: fog.build(), outline: outline.build() };
+  return baseCache;
 }
 
+/** 已揭開的格子（少數）：每次重繪重建一條路徑。 */
 function stroked(cells, tile, origin, dash) {
   const builder = dash ? PathBuilder.stroke(1).dash_array(dash) : PathBuilder.stroke(1);
   for (const spot of cells) builder.add_polygon(diamondPoints(spot, tile, origin)).close();
@@ -145,8 +150,8 @@ function stroked(cells, tile, origin, dash) {
 }
 
 /** 內容區大小的路徑（座標就是內容座標）。 */
-function fullPath(path, color, size) {
-  return window.paint_path(path, color).absolute().left(0).top(0).w(size.width).h(size.height);
+function fullPath(path, color, size, camera) {
+  return window.paint_path(path, color).absolute().left(camera.x).top(camera.y).w(size.width).h(size.height);
 }
 
 /** 一格方框內的路徑（百分比座標的 mock 圖形用）。 */
@@ -165,28 +170,40 @@ function fillPath(points) {
   return PathBuilder.fill().add_polygon(points).close().build();
 }
 
-/** 一格的方框（絕對定位在它的投影位置）。 */
-function cellBox({ x, y }, tile, origin) {
-  const spot = projectTile({ x, y }, tile);
+/**
+ * 一格的方框（絕對定位在它的投影位置）＋它自己的點擊。
+ * `cellAtOffset` 把方框內的點換成「相對這一格」的邏輯位移，所以角上的點會算給隔壁那一格。
+ */
+function cellBox(cell, tile, origin, radius, onPick, camera) {
+  const spot = projectTile(cell, tile);
   return div()
-    .id(`map-${x}-${y}`)
+    .id(`map-${cell.x}-${cell.y}`)
     .absolute()
-    .left(origin.left + spot.left)
-    .top(origin.top + spot.top)
+    .left(camera.x + origin.left + spot.left)
+    .top(camera.y + origin.top + spot.top)
     .w(tile.w)
-    .h(tile.h);
+    .h(tile.h)
+    .on_mouse_down("left", (event, cx) => {
+      const local = event.local_position;
+      if (!local) return;
+      const { dx, dy } = cellAtOffset(local, tile);
+      const x = cell.x + dx;
+      const y = cell.y + dy;
+      if (Math.abs(x) > radius || Math.abs(y) > radius) return;
+      onPick({ x, y }, cx);
+    });
 }
 
-function centerCell(city, t, tile, origin) {
+function centerCell(city, t, tile, origin, radius, onPick, camera) {
   const points = localDiamond(tile);
-  return cellBox(city.center, tile, origin).children([
+  return cellBox(city.center, tile, origin, radius, onPick, camera).children([
     tilePath(fillPath(points), t.selected, tile),
     tilePath(PathBuilder.stroke(2.5).add_polygon(points).close().build(), t.accent, tile),
     markBox(city.center.label, t, tile, t.accent),
   ]);
 }
 
-function cell(entry, selection, t, tile, origin) {
+function cell(entry, selection, t, tile, origin, radius, onPick, camera) {
   const selected = (selection?.kind === "expedition" && selection.rootSessionId === entry.rootSessionId) ||
     (selection?.kind === "tile" && selection.x === entry.x && selection.y === entry.y);
   const faction = factionStyle(entry.faction);
@@ -195,11 +212,11 @@ function cell(entry, selection, t, tile, origin) {
   const building = buildingOf(entry);
   const points = localDiamond(tile);
   const outline = entry.landStage === "reserved"
-    ? stroked([{ x: 0, y: 0 }], tile, LOCAL, [4, 3])
+    ? stroked([LOCAL_CELL], tile, LOCAL, [4, 3])
     : selected
       ? PathBuilder.stroke(2.5).add_polygon(points).close().build()
-      : stroked([{ x: 0, y: 0 }], tile, LOCAL);
-  return cellBox(entry, tile, origin).children([
+      : stroked([LOCAL_CELL], tile, LOCAL);
+  return cellBox(entry, tile, origin, radius, onPick, camera).children([
     tilePath(fillPath(points), selected ? t.selected : t.raised, tile),
     ground ? tilePath(fillPath(PLOT_DIAMOND), Background.solid(t[ground.token] ?? t.muted).opacity(0.35), tile) : null,
     building ? buildingMark(building, tile, factionColor) : null,
