@@ -10,17 +10,22 @@ herdr 的開墾城鎮 mod。這個資料夾是 mod 本體：一個「遠征指�
 | `core/town.js` | 城鎮讀取模型：活動紀錄 → 城市、格子、遠征、右側詳情；帳本模式由 journal 決定格子位置 |
 | `core/ingest.js` | 把 §6.1 的活動紀錄與「遠征取得土地」寫進帳本（順序與 `planExpeditions` 相同） |
 | `core/grid.js` | 邏輯座標、BFS 選地與 3/4 投影（投影與規則分開） |
+| `core/host-io.js` | 儲存介面的 host 適配層：herdr 的原生 CAS 衝突 → `CasConflict`（見下） |
 | `core/selection.js` | 選取狀態的保存（不是城的帳本；見下） |
 | `scenarios/first-expedition.js` | 固定事件情境（§6.1 的最小欄位）；這一票的活動來源 |
 | `test/town.test.js` | 固定情境測試：只斷言可觀察的城鎮狀態 |
 | `test/restore.test.js` | 帳本重建的城 ＝ 直接重播的城；重開、重播、checkpoint 都一樣 |
 | `test/ledger.test.js` | 儲存層：完成依據、故障重試、CAS 競爭、換段、ack |
-| `test/fs-io.js` | bun 測試用的 fs 後端（模擬 `writeTextFile` 的 CAS）；mod 不會載入它 |
+| `test/host-seam.test.js` | host 接縫：用假 host 丟真實 host 的錯誤形狀，驗證衝突被正規化、其他錯誤不被吞 |
+| `test/fs-io.js` | bun 測試用的 fs 後端（說同一種 CAS 語言）；mod 不會載入它 |
 | `spike-panel.js` | S1／S2 的文字面板（proposal §15.1 的證據），沒有被載入 |
 
 領域邏輯完全不碰 host API，所以可以在 bun 下測；只有 `main.js` 匯入 `herdr` 與 `gpui-kit`。
-儲存層用一個小小的介面隔離（`io.read` / `io.write(path, text, expected)`）：mod 用
-`readTextFile`／`writeTextFile`，測試用 node fs（`test/fs-io.js`），帳本本身不認識任何 host API。
+儲存層用一個小小的介面隔離（`io.read` / `io.write(path, text, expected)`），**契約是**：
+快照不符（`expected === null` 代表建立新檔）就拒絕成 `CasConflict`，其他錯誤原樣往上丟。
+mod 端由 `core/host-io.js` 把 herdr 的原生錯誤轉成 `CasConflict`（真實 host 的衝突是原生
+`Error`，訊息是 `` `herdr.writeTextFile`: The file changed outside Herdr. Reload before saving… ``，
+三種衝突形狀共用同一句）；測試端由 `test/fs-io.js` 直接說同一種語言；帳本本身不認識 host API。
 
 ## 城帳本（#3）
 
