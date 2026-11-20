@@ -89,7 +89,7 @@ async function cityIdsFromLedgers(io) {
     const text = await io.read(file);
     if (text === null) continue;
     const head = JSON.parse(text);
-    if (typeof head.cityId === \"string\") ids.add(head.cityId);
+    if (typeof head.cityId === "string") ids.add(head.cityId);
   }
   return [...ids];
 }
@@ -113,9 +113,10 @@ async function ensureActivityDir(io) {
 }
 
 /**
- * adapter 的活動檔 → 城帳本 → 城鎮（journal 是唯一完成依據，§13）。
- * 每個城有自己的帳本，所以活動先按 visit 的 commonDir 分城再寫入（§13.1）。
+ * 活動檔 → 城帳本 → 城鎮；開機時也讓帳本檢查是否需要分頁 checkpoint（#4）。
+ * 活動按 visit 的 commonDir 分城寫入，帳本 journal 是唯一完成依據（§13）。
  */
+
 async function loadTown(io) {
   const activities = await loadActivities(io, activityDir(appHome()));
   const cityIds = [...new Set([...citiesOf(activities), ...(await cityIdsFromLedgers(io))])].sort();
@@ -126,6 +127,7 @@ async function loadTown(io) {
   for (const cityId of cityIds) {
     const ledger = await new CityLedger({ io, dir: cityDir(adapterRoot(appHome()), cityId), cityId }).open();
     await ingestScenario(ledger, replay, cityId);
+    await ledger.maybeCheckpoint();
     const state = await ledger.state();
     stored.push(...state.activities.values());
     expeditions.push(...state.tiles);

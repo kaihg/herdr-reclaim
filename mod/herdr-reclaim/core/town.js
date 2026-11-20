@@ -208,10 +208,21 @@ export function readTown(replay = {}) {
  */
 export function readTownFromLedger(replay = {}) {
   const expeditions = replay.expeditions ?? [];
-  const spots = new Map(expeditions.map((entry) => [`${entry.rootSessionId}@@${entry.cityId}`, entry]));
+  // 格子鍵要含 generation（#4）：重新派遣（#7）之後，新的一代不能蓋掉上一代。
+  // 活動紀錄沒有 generation，所以它算到這支遠征**現役的那一代**頭上；
+  // 其餘每一代各自是一格（工作 0、駐紮）。
+  const spots = new Map();
+  for (const entry of expeditions) {
+    const key = `${entry.rootSessionId}@@${entry.cityId}`;
+    const generation = entry.generation ?? 1;
+    const current = spots.get(key);
+    if (!current || generation > (current.generation ?? 1)) spots.set(key, { ...entry, generation });
+  }
   const town = replayTown({ activities: replay.activities, repoFacts: replay.repoFacts }, (session, visit) => {
     const entry = spots.get(`${session.sessionId}@@${visit.commonDir}`);
-    return entry ? { x: entry.x, y: entry.y, generation: entry.generation ?? 1 } : null;
+    return entry
+      ? { x: entry.x, y: entry.y, generation: entry.generation ?? 1, harvestPoints: entry.harvestPoints ?? 0 }
+      : null;
   });
 
   // 帳本有 entry、活動紀錄還沒到的格子也要畫出來（工作時間 0、狀態駐紮）。
@@ -228,7 +239,6 @@ export function readTownFromLedger(replay = {}) {
       };
       town.cities.push(city);
     }
-    // 同一支遠征可能有不同 generation（#4 的重新派遣），所以兩者都要比。
     const generation = entry.generation ?? 1;
     if (city.tiles.some((tile) => tile.rootSessionId === entry.rootSessionId && tile.generation === generation)) {
       continue;
@@ -244,6 +254,7 @@ export function readTownFromLedger(replay = {}) {
         repo: entry.repo ?? { commonDir: entry.cityId, checkout: null },
         visits: [],
         sources: [],
+        harvestPoints: entry.harvestPoints ?? 0,
       }),
     );
   }
@@ -368,11 +379,13 @@ function newTile(session, city, visit, planned) {
     x: planned.x,
     y: planned.y,
     rootSessionId: session.sessionId,
-    generation: planned.generation ?? 1, // 重新派遣（#4）才會往上加
+    generation: planned.generation ?? 1, // 重新派遣（#7）才會往上加
     cli: session.cli,
     repo: { commonDir: city.cityId, checkout: visit.checkout },
     visits: [],
     sources: [session],
+    // 收成點數由帳本帶進來（§10：自然工作、收成、加速三種點數分開保存）。
+    harvestPoints: planned.harvestPoints ?? 0,
   };
 }
 
@@ -381,7 +394,7 @@ export const ZERO_USAGE = { inputNonCache: 0, cacheRead: 0, cacheWrite: 0, outpu
 
 /**
  * 一格（或一支遠征）的用量：root 加上併進來的 child，同一把來源 key 只算一次（§6.1、§15.6）。
- * `sources` 是這一格的 session；child 的用量依 S1 的歸戶規則算在 root 這一格。
+ * 每筆用量依發生時的 cityId 歸城；child 的用量依 S1 歸到 root 遠征。
  */
 function sumUsage(sources, cityId) {
   const total = { ...ZERO_USAGE };
@@ -394,10 +407,12 @@ function sumUsage(sources, cityId) {
   return total;
 }
 
+/** §10：總點數 = floor(自然工作毫秒 / 60_000) + 收成點數。 */
 function finishTile(tile) {
   const intervals = tile.sources.flatMap((session) => session.intervals.filter((interval) => interval.cityId === tile.cityId));
   const workMs = unionMs(intervals);
-  const points = Math.floor(workMs / MINUTE_MS);
+  const harvestPoints = tile.harvestPoints ?? 0;
+  const points = Math.floor(workMs / MINUTE_MS) + harvestPoints;
   return {
     cityId: tile.cityId,
     x: tile.x,
@@ -410,6 +425,7 @@ function finishTile(tile) {
     workMs,
     points,
     usage: sumUsage(tile.sources, tile.cityId),
+    harvestPoints,
     landStage: points >= CLEAR_POINTS ? "cleared" : "reserved",
     status: intervals.some((interval) => interval.open) ? "active" : "idle",
   };
