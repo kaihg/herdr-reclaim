@@ -8,7 +8,7 @@
 // 「還沒有收成」與「沒有額度來源」。
 import { CENTER, bfsNextTile, keyOf } from "./grid.js";
 import { BOOST_POINTS_PER_PARCHMENT, CLEAR_POINTS, RECIPES, RESEARCH_TOKENS_PER_PARCHMENT, RESOURCE_LABELS, TRADE_RATE, buildableRecipes } from "./rules.js";
-import { basisNote, factionOf, formatFaction, investmentsOf, mergeInvestments, quotaLines } from "./provider-stats.js";
+import { allTokensUnknown, basisNote, factionOf, formatFaction, investmentsOf, mergeInvestments, quotaLines } from "./provider-stats.js";
 
 export const SCHEMA = 1;
 
@@ -677,7 +677,10 @@ function expeditionDetail(city, tile) {
       })),
       ...(tile.providerUsage ?? []).map(({ provider, usage }) => ({
         label: `投入 ${provider}`,
-        value: formatUsage(usage),
+        // 完全未知的用量留下的是 0 佔位，不能當成「投入 0」（§9）：跟派系用同一份資料判斷。
+        value: allTokensUnknown((tile.investment?.providers ?? []).find((entry) => entry.provider === provider))
+          ? "未知（欄位未回報）"
+          : formatUsage(usage),
       })),
       ...(tile.harvests ?? []).map((harvest, index) => ({
         label: `收成 ${index + 1}`,
@@ -797,13 +800,15 @@ function formatTimestamp(value) {
 
 /** 右側詳情的用量一行：進／出與快取，價格未知時明說，不假裝是 0。 */
 export function formatUsage(usage = ZERO_USAGE) {
+  const cost = usage.costKnown > 0 ? ` · 成本 ${usage.costKnown.toFixed(4)}` : "";
+  const unknown = usage.costUnknownEntries > 0 ? ` · ${usage.costUnknownEntries} 筆價格未知` : "";
+  // 四個 token 欄位都沒有回報時，數字是正規化的 0 佔位，不是「用量 0」（§9）。
+  if (allTokensUnknown(usage)) return `未知（欄位未回報）${cost}${unknown}`;
   const parts = [
     `進 ${usage.inputNonCache}`,
     `出 ${usage.output}`,
     `快取讀 ${usage.cacheRead}`,
     `快取寫 ${usage.cacheWrite}`,
   ];
-  const cost = usage.costKnown > 0 ? ` · 成本 ${usage.costKnown.toFixed(4)}` : "";
-  const unknown = usage.costUnknownEntries > 0 ? ` · ${usage.costUnknownEntries} 筆價格未知` : "";
   return `${parts.join(" · ")}${cost}${unknown}`;
 }

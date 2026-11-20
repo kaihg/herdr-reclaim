@@ -41,17 +41,32 @@ const ZERO_KEYS = Object.keys(ZERO);
 const tokensOf = (entry) => entry.inputNonCache + entry.output;
 const metricOf = (entry, basis) => (basis === "cost" ? entry.costKnown : tokensOf(entry));
 
+/**
+ * 這一筆有沒有可以比較的數字（§9）。四個 token 欄位都沒有回報時，正規化留下來的是 0 佔位，
+ * 那不是「投入 0」；費用 0 又標成未知也一樣。兩邊都拿不到數字就是「完全未知」：不進排行、
+ * 不決定派系，也不讓同分規則因此去取 root provider。
+ */
+const measuredOf = (entry) => tokensOf(entry) > 0 || Number(entry.costKnown) > 0;
+/** 四個 token 欄位都沒有回報：留下來的是正規化的 0 佔位，不是真的 0（§9）。 */
+export function allTokensUnknown(entry) {
+  const unknown = entry?.unknownFields ?? [];
+  return ["inputNonCache", "cacheRead", "cacheWrite", "output"].every((field) => unknown.includes(field));
+}
+
 /** 這一筆的費用與欄位都齊全，才算「已知」（§9：有任何未知就換基準）。 */
 const costsKnownOf = (entry) => entry.costUnknownEntries === 0 && (entry.unknownFields?.length ?? 0) === 0;
 
 function summarize(byProvider) {
   const providers = [...byProvider.values()].map((bucket) => {
     const { unknownFields, ...rest } = bucket;
-    return unknownFields?.size ? { ...rest, unknownFields: [...unknownFields].sort() } : rest;
+    const entry = { ...rest, measured: measuredOf(rest) };
+    return unknownFields?.size ? { ...entry, unknownFields: [...unknownFields].sort() } : entry;
   });
   // 全部已知才敢用 API 等值比較；有任何一筆未知就整組改用 token 基準（§9）。
   const basis = providers.length > 0 && providers.every(costsKnownOf) ? "cost" : "tokens";
+  // 有數字的排在前面；沒有數字的（完全未知）永遠不會因為同分被挑成派系。
   providers.sort((a, b) =>
+    Number(b.measured) - Number(a.measured) ||
     metricOf(b, basis) - metricOf(a, basis) ||
     tokensOf(b) - tokensOf(a) ||
     String(a.provider).localeCompare(String(b.provider)),
@@ -104,11 +119,13 @@ export function mergeInvestments(list) {
 export function factionOf(investments, rootProvider = null) {
   const providers = investments?.providers ?? [];
   const basis = investments?.basis ?? "tokens";
-  if (!providers.length) {
-    return { id: "none", name: NO_FACTION, provider: null, basis, reason: "沒有 provider 用量" };
+  // 完全未知的 provider 不算投入：沒有任何有數字的 provider 時就是「無派系」（§9）。
+  const measured = providers.filter((entry) => measuredOf(entry));
+  if (measured.length === 0) {
+    return { id: "none", name: NO_FACTION, provider: null, basis, reason: "沒有可歸戶的 provider 用量" };
   }
-  const top = Math.max(...providers.map((entry) => metricOf(entry, basis)));
-  const tied = providers.filter((entry) => metricOf(entry, basis) === top).map((entry) => entry.provider).sort();
+  const top = Math.max(...measured.map((entry) => metricOf(entry, basis)));
+  const tied = measured.filter((entry) => metricOf(entry, basis) === top).map((entry) => entry.provider).sort();
   const provider = typeof rootProvider === "string" && tied.includes(rootProvider) ? rootProvider : tied[0];
   return { id: provider, name: factionOfProvider(provider), provider, basis, reason: null };
 }
@@ -121,14 +138,15 @@ export function formatFaction(faction) {
 
 /** 比較基準的一行：限制要在畫面上說清楚（§9）。 */
 export function basisNote(investments) {
-  if (!investments || (investments.providers ?? []).length === 0) return "還沒有可歸戶的 provider 用量";
+  if (!(investments?.providers ?? []).some((entry) => measuredOf(entry))) return "還沒有可歸戶的 provider 用量";
   return investments.basis === "cost"
     ? "費用以 API 等值比較"
     : "成本未知：改用 non-cache input + output 比較";
 }
 
-/** 一個 provider 的投資值；畫面與派系都用同一個基準。 */
+/** 一個 provider 的投資值；畫面與派系都用同一個基準。完全未知的沒有數字可以寫。 */
 export function formatInvestment(investments, entry) {
+  if (!entry.measured) return "未知（欄位未回報）";
   return investments?.basis === "cost"
     ? `API 等值 ${Number(entry.costKnown).toFixed(4)}`
     : `進 ${entry.inputNonCache} + 出 ${entry.output}`;
@@ -148,6 +166,7 @@ export function investmentRows(investments) {
     name: factionOfProvider(entry.provider),
     value: formatInvestment(investments, entry),
     share: investmentShare(investments, entry),
+    measured: measuredOf(entry),
     unknownFields: entry.unknownFields ?? [],
   }));
 }

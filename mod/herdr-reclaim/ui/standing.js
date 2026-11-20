@@ -9,7 +9,9 @@ import { formatFaction, guildQuotaLine, investmentRows } from "../core/provider-
 /** 上方右側：主要行會與它明確回報的額度；拿不到就顯示未知（§9）。 */
 export function guildBlock(city, quotas, t) {
   const guild = city.guild;
-  const line = guild ? guildQuotaLine(quotas, guild.provider) : null;
+  const line = guild?.provider ? guildQuotaLine(quotas, guild.provider) : null;
+  // 沒有主要行會（例如全部用量都未知）時，額度一行不能借用整份快照的理由。
+  const fallback = guild?.provider ? `未知（${quotas?.reason ?? "拿不到額度回報"}）` : "未知（沒有主要行會）";
   return [
     div().text_size(10).text_color(t.dim).child("主要行會"),
     div().text_size(12.5).truncate().child(guild ? formatFaction(guild) : "未知"),
@@ -17,7 +19,7 @@ export function guildBlock(city, quotas, t) {
       .text_size(9)
       .text_color(line?.known === true ? t.muted : t.dim)
       .truncate()
-      .child(line ? line.text : `未知（${quotas?.reason ?? "拿不到額度回報"}）`),
+      .child(line ? line.text : fallback),
   ];
 }
 
