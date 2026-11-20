@@ -4,7 +4,7 @@
 import { describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import { bfsNextTile } from "../core/grid.js";
-import { CasConflict, CityLedger, CrashAfterContent, CrashAfterJournal, CrashAfterSeal, byteLen, claimKey, hashText } from "../core/ledger.js";
+import { CasConflict, CityLedger, CrashAfterContent, CrashAfterJournal, CrashAfterSeal, byteLen, claimKey, hashText, tileId } from "../core/ledger.js";
 import { ingestActivities } from "../core/ingest.js";
 import { readTownFromLedger } from "../core/town.js";
 import { AT } from "../scenarios/first-expedition.js";
@@ -517,8 +517,11 @@ describe("checkpoint 是衍生索引：不完整就整份丟棄、從 journal �
     const checkpointed = await ledger.checkpoint();
     expect(checkpointed.counts.chunks).toBe(0);
     expect(checkpointed.counts.tiles).toBe(generations);
-    for (const dirname of ["checkpoints", "blobs"]) {
-      for (const file of filesUnder(`${dir}/${dirname}`)) expect(fs.statSync(file).size).toBeLessThan(pageLimit);
+    for (const file of filesUnder(`${dir}/blobs`)) expect(fs.statSync(file).size).toBeLessThan(pageLimit);
+    // manifest 是固定欄位的小索引（resources／counts／digests），不受分頁上限約束；
+    // 其餘衍生檔案（索引頁、座標分塊）都還在 pageLimit 內。
+    for (const file of filesUnder(`${dir}/checkpoints`)) {
+      expect(fs.statSync(file).size).toBeLessThan(file.endsWith("/manifest.json") ? 256 * 1024 : pageLimit);
     }
     for (const file of filesUnder(dir)) expect(fs.statSync(file).size).toBeLessThan(256 * 1024);
 
@@ -537,5 +540,177 @@ describe("checkpoint 是衍生索引：不完整就整份丟棄、從 journal �
     expect((await ledger.tilesInChunk(0, -1)).map((tile) => tile.generation)).toEqual([generations + 1]);
     const reopened = await open(dir, createFileIo(), { pageLimit });
     expect(await townsOf(reopened)).toEqual(await townsOf(ledger));
+  });
+});
+
+describe("摘要驗證只在載入發生一次", () => {
+  test("載入之後的 state／submit 不會再讀 checkpoint 的每一頁", async () => {
+    const dir = dirOf("verify-once");
+    const base = createFileIo();
+    let checkpointReads = 0;
+    const io = {
+      read: async (file) => {
+        if (file.includes("/checkpoints/")) checkpointReads += 1;
+        return base.read(file);
+      },
+      write: (file, text, expected) => base.write(file, text, expected),
+    };
+    const ledger = await open(dir, io);
+    expect((await ledger.submit((state) => expeditionOp(state, "sess-a"))).status).toBe("applied");
+    expect((await ledger.submit((state) => expeditionOp(state, "sess-b"))).status).toBe("applied");
+    await ledger.checkpoint();
+
+    const reopened = await open(dir, io);
+    await reopened.state(); // 第一次載入：完整驗一次（head 摘要＋各組索引摘要）
+    const afterLoad = checkpointReads;
+    expect(afterLoad).toBeGreaterThan(0);
+
+    for (let index = 0; index < 5; index++) {
+      await reopened.state(); // 強制重讀：只讀 journal 尾段
+      expect((await reopened.submit((state) => expeditionOp(state, `sess-x-${index}`))).status).toBe("applied");
+    }
+    expect(checkpointReads).toBe(afterLoad);
+  });
+});
+
+describe("checkpoint 的內容完整性：被改過就不能當資料", () => {
+  const harvestAt = (sessionId, claim) => ({
+    opId: `harvest:${sessionId}:${claim}`,
+    kind: "harvest",
+    at: AT + 100,
+    cityId: CITY_ID,
+    rootSessionId: sessionId,
+    generation: 1,
+    claim,
+    points: 20,
+    resources: { wood: 10 },
+    blobs: { claim, paths: [`src/${claim}.ts`] },
+  });
+
+  /** 一座有格子、有 claim、有庫存的城，並做過一次 checkpoint。 */
+  async function checkpointedCity(name, options = {}) {
+    const dir = dirOf(name);
+    const ledger = await open(dir, createFileIo(), options);
+    const sessions = ["sess-a", "sess-b", "sess-c"];
+    for (const [index, sessionId] of sessions.entries()) {
+      expect((await ledger.submit(() => ({
+        opId: `expedition:${CITY_ID}:${sessionId}:1`,
+        kind: "expedition",
+        at: AT,
+        activatedAt: AT + index,
+        cityId: CITY_ID,
+        rootSessionId: sessionId,
+        generation: 1,
+        x: index,
+        y: -1,
+        cli: "omp",
+        repo: { commonDir: CITY_ID, checkout: "/reclaim/city-durable" },
+      }))).status).toBe("applied");
+      expect((await ledger.submit(() => harvestAt(sessionId, `claim-${sessionId}`))).status).toBe("applied");
+    }
+    const { seq } = await ledger.checkpoint();
+    // 從頭重播的答案（不碰 checkpoint）：竄改之後重開必須等於這一份。
+    const replayDir = `${dir}-replay`;
+    fs.cpSync(dir, replayDir, { recursive: true });
+    const headPath = `${replayDir}/head.json`;
+    const head = JSON.parse(fs.readFileSync(headPath, "utf8"));
+    fs.writeFileSync(headPath, `${JSON.stringify({ ...head, checkpoint: -1, checkpointDigest: null })}\n`);
+    const fresh = await open(replayDir, createFileIo(), options);
+    return { dir, seq, options, expected: await townsOf(fresh), expectedState: await fresh.state() };
+  }
+
+  /** 重開同一座城：等於「從頭重播」，而且 checkpoint 已被丟棄。 */
+  async function expectRebuilt({ dir, expected, expectedState, options }, check) {
+    const reopened = await open(dir, createFileIo(), options);
+    const state = await reopened.state();
+    expect(state.resources).toEqual(expectedState.resources);
+    expect([...state.claims]).toEqual([...expectedState.claims]);
+    expect([...state.opSeqs]).toEqual([...expectedState.opSeqs]);
+    expect(state.tiles).toEqual(expectedState.tiles);
+    expect(await townsOf(reopened)).toEqual(expected);
+    if (check) await check(reopened);
+    expect(JSON.parse(fs.readFileSync(`${dir}/head.json`, "utf8")).checkpoint).toBe(-1);
+  }
+
+  test("manifest 的數值被改成合法 JSON（庫存 30→98765）：重開等於從頭重播", async () => {
+    const city = await checkpointedCity("tamper-manifest");
+    const path = `${city.dir}/checkpoints/${city.seq}/manifest.json`;
+    const manifest = JSON.parse(fs.readFileSync(path, "utf8"));
+    expect(manifest.resources.wood).toBe(30);
+    manifest.resources.wood = 98765;
+    fs.writeFileSync(path, JSON.stringify(manifest));
+
+    await expectRebuilt(city, async (reopened) => {
+      const duplicate = await reopened.submit(() => ({ ...harvestAt("sess-a", "claim-sess-a"), opId: "harvest:other-id" }));
+      expect(duplicate).toMatchObject({ status: "rejected", reason: "claim_exists" });
+    });
+  });
+
+  test("claims 子頁內容被換掉（筆數不變）：已領過的 claim 仍被擋下", async () => {
+    const city = await checkpointedCity("tamper-claims", { pageLimit: 700 });
+    const prefix = hashText(claimKey(CITY_ID, "claim-sess-a")).slice(0, 2);
+    const pagePath = `${city.dir}/checkpoints/${city.seq}/claims/${prefix}.json`;
+    const page = JSON.parse(fs.readFileSync(pagePath, "utf8"));
+    const lostKey = claimKey(CITY_ID, "claim-sess-a");
+    expect(Object.keys(page.e)).toContain(lostKey);
+    // 筆數不變、內容換掉：把這個 claim 換成一個沒人領過的鍵。
+    page.e[claimKey(CITY_ID, "claim-not-real")] = page.e[lostKey];
+    delete page.e[lostKey];
+    fs.writeFileSync(pagePath, JSON.stringify(page));
+
+    await expectRebuilt(city, async (reopened) => {
+      const duplicate = await reopened.submit(() => ({ ...harvestAt("sess-a", "claim-sess-a"), opId: "harvest:other-id" }));
+      expect(duplicate).toMatchObject({ status: "rejected", reason: "claim_exists" });
+      expect((await reopened.state()).resources.wood).toBe(30);
+    });
+  });
+
+  test("ops 子頁內容被換掉（筆數不變）：已落帳的操作不會再執行一次", async () => {
+    const city = await checkpointedCity("tamper-ops", { pageLimit: 700 });
+    const trade = { opId: "trade:one", kind: "trade", at: AT, cityId: CITY_ID, from: "wood", to: "stone", amount: 2, rate: 3 };
+    const ledger = await open(city.dir, createFileIo(), city.options);
+    expect((await ledger.submit(() => trade)).status).toBe("applied");
+    const { seq } = await ledger.checkpoint();
+    const prefix = hashText(trade.opId).slice(0, 2);
+    const pagePath = `${city.dir}/checkpoints/${seq}/ops/${prefix}.json`;
+    const page = JSON.parse(fs.readFileSync(pagePath, "utf8"));
+    expect(Object.keys(page.e)).toContain(trade.opId);
+    page.e["trade:not-real"] = page.e[trade.opId];
+    delete page.e[trade.opId];
+    fs.writeFileSync(pagePath, JSON.stringify(page));
+
+    const before = (await ledger.state()).resources;
+    const reopened = await open(city.dir, createFileIo(), city.options);
+    expect((await reopened.state()).resources).toEqual(before);
+    // 這筆操作已經在 journal 裡：不能因為 checkpoint 被丟棄就再執行一次（市集會重複扣料）。
+    expect((await reopened.submit(() => trade)).status).toBe("duplicate");
+    expect((await reopened.state()).resources).toEqual(before);
+  });
+
+  test("expeditions 子頁內容被換掉（筆數不變）：格子與遠征身份仍等於從頭重播", async () => {
+    const city = await checkpointedCity("tamper-expeditions", { pageLimit: 512 });
+    const id = tileId(CITY_ID, "sess-a", 1);
+    const pagePath = `${city.dir}/checkpoints/${city.seq}/expeditions/${hashText(id).slice(0, 2)}.json`;
+    const page = JSON.parse(fs.readFileSync(pagePath, "utf8"));
+    expect(Object.keys(page.e)).toContain(id);
+    page.e[tileId(CITY_ID, "sess-not-real", 1)] = page.e[id];
+    delete page.e[id];
+    fs.writeFileSync(pagePath, JSON.stringify(page));
+
+    await expectRebuilt(city, async (reopened) => {
+      expect(await reopened.lookupExpedition("sess-a", 1)).toMatchObject({ tile: { rootSessionId: "sess-a" } });
+    });
+  });
+
+  test("內容檔（blob）被改過：checkpoint 不可信，改用完整重播", async () => {
+    const city = await checkpointedCity("tamper-blob", { pageLimit: 512 });
+    // pageLimit 小 → 遠征紀錄以 blob 形式放進內容檔；改掉其中一個 blob 的內容。
+    const blobs = filesUnder(`${city.dir}/blobs`);
+    expect(blobs.length).toBeGreaterThan(0);
+    fs.writeFileSync(blobs[0], JSON.stringify({ t: "l", d: "被改過的內容" }));
+
+    await expectRebuilt(city, async (reopened) => {
+      expect((await reopened.state()).resources.wood).toBe(30);
+    });
   });
 });

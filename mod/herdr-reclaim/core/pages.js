@@ -73,7 +73,11 @@ export class PrefixIndex {
     await this.writeRoot([...children].sort());
   }
 
-  /** 整批重建（checkpoint 用；不常發生，所以一次寫好每一頁）。 */
+  /**
+   * 整批重建（checkpoint 用；不常發生，所以一次寫好每一頁）。
+   * 回傳 `digest`：這一組頁面（根頁＋每一頁）的內容摘要，寫進 checkpoint manifest，
+   * 載入時用來確認「頁面內容沒有被改過」（筆數不變但內容被換掉也要看得出來）。
+   */
   async build(entries) {
     const groups = new Map();
     for (const [key, value] of entries) {
@@ -83,25 +87,50 @@ export class PrefixIndex {
       groups.set(prefix, group);
     }
     const prefixes = [...groups.keys()].sort();
-    for (const prefix of prefixes) await this.writeSubtree(prefix, this.startLen, groups.get(prefix));
-    await this.writeRoot(prefixes);
-    return { pages: await this.countPages(), keys: [...entries].length };
+    const chain = [];
+    for (const prefix of prefixes) chain.push(...await this.writeSubtree(prefix, this.startLen, groups.get(prefix)));
+    chain.push(`root:${await this.writeRoot(prefixes)}`);
+    return { pages: await this.countPages(), keys: [...entries].length, digest: digestOfPages(chain) };
   }
 
   /**
-   * 索引裡的全部資料（走訪靠根頁與拆分標記，不列目錄）。
+   * 索引裡的全部資料（走訪靠根頁與拆分標記，不列目錄），同時算出**內容摘要**。
    *
    * `strict`：遇到「根頁／拆分標記列到、檔案卻不在」就報錯。checkpoint 這種衍生索引
    * 壞掉時必須看得見（否則缺頁會被當成「沒有資料」，庫存與去重資料靜靜地少掉）。
+   * `digest` 的定義與 `build()` 一致：把每一頁的「前綴:內容雜湊」排序後串起來再雜湊，
+   * 所以任何一頁的內容、多一頁少一頁都會讓摘要不同。
    */
-  async all({ strict = false } = {}) {
-    const root = await this.readPage(this.rootPath());
-    if (strict && !root) throw new Error(`索引根頁不見了：${this.rootPath()}`);
-    const out = new Map();
-    for (const prefix of root?.c ?? []) {
-      for (const [key, value] of await this.collect(prefix, { strict })) out.set(key, value);
+  async scan({ strict = false } = {}) {
+    const rootText = await this.io.read(this.rootPath());
+    if (rootText === null) {
+      if (strict) throw new Error(`索引根頁不見了：${this.rootPath()}`);
+      return { entries: new Map(), digest: digestOfPages([]) };
     }
-    return out;
+    const chain = [`root:${hashText(rootText)}`];
+    const entries = new Map();
+    const walk = async (prefix) => {
+      const text = await this.io.read(this.pagePath(prefix));
+      if (text === null) {
+        if (strict) throw new Error(`索引頁不見了：${this.pagePath(prefix)}`);
+        return;
+      }
+      chain.push(`${prefix}:${hashText(text)}`);
+      const page = JSON.parse(text);
+      if (page.t === "e") {
+        for (const [key, value] of Object.entries(page.e)) entries.set(key, value);
+        return;
+      }
+      if (page.t !== "s") throw new Error(`不是索引頁：${prefix}`);
+      for (const child of page.c ?? []) await walk(child);
+    };
+    for (const prefix of JSON.parse(rootText)?.c ?? []) await walk(prefix);
+    return { entries, digest: digestOfPages(chain) };
+  }
+
+  /** 索引裡的全部資料（走訪靠根頁與拆分標記，不列目錄）。 */
+  async all(options = {}) {
+    return (await this.scan(options)).entries;
   }
 
   /** 一個前綴底下的所有資料。 */
@@ -130,8 +159,7 @@ export class PrefixIndex {
   async writeSubtree(prefix, len, entries) {
     const text = JSON.stringify({ t: "e", e: Object.fromEntries(entries) });
     if (byteLen(text) < this.limit) {
-      await this.writePage(this.pagePath(prefix), { t: "e", e: Object.fromEntries(entries) });
-      return;
+      return [`${prefix}:${await this.writePage(this.pagePath(prefix), { t: "e", e: Object.fromEntries(entries) })}`];
     }
     if (len >= this.maxLen) throw new Error(`索引頁超過上限（${byteLen(text)} >= ${this.limit}）：${prefix}`);
     const groups = new Map();
@@ -142,8 +170,10 @@ export class PrefixIndex {
       groups.set(child, group);
     }
     const children = [...groups.keys()].sort();
-    for (const child of children) await this.writeSubtree(child, len + 1, groups.get(child));
-    await this.writePage(this.pagePath(prefix), { t: "s", l: len + 1, c: children });
+    const chain = [];
+    for (const child of children) chain.push(...await this.writeSubtree(child, len + 1, groups.get(child)));
+    chain.push(`${prefix}:${await this.writePage(this.pagePath(prefix), { t: "s", l: len + 1, c: children })}`);
+    return chain;
   }
 
   async readPage(path) {
@@ -159,6 +189,7 @@ export class PrefixIndex {
     const text = JSON.stringify(page);
     if (byteLen(text) >= this.limit) throw new Error(`索引頁超過上限（${byteLen(text)} >= ${this.limit}）：${path}`);
     await casWrite(this.io, path, text);
+    return hashText(text);
   }
 
   /**
@@ -169,6 +200,7 @@ export class PrefixIndex {
     const text = JSON.stringify({ t: "s", l: this.startLen, c: prefixes });
     if (byteLen(text) > PAGE_LIMIT) throw new Error(`索引根頁超過 256 KiB：${this.rootPath()}`);
     await casWrite(this.io, this.rootPath(), text);
+    return hashText(text);
   }
 
   /** 這個索引目前有幾個頁面（測試與統計用）。 */
@@ -183,4 +215,9 @@ export class PrefixIndex {
     for (const prefix of root?.c ?? []) await walk(prefix);
     return pages;
   }
+}
+
+/** 一組頁面的內容摘要：把「前綴:內容雜湊」排序後串起來再雜湊一次（與走訪順序無關）。 */
+function digestOfPages(chain) {
+  return hashText([...chain].sort().join("|"));
 }

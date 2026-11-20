@@ -71,10 +71,16 @@ export class BlobStore {
     return this.putText(canonicalJson(value));
   }
 
-  /** 讀回最上層雜湊代表的完整文字內容；位元組與順序都與寫入時相同。 */
+  /**
+   * 讀回最上層雜湊代表的完整文字內容；位元組與順序都與寫入時相同。
+   *
+   * 檔名就是內容的雜湊，所以讀回時**重算一次**：內容被改過（或引用被換到別的內容檔）
+   * 就不再等於檔名，直接報錯，而不是拿被改過的資料去重建狀態。
+   */
   async getText(hash) {
     const text = await this.io.read(this.path(hash));
     if (text === null) throw new Error(`內容檔不見了：${hash}`);
+    if (hashText(text) !== hash) throw new Error(`內容與雜湊不符：${hash}`);
     const doc = JSON.parse(text);
     if (doc?.t === "l") return String(doc.d ?? "");
     if (doc?.t !== "m") throw new Error(`不是內容檔：${hash}`);
@@ -85,13 +91,14 @@ export class BlobStore {
     return JSON.parse(await this.getText(hash));
   }
 
-  /** 走完一份 manifest（子節點可能是另一份 manifest）。型別與位元組數都逐一核對。 */
+  /** 走完一份 manifest（子節點可能是另一份 manifest）。型別、內容雜湊與位元組數都逐一核對。 */
   async reassemble(node, doc) {
     let out = "";
     let bytes = 0;
     for (const child of doc.c ?? []) {
       const childText = await this.io.read(this.path(child.h));
       if (childText === null) throw new Error(`內容檔不見了：${child.h}`);
+      if (hashText(childText) !== child.h) throw new Error(`內容與雜湊不符：${child.h}`);
       const childDoc = JSON.parse(childText);
       if (childDoc?.t !== child.t) throw new Error(`manifest 的子節點型別不符：${child.h}`);
       const part = child.t === "l" ? String(childDoc.d ?? "") : await this.reassemble(child, childDoc);

@@ -160,6 +160,15 @@ describe("長期城鎮的容量：一萬支遠征、十萬筆操作", () => {
       fs.writeFileSync(headPath, `${JSON.stringify({ ...plain, checkpoint: -1 })}\n`);
       const full = await open(replayDir);
       const [withCheckpoint, withoutCheckpoint] = await Promise.all([ledger.state(), full.state()]);
+      // checkpoint 載入（含內容摘要驗證）要花多久：新開一份實例、讀一次狀態。
+      const checkpointStarted = performance.now();
+      const checkpointState = await (await open(dir)).state();
+      const checkpointLoadMs = Math.round(performance.now() - checkpointStarted);
+      const journalStarted = performance.now();
+      const journalState = await (await open(replayDir)).state();
+      const journalLoadMs = Math.round(performance.now() - journalStarted);
+      expect(checkpointState.tiles).toHaveLength(EXPEDITIONS);
+      expect(journalState.tiles).toHaveLength(EXPEDITIONS);
       expect(withoutCheckpoint.tiles).toEqual(withCheckpoint.tiles);
       expect([...withoutCheckpoint.activities]).toEqual([...withCheckpoint.activities]);
       expect([...withoutCheckpoint.opSeqs]).toEqual([...withCheckpoint.opSeqs]);
@@ -194,6 +203,9 @@ describe("長期城鎮的容量：一萬支遠征、十萬筆操作", () => {
             files: sizes.length,
             maxFile: Math.max(...sizes.map((file) => file.bytes)),
             headBytes: fs.statSync(`${dir}/head.json`).size,
+            checkpointLoadMs,
+            journalLoadMs,
+            checkpointFiles: filesOf(`${dir}/checkpoints`).length,
           },
         }),
       );
