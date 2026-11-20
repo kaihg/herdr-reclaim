@@ -72,13 +72,18 @@ function cityIdsOf(scenario) {
   return [...ids];
 }
 
-/** 寫進帳本（journal 是唯一完成依據），再從帳本重建城鎮。 */
+/**
+ * 寫進帳本（journal 是唯一完成依據），再從帳本重建城鎮。
+ * 開機時也讓帳本自己決定要不要做 checkpoint（#4）：journal 長到一個程度就把衍生狀態
+ * 寫成有上限的分頁，讀取才不會隨著長期使用一直變慢。
+ */
 async function loadTown(io) {
   const activities = [];
   const expeditions = [];
   for (const cityId of cityIdsOf(firstExpedition)) {
     const ledger = await new CityLedger({ io, dir: cityDir(`${appHome()}/${DATA_DIR}`, cityId), cityId }).open();
     await ingestScenario(ledger, firstExpedition, cityId);
+    await ledger.maybeCheckpoint();
     const state = await ledger.state();
     activities.push(...state.activities.values());
     expeditions.push(...state.tiles);
