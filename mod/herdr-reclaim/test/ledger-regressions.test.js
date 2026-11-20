@@ -3,7 +3,7 @@
 //   1. manifest 被當成內容（內容檔切塊後讀回來還是原本的內容）
 //   2. segment 超限（封段行要預留空間，封段後每一段都還在單段上限內）
 //   3. 收成誤加 100 點（帳本只套 entry 帶的點數，不自己發明）
-//   4. 舊 generation 套到新 generation（重新派遣後，舊代的收成整筆拒絕）
+//   4. 舊 generation 遲到收成仍按事件時間落回原代
 //   5. 長期段落超限（大量操作後每一段都還在單檔上限內）
 //
 // 另外驗證「封段後寫入者改到下一段並重新檢查前提」：別人先封段時，晚到的寫入者
@@ -11,7 +11,7 @@
 import { describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import { CityLedger, byteLen } from "../core/ledger.js";
-import { readTownFromLedger } from "../core/town.js";
+import { processLand, redispatch } from "../core/ingest.js";
 import { AT } from "../scenarios/first-expedition.js";
 import { createFileIo } from "./fs-io.js";
 
@@ -36,10 +36,10 @@ const expeditionOp = (sessionId, generation, x, y) => ({
 });
 
 /** 收成：點數與資源向量由 entry 自己帶（§7.3 的規則屬於收成票，帳本不發明數字）。 */
-const harvestOp = (sessionId, generation, claim, { points = 20, resources = { wood: 10 } } = {}) => ({
+const harvestOp = (sessionId, generation, claim, { points = 20, resources = { wood: 10 }, at = AT } = {}) => ({
   opId: `harvest:${claim}`,
   kind: "harvest",
-  at: AT,
+  at,
   cityId: CITY_ID,
   rootSessionId: sessionId,
   generation,
@@ -116,26 +116,29 @@ describe("S3 的五項既有失敗", () => {
     expect((await tileOf(ledger, "sess-points")).points).toBe(40);
   });
 
-  test("④ 重新派遣後，舊 generation 的收成整筆拒絕", async () => {
+  test("④ 重新派遣後，舊 generation 的晚到收成仍按事件時間歸回原代", async () => {
     const ledger = await open(dirOf("generation"));
     await ledger.submit(() => expeditionOp("sess-gen", 1, 0, -1));
-    expect((await ledger.submit(() => harvestOp("sess-gen", 1, "claim-gen1"))).status).toBe("applied");
-    // 重新派遣（#7 的條件會更嚴；這一票只要求 generation 是現役的下一代）。
-    expect((await ledger.submit(() => expeditionOp("sess-gen", 2, 0, -2))).status).toBe("applied");
+    expect((await processLand(ledger, {
+      rootSessionId: "sess-gen",
+      generation: 1,
+      action: "withdraw",
+      at: AT + 1_000,
+    })).status).toBe("applied");
+    expect((await redispatch(ledger, { rootSessionId: "sess-gen", at: AT + 2_000 })).status).toBe("applied");
 
-    const stale = await ledger.submit(() => harvestOp("sess-gen", 1, "claim-old"));
-    expect(stale.status).toBe("rejected");
-    expect(stale.reason).toBe("stale_generation");
-
-    // 舊代的格子還在，但沒有多拿到點數；新代照常收成。
+    const late = await ledger.submit(() =>
+      harvestOp("sess-gen", 1, "claim-old", { at: AT + 500 }));
+    expect(late.status).toBe("applied");
     expect((await tileOf(ledger, "sess-gen", 1)).harvestPoints).toBe(20);
-    expect((await ledger.submit(() => harvestOp("sess-gen", 2, "claim-old"))).status).toBe("applied");
+    expect((await tileOf(ledger, "sess-gen", 2)).harvestPoints).toBe(0);
+
+    expect((await ledger.submit(() =>
+      harvestOp("sess-gen", 2, "claim-new", { at: AT + 2_500 }))).status).toBe("applied");
     expect((await tileOf(ledger, "sess-gen", 2)).harvestPoints).toBe(20);
-    // 一格 generation 一個身分：兩代各一張，不會互相蓋掉。
     expect((await townsOf(ledger)).cities[0].tiles).toHaveLength(2);
-    // 歷程查詢分得開兩代：指定 generation 才定位得到那一代的格子與它的 entry。
     const second = await ledger.lookupExpedition("sess-gen", 2);
-    expect(second.tile).toMatchObject({ generation: 2, x: 0, y: -2, harvestPoints: 20 });
+    expect(second.tile).toMatchObject({ generation: 2, x: 0, y: -1, harvestPoints: 20 });
     expect(await ledger.lookupExpedition("sess-gen", 3)).toBeNull();
     expect((await ledger.historyOf("sess-gen", 1)).entries.filter((entry) => entry.kind === "harvest")).toHaveLength(1);
     expect((await ledger.historyOf("sess-gen", 2)).entries.filter((entry) => entry.kind === "harvest")).toHaveLength(1);

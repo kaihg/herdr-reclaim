@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import { CityLedger, cityDir } from "../core/ledger.js";
 import { readTown, readTownFromLedger, selectionDetail } from "../core/town.js";
-import { ingestActivities, ingestExpeditions, ingestScenario } from "../core/ingest.js";
+import { ingestActivities, ingestExpeditions, ingestScenario, processLand, redispatch } from "../core/ingest.js";
 import {
   defaultSelection,
   parseUi,
@@ -14,7 +14,7 @@ import {
   serializeUi,
   withSelection,
 } from "../core/selection.js";
-import { CITY, ROOT_SESSION_ID, firstExpedition } from "../scenarios/first-expedition.js";
+import { AT, CITY, ROOT_SESSION_ID, firstExpedition } from "../scenarios/first-expedition.js";
 import { createFileIo } from "./fs-io.js";
 
 const newDir = () => cityDir(fs.mkdtempSync("/tmp/reclaim-3-"), CITY.commonDir);
@@ -116,7 +116,7 @@ describe("帳本重建城鎮", () => {
 
     const reopened = await townOfLedger(await open(dir));
     expect(selectionDetail(reopened, selection)).toEqual(selectionDetail(town, selection));
-    expect(selectionDetail(reopened, selection).title).toBe(`遠征 ${ROOT_SESSION_ID.slice(0, 8)}`);
+    expect(selectionDetail(reopened, selection).title).toBe(`遠征 ${ROOT_SESSION_ID.slice(0, 8)} · 第 1 代`);
   });
 
   test("只有活動紀錄、沒有取得土地的 entry 時，城鎮不會出現格子", async () => {
@@ -125,7 +125,7 @@ describe("帳本重建城鎮", () => {
     const state = await ledger.state();
     expect(state.activities.size).toBe(5); // 活動紀錄與內容檔都寫進去了
     expect(state.tiles).toHaveLength(0); // 但沒有取得土地的 entry
-    expect(await townOfLedger(ledger)).toEqual({ schema: 1, cities: [] });
+    expect(await townOfLedger(ledger)).toEqual({ schema: 1, cities: [], unresolvedActivities: [] });
   });
 
   test("選取存在 mod 的 ui.json，重開後還原成同一個選取；城鎮帳本不記選取", async () => {
@@ -140,6 +140,7 @@ describe("帳本重建城鎮", () => {
       kind: "expedition",
       cityId: town.cities[0].cityId,
       rootSessionId: town.cities[0].tiles[1].rootSessionId,
+      generation: town.cities[0].tiles[1].generation,
     };
     const before = await io.read(uiPath);
     const saved = withSelection(parseUi(before), chosen.cityId, chosen);
@@ -152,5 +153,59 @@ describe("帳本重建城鎮", () => {
     // 帳本裡沒有選取這回事：journal entry 只有活動與取得土地。
     const entries = (await ledger.scanSegments()).flatMap((segment) => segment.entries);
     expect(new Set(entries.map((entry) => entry.kind))).toEqual(new Set(["activity", "expedition"]));
+  });
+
+  test("真實撤回與重新派遣後，晚掃描的舊 commit 只進入原 generation", async () => {
+    const ledger = await open(newDir());
+    await ingestScenario(ledger, firstExpedition, CITY.commonDir);
+    const withdrawn = await processLand(ledger, {
+      rootSessionId: ROOT_SESSION_ID,
+      generation: 1,
+      action: "withdraw",
+      at: AT + 10_000_000,
+    });
+    expect(withdrawn.status).toBe("applied");
+    const dispatched = await redispatch(ledger, { rootSessionId: ROOT_SESSION_ID, at: AT + 11_000_000 });
+    expect(dispatched.status).toBe("applied");
+
+    const lateHarvest = await ledger.submit(() => ({
+      opId: "harvest:old-generation-only",
+      kind: "harvest",
+      at: AT + 60_000,
+      cityId: CITY.commonDir,
+      rootSessionId: ROOT_SESSION_ID,
+      generation: 1,
+      claims: ["old-generation-path"],
+      paths: ["old-generation-path"],
+      points: 20,
+      resources: { wood: 10 },
+    }));
+    expect(lateHarvest.status).toBe("applied");
+    const currentHarvest = await ledger.submit(() => ({
+      opId: "harvest:new-generation",
+      kind: "harvest",
+      at: AT + 11_500_000,
+      cityId: CITY.commonDir,
+      rootSessionId: ROOT_SESSION_ID,
+      generation: 2,
+      claims: ["new-generation-path"],
+      paths: ["new-generation-path"],
+      points: 20,
+      resources: { wood: 10 },
+    }));
+    expect(currentHarvest.status).toBe("applied");
+    const town = await townOfLedger(ledger);
+    const generations = town.cities[0].tiles
+      .filter((tile) => tile.rootSessionId === ROOT_SESSION_ID)
+      .sort((a, b) => a.generation - b.generation);
+    const protectedTile = await processLand(ledger, {
+      rootSessionId: ROOT_SESSION_ID,
+      generation: 2,
+      action: "withdraw",
+      at: AT + 12_000_000,
+    });
+    expect(protectedTile).toMatchObject({ status: "rejected", reason: "has_commit_harvest" });
+    expect(generations.map((tile) => [tile.generation, tile.harvestPoints, tile.points, tile.landStage]))
+      .toEqual([[1, 20, 94, "withdrawn"], [2, 20, 20, "reserved"]]);
   });
 });

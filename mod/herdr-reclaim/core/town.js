@@ -92,7 +92,7 @@ function usageBySource(records) {
       if (event.kind !== "usage") continue;
       for (const [provider, usage] of Object.entries(event.usage ?? {})) {
         const source = usage.sourceKey ?? (event.sourceEntryId ? `${origin}#${event.sourceEntryId}` : `${origin}#${record.writerEpoch ?? ""}#${event.eventSeq}`);
-        bySource.set(`${source}#${provider}`, { ...usage, cityId });
+        bySource.set(`${source}#${provider}`, { ...usage, cityId, at: event.at });
       }
     }
   }
@@ -221,7 +221,17 @@ export function readTownFromLedger(replay = {}) {
   const town = replayTown({ activities: replay.activities, repoFacts: replay.repoFacts }, (session, visit) => {
     const entry = spots.get(`${session.sessionId}@@${visit.commonDir}`);
     return entry
-      ? { x: entry.x, y: entry.y, generation: entry.generation ?? 1, harvestPoints: entry.harvestPoints ?? 0 }
+      ? {
+          x: entry.x,
+          y: entry.y,
+          generation: entry.generation ?? 1,
+          activatedAt: entry.activatedAt,
+          deactivatedAt: entry.deactivatedAt,
+          landStage: entry.landStage,
+          harvestPoints: entry.harvestPoints ?? 0,
+          workPoints: entry.workPoints ?? 0,
+          boostPoints: entry.boostPoints ?? 0,
+        }
       : null;
   });
 
@@ -251,18 +261,49 @@ export function readTownFromLedger(replay = {}) {
         y: entry.y,
         rootSessionId: entry.rootSessionId,
         generation,
+        activatedAt: entry.activatedAt ?? entry.at ?? 0,
+        deactivatedAt: entry.deactivatedAt ?? null,
+        landStage: entry.landStage ?? null,
         cli: entry.cli ?? null,
         repo: entry.repo ?? { commonDir: entry.cityId, checkout: null },
         visits: [],
         sources: [],
         harvestPoints: entry.harvestPoints ?? 0,
+        workPoints: entry.workPoints ?? 0,
+        boostPoints: entry.boostPoints ?? 0,
       }),
     );
+  }
+  const recordsById = new Map();
+  for (const record of mergeActivities(replay.activities ?? [])) {
+    if (!recordsById.has(record.sessionId)) recordsById.set(record.sessionId, []);
+    recordsById.get(record.sessionId).push(record);
+  }
+  const sessions = [...recordsById.values()].map(sessionOf);
+  const sessionById = new Map(sessions.map((session) => [session.sessionId, session]));
+  const rootOf = (session) => {
+    const seen = new Set();
+    let current = session;
+    while (current?.role === "child" && current.parentSessionId && !seen.has(current.sessionId)) {
+      seen.add(current.sessionId);
+      current = sessionById.get(current.parentSessionId);
+    }
+    return current?.sessionId ?? session.sessionId;
+  };
+  for (const city of town.cities) {
+    city.tiles = city.tiles.map((tile) => {
+      const root = sessionById.get(tile.rootSessionId);
+      const sources = sessions.filter((session) =>
+        rootOf(session) === tile.rootSessionId && session.visits.some((visit) => visit.commonDir === tile.cityId));
+      const visits = root?.visits.filter((visit) => visit.commonDir === tile.cityId) ?? [];
+      return finishTile({ ...tile, sources, visits });
+    });
   }
   for (const city of town.cities) {
     city.resources = replay.resources?.[city.cityId] ?? city.resources;
     city.unharvestedCommits = replay.unharvestedCommits?.[city.cityId] ?? [];
   }
+  town.unresolvedActivities = replay.unresolvedActivities ?? [];
   return town;
 }
 
@@ -277,7 +318,7 @@ export function planExpeditions(replay = {}) {
     plans.push({
       cityId: visit.commonDir,
       rootSessionId: session.sessionId,
-      at: session.startedAt,
+      at: visit.startedAt ?? session.startedAt,
       generation: spot.generation,
       x: spot.x,
       y: spot.y,
@@ -352,6 +393,7 @@ function replayTown(replay, place) {
 
   return {
     schema: SCHEMA,
+    unresolvedActivities: replay.unresolvedActivities ?? [],
     cities: [...cities.values()].map((city) => ({
       cityId: city.cityId,
       name: city.name,
@@ -386,13 +428,17 @@ function newTile(session, city, visit, planned) {
     x: planned.x,
     y: planned.y,
     rootSessionId: session.sessionId,
-    generation: planned.generation ?? 1, // 重新派遣（#7）才會往上加
+    generation: planned.generation ?? 1,
+    activatedAt: planned.activatedAt ?? session.startedAt,
+    deactivatedAt: planned.deactivatedAt ?? null,
+    landStage: planned.landStage ?? null,
     cli: session.cli,
     repo: { commonDir: city.cityId, checkout: visit.checkout },
     visits: [],
     sources: [session],
-    // 收成點數由帳本帶進來（§10：自然工作、收成、加速三種點數分開保存）。
     harvestPoints: planned.harvestPoints ?? 0,
+    workPoints: planned.workPoints ?? 0,
+    boostPoints: planned.boostPoints ?? 0,
   };
 }
 
@@ -403,12 +449,12 @@ export const ZERO_USAGE = { inputNonCache: 0, cacheRead: 0, cacheWrite: 0, outpu
  * 一格（或一支遠征）的用量：root 加上併進來的 child，同一把來源 key 只算一次（§6.1、§15.6）。
  * 每筆用量依發生時的 cityId 歸城；child 的用量依 S1 歸到 root 遠征。
  */
-function sumUsage(sources, cityId) {
+function sumUsage(sources, cityId, startedAt = -Infinity, endedAt = Infinity) {
   const total = { ...ZERO_USAGE };
   const unknownFields = new Set();
   for (const session of sources) {
     for (const usage of session.usage.values()) {
-      if (usage.cityId !== cityId) continue;
+      if (usage.cityId !== cityId || usage.at < startedAt || usage.at >= endedAt) continue;
       for (const key of Object.keys(total)) total[key] += Number(usage[key]) || 0;
       for (const field of usage.unknownFields ?? []) unknownFields.add(field);
     }
@@ -417,26 +463,45 @@ function sumUsage(sources, cityId) {
   return total;
 }
 
-/** §10：總點數 = floor(自然工作毫秒 / 60_000) + 收成點數。 */
+/** §10：自然工作、收成與加速點分開保存，再加總判斷開墾。 */
 function finishTile(tile) {
-  const intervals = tile.sources.flatMap((session) => session.intervals.filter((interval) => interval.cityId === tile.cityId));
-  const workMs = unionMs(intervals);
+  const startedAt = Number(tile.activatedAt ?? -Infinity);
+  const endedAt = tile.deactivatedAt == null ? Infinity : Number(tile.deactivatedAt);
+  const intervals = tile.sources.flatMap((session) => session.intervals
+    .filter((interval) => interval.cityId === tile.cityId)
+    .map((interval) => ({
+      ...interval,
+      start: Math.max(interval.start, startedAt),
+      end: Math.min(interval.end, endedAt),
+      open: interval.open && endedAt === Infinity,
+    }))
+    .filter((interval) => interval.end >= interval.start));
+  const measuredWorkMs = unionMs(intervals);
+  const workPoints = Math.max(Math.floor(measuredWorkMs / MINUTE_MS), tile.workPoints ?? 0);
+  const workMs = Math.max(measuredWorkMs, workPoints * MINUTE_MS);
   const harvestPoints = tile.harvestPoints ?? 0;
-  const points = Math.floor(workMs / MINUTE_MS) + harvestPoints;
+  const boostPoints = tile.boostPoints ?? 0;
+  const points = workPoints + harvestPoints + boostPoints;
+  const derivedStage = points >= CLEAR_POINTS ? "cleared" : "reserved";
   return {
     cityId: tile.cityId,
     x: tile.x,
     y: tile.y,
     rootSessionId: tile.rootSessionId,
     generation: tile.generation,
+    activatedAt: tile.activatedAt,
+    deactivatedAt: tile.deactivatedAt,
     cli: tile.cli,
     repo: tile.repo,
     visits: tile.visits,
     workMs,
-    points,
-    usage: sumUsage(tile.sources, tile.cityId),
+    workPoints,
     harvestPoints,
-    landStage: points >= CLEAR_POINTS ? "cleared" : "reserved",
+    boostPoints,
+    points,
+    usage: sumUsage(tile.sources, tile.cityId, startedAt, endedAt),
+    harvested: tile.harvested === true,
+    landStage: tile.landStage ?? derivedStage,
     status: intervals.some((interval) => interval.open) ? "active" : "idle",
   };
 }
@@ -467,7 +532,10 @@ export function selectionDetail(town, selection) {
   if (!city) return detail("none", null, null, "沒有城鎮", null, []);
 
   if (selection?.kind === "expedition") {
-    const tile = city.tiles.find((candidate) => candidate.rootSessionId === selection.rootSessionId);
+    const matches = city.tiles.filter((candidate) => candidate.rootSessionId === selection.rootSessionId);
+    const tile = matches.find((candidate) => candidate.generation === selection.generation) ??
+      matches.reduce((latest, candidate) =>
+        !latest || candidate.generation > latest.generation ? candidate : latest, null);
     return tile ? expeditionDetail(city, tile) : detail("none", city, null, "找不到這支遠征", null, []);
   }
 
@@ -496,19 +564,38 @@ function detail(kind, city, tile, title, statusLabel, fields) {
 }
 
 function expeditionDetail(city, tile) {
+  const actions = tile.landStage === "withdrawn" || tile.landStage === "archived"
+    ? ["redispatch"]
+    : !tile.harvested && tile.landStage === "reserved"
+      ? ["withdraw"]
+      : !tile.harvested && tile.landStage === "cleared"
+        ? ["archive"]
+        : [];
+  const stageLabel = ({
+    reserved: "預留",
+    cleared: "已開墾",
+    built: "已建",
+    withdrawn: "已撤回",
+    archived: "已封存",
+  })[tile.landStage] ?? "預留";
   return {
     kind: "expedition",
     cityId: city.cityId,
     cityName: city.name,
+    rootSessionId: tile.rootSessionId,
+    generation: tile.generation,
     tile: { x: tile.x, y: tile.y },
-    title: `遠征 ${shortId(tile.rootSessionId)}`,
+    title: `遠征 ${shortId(tile.rootSessionId)} · 第 ${tile.generation} 代`,
     statusLabel: tile.status === "active" ? "探索中" : "駐紮",
     points: tile.points,
     pointsTarget: CLEAR_POINTS,
+    actions,
+    actionUnavailableReason: tile.harvested ? "已有 commit 收成，不能撤回或封存" : null,
     fields: [
       { label: "工作時間", value: formatDuration(tile.workMs) },
+      { label: "點數", value: `工作 ${tile.workPoints} · 收成 ${tile.harvestPoints} · 加速 ${tile.boostPoints}` },
       { label: "用量", value: formatUsage(tile.usage) },
-      { label: "土地", value: tile.landStage === "cleared" ? "已開墾" : "預留" },
+      { label: "土地", value: stageLabel },
       { label: "座標", value: `${tile.x}, ${tile.y}` },
       { label: "CLI", value: tile.cli ?? "未知" },
       { label: "session", value: tile.rootSessionId },

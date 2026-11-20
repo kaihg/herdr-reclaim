@@ -81,10 +81,11 @@ export async function ingestScenario(ledger, scenario, cityId) {
 function takenOf(state, cityId) {
   const taken = new Set();
   for (const tile of state.tiles) {
-    if (tile.cityId === cityId) taken.add(`${tile.x},${tile.y}`);
+    if (tile.cityId === cityId && tile.landStage !== "withdrawn") taken.add(`${tile.x},${tile.y}`);
   }
   return taken;
 }
+
 
 export function expeditionOp(state, plan) {
   const taken = takenOf(state, plan.cityId);
@@ -96,9 +97,42 @@ export function expeditionOp(state, plan) {
     cityId: plan.cityId,
     rootSessionId: plan.rootSessionId,
     generation: plan.generation,
+    activatedAt: plan.activatedAt ?? plan.at ?? 0,
     x: spot.x,
     y: spot.y,
     cli: plan.cli ?? null,
     repo: plan.repo ?? null,
   };
+}
+
+/** 撤回／封存：資格檢查和操作以一筆 journal CAS 原子完成。 */
+export async function processLand(ledger, { rootSessionId, generation, action, at }) {
+  return ledger.submit(() => ({
+    opId: `${action}:${ledger.cityId}:${rootSessionId}:${generation}`,
+    kind: "landAction",
+    at,
+    cityId: ledger.cityId,
+    rootSessionId,
+    generation,
+    action,
+  }));
+}
+
+/** 重新派遣以當下帳本重新 BFS，generation、工作點與加速點重新起算。 */
+export async function redispatch(ledger, { rootSessionId, at }) {
+  return ledger.submit((state) => {
+    const previousGeneration = state.currentGen.get(`${ledger.cityId}@@${rootSessionId}`);
+    if (previousGeneration === undefined) return null;
+    const previous = state.tileById.get(`${ledger.cityId}@@${rootSessionId}@@${previousGeneration}`);
+    if (!previous || !["withdrawn", "archived"].includes(previous.landStage)) return null;
+    return expeditionOp(state, {
+      cityId: ledger.cityId,
+      rootSessionId,
+      generation: previousGeneration + 1,
+      at,
+      activatedAt: at,
+      cli: previous.cli,
+      repo: previous.repo,
+    });
+  });
 }

@@ -20,7 +20,7 @@ import { appHome, checking, exec, readTextFile, settings, theme, watchFolder, wr
 import { ADAPTER_DIR, activityDir, adapterRoot, citiesOf, loadActivities, repoFactsOf } from "./core/adapter.js";
 import { loadCommitEvidence, parseRawDiff, parseReflogEvidence, ingestCommits, unharvestedCommitReasons } from "./core/commit-evidence.js";
 import { MAP_RADIUS, keyOf, projectTile } from "./core/grid.js";
-import { ingestScenario } from "./core/ingest.js";
+import { ingestScenario, processLand, redispatch } from "./core/ingest.js";
 import { hostIo } from "./core/host-io.js";
 import { CasConflict, CityLedger, cityDir } from "./core/ledger.js";
 import { installHooks, removeHooks } from "./core/hooks.js";
@@ -129,8 +129,35 @@ async function ensureActivityDir(io) {
  * 活動按 visit 的 commonDir 分城寫入，帳本 journal 是唯一完成依據（§13）。
  */
 
+async function retryUnresolvedActivities(activities) {
+  return Promise.all((activities ?? []).map(async (record) => {
+    const events = await Promise.all((record.events ?? []).map(async (event) => {
+      if (event.kind !== "visit_start" || !event.visit?.cwd || event.visit.commonDir) return event;
+      const [commonDir, checkout] = await Promise.all([
+        exec("git", ["-C", event.visit.cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"]),
+        exec("git", ["-C", event.visit.cwd, "rev-parse", "--show-toplevel"]),
+      ]);
+      if (commonDir.code !== 0 || checkout.code !== 0) return event;
+      return { ...event, visit: { ...event.visit, commonDir: commonDir.stdout.trim(), checkout: checkout.stdout.trim() } };
+    }));
+    return { ...record, events };
+  }));
+}
+
 async function loadTown(io) {
-  const activities = await loadActivities(io, activityDir(appHome()));
+  const rawActivities = await loadActivities(io, activityDir(appHome()));
+  const activities = await retryUnresolvedActivities(rawActivities);
+  const unresolvedCandidates = activities.flatMap((record) => (record.events ?? [])
+    .filter((event) => event.kind === "visit_start" && event.visit?.cwd && !event.visit.commonDir)
+    .map((event) => ({
+      sessionId: record.sessionId,
+      writerEpoch: record.writerEpoch,
+      eventSeq: event.eventSeq,
+      cli: record.cli ?? "未知",
+      cwd: event.visit.cwd,
+      at: event.at,
+      status: "unresolved",
+    })));
   const cityIds = [...new Set([...citiesOf(activities), ...(await cityIdsFromLedgers(io))])].sort();
   const repoFacts = await repoFactsOf(io, cityIds);
   const replay = { activities, repoFacts };
@@ -185,7 +212,19 @@ async function loadTown(io) {
     stored.push(...state.activities.values());
     expeditions.push(...state.tiles);
   }
-  return readTownFromLedger({ activities: stored, expeditions, repoFacts, resources, unharvestedCommits: unharvested });
+  const resolvedEventKeys = new Set(stored.flatMap((record) => (record.events ?? [])
+    .filter((event) => event.visit?.commonDir)
+    .map((event) => `${record.sessionId}@@${record.writerEpoch}@@${event.eventSeq}`)));
+  const unresolvedActivities = unresolvedCandidates.filter((event) =>
+    !resolvedEventKeys.has(`${event.sessionId}@@${event.writerEpoch}@@${event.eventSeq}`));
+  return readTownFromLedger({
+    activities: stored,
+    expeditions,
+    repoFacts,
+    resources,
+    unresolvedActivities,
+    unharvestedCommits: unharvested,
+  });
 }
 
 /** 選取狀態的檔案（不是城的帳本）：選取不產生資源，也不改變土地。 */
@@ -292,18 +331,76 @@ export default class Town extends View {
     cx.notify();
   }
 
+  operateLand(detail, action, cx) {
+    if (!detail?.cityId || !detail.rootSessionId) return;
+    cx.spawn(async (cx2) => {
+      try {
+        const ledger = await new CityLedger({
+          io: this.io,
+          dir: cityDir(adapterRoot(appHome()), detail.cityId),
+          cityId: detail.cityId,
+        }).open();
+        const result = action === "redispatch"
+          ? await redispatch(ledger, { rootSessionId: detail.rootSessionId, at: Date.now() })
+          : await processLand(ledger, {
+              rootSessionId: detail.rootSessionId,
+              generation: detail.generation,
+              action,
+              at: Date.now(),
+            });
+        if (result.status !== "applied" && result.status !== "duplicate") {
+          this.note = `土地操作未完成：${result.reason ?? result.status}`;
+        } else {
+          this.town = await loadTown(this.io);
+          const latest = this.town.cities.find((city) => city.cityId === detail.cityId)?.tiles
+            .filter((tile) => tile.rootSessionId === detail.rootSessionId)
+            .reduce((current, tile) => !current || tile.generation > current.generation ? tile : current, null);
+          this.selection = {
+            kind: "expedition",
+            cityId: detail.cityId,
+            rootSessionId: detail.rootSessionId,
+            generation: latest?.generation,
+          };
+          this.note = null;
+          await saveSelection(this.io, this.selection);
+        }
+      } catch (error) {
+        this.note = `土地操作失敗：${error}`;
+      }
+      cx2.notify();
+    });
+  }
+
+  retryTown(cx) {
+    cx.spawn(async (cx2) => {
+      try {
+        this.town = await loadTown(this.io);
+        this.note = null;
+      } catch (error) {
+        this.note = `城鎮讀取失敗：${error}`;
+      }
+      cx2.notify();
+    });
+  }
+
   render(cx) {
     const t = theme();
     const city = this.city();
     if (!city) {
+      const unresolved = this.town?.unresolvedActivities ?? [];
       return v_flex()
         .id("root")
         .size_full()
         .items_center()
         .justify_center()
+        .gap(8)
         .bg(t.canvas)
         .text_color(t.muted)
-        .child(this.note ?? "還沒有任何城市：互動的 root session 進到一個 Git repo 之後就會出現。");
+        .child(div().child(this.note ?? "還沒有任何城市：互動的 root session 進到一個 Git repo 之後就會出現。"))
+        .children(unresolved.map((activity) =>
+          div().text_size(10).child(`未解析 · ${activity.sessionId} · ${activity.cwd}`)))
+        .when(unresolved.length > 0, (element) =>
+          element.child(hookButton("重試歸戶", t, (cx2) => this.retryTown(cx2))));
     }
     // 這一格 mod 有多寬決定兩側的欄寬；窄 pane 也看得到四個區塊。
     // on_size_change 給的是實際像素（含畫面縮放），版面用的 .w()/.left() 是 UI 像素。
@@ -330,7 +427,7 @@ export default class Town extends View {
         h_flex().flex_1().min_h(0).children([
           this.expeditionList(city, t, cx, leftW),
           this.map(city, t, cx, mapArea),
-          this.detailPanel(selectionDetail(this.town, this.selection), t, rightW),
+          this.detailPanel(selectionDetail(this.town, this.selection), t, rightW, cx),
         ]),
       ]);
   }
@@ -423,15 +520,22 @@ export default class Town extends View {
           ...city.unharvestedCommits.map((commit) => div().text_size(9).text_color(t.muted).truncate()
             .child(`${commit.sha.slice(0, 8)} · ${COMMIT_REASON_LABELS[commit.reason] ?? commit.reason}`)),
         ] : []),
+        ...(this.town?.unresolvedActivities?.length ? [
+          div().text_size(10).text_color(t.dim).child("未解析活動"),
+          ...this.town.unresolvedActivities.map((activity) =>
+            div().text_size(9).text_color(t.muted).truncate().child(`${activity.sessionId} · ${activity.cwd}`)),
+          hookButton("重試歸戶", t, (cx2) => this.retryTown(cx2)),
+        ] : []),
         ...city.tiles.map((tile) => this.expeditionCard(city, tile, t, cx)),
       ]);
   }
 
   expeditionCard(city, tile, t, cx) {
     const status = statusOf(tile, t);
-    const selected = this.selection?.kind === "expedition" && this.selection.rootSessionId === tile.rootSessionId;
+    const selected = this.selection?.kind === "expedition" &&
+      this.selection.rootSessionId === tile.rootSessionId && this.selection.generation === tile.generation;
     return v_flex()
-      .id(`expedition-${tile.rootSessionId}`)
+      .id(`expedition-${tile.rootSessionId}-${tile.generation}`)
       .w_full()
       .flex_none()
       .gap(3)
@@ -443,7 +547,12 @@ export default class Town extends View {
       .border_color(selected ? t.accent : t.border)
       .hover((style) => style.bg(selected ? t.selected : t.hover))
       .on_click((_event, cx2) =>
-        this.select({ kind: "expedition", cityId: city.cityId, rootSessionId: tile.rootSessionId }, cx2),
+        this.select({
+          kind: "expedition",
+          cityId: city.cityId,
+          rootSessionId: tile.rootSessionId,
+          generation: tile.generation,
+        }, cx2),
       )
       .children([
         h_flex()
@@ -451,7 +560,7 @@ export default class Town extends View {
           .items_center()
           .child(div().size(7).rounded_full().bg(status.color))
           .child(div().text_size(11).text_color(status.color).child(status.label)),
-        div().text_size(12.5).font_semibold().truncate().child(`遠征 ${shortId(tile.rootSessionId)}`),
+        div().text_size(12.5).font_semibold().truncate().child(`遠征 ${shortId(tile.rootSessionId)} · 第 ${tile.generation} 代`),
         div().text_size(11).text_color(t.muted).truncate().child(`${tile.points} / ${CLEAR_POINTS} · ${tile.cli ?? "未知"}`),
       ]);
   }
@@ -461,10 +570,20 @@ export default class Town extends View {
   map(city, t, cx, area) {
     const tile = tileSize(area);
     const paths = diamondPaths(tile);
-    const tiles = new Map(city.tiles.map((entry) => [keyOf(entry), entry]));
+    const tiles = new Map(city.tiles
+      .filter((entry) => entry.landStage !== "archived" && entry.landStage !== "withdrawn")
+      .map((entry) => [keyOf(entry), entry]));
+    const revealed = new Set();
+    for (const tileEntry of city.tiles) {
+      if (tileEntry.landStage !== "cleared" && tileEntry.landStage !== "built") continue;
+      revealed.add(keyOf(tileEntry));
+      for (const [dx, dy] of [[0, -1], [1, 0], [0, 1], [-1, 0]]) {
+        revealed.add(keyOf({ x: tileEntry.x + dx, y: tileEntry.y + dy }));
+      }
+    }
     const cells = [];
     for (let x = -MAP_RADIUS; x <= MAP_RADIUS; x++) {
-      for (let y = -MAP_RADIUS; y <= MAP_RADIUS; y++) cells.push(this.cell(city, tiles, x, y, t, cx, tile, paths, area));
+      for (let y = -MAP_RADIUS; y <= MAP_RADIUS; y++) cells.push(this.cell(city, tiles, revealed, x, y, t, cx, tile, paths, area));
     }
     return div()
       .id("map")
@@ -479,21 +598,19 @@ export default class Town extends View {
       .children(cells);
   }
 
-  cell(city, tiles, x, y, t, cx, tile, paths, area) {
+  cell(city, tiles, revealed, x, y, t, cx, tile, paths, area) {
     const entry = tiles.get(keyOf({ x, y }));
     const isCenter = x === city.center.x && y === city.center.y;
+    const isRevealed = revealed.has(keyOf({ x, y }));
     const selected =
       (this.selection?.kind === "tile" && this.selection.x === x && this.selection.y === y) ||
       (Boolean(entry) && this.selection?.kind === "expedition" && this.selection.rootSessionId === entry.rootSessionId);
     const spot = projectTile({ x, y }, tile);
-    // 迷霧用斜線紋（各主題都看得出來），遠征格用底色與外框、選取再粗一圈。
     const fill = isCenter
       ? t.raised
       : entry
-        ? selected
-          ? t.selected
-          : t.raised
-        : Background.pattern_slash(t.dim, 1, 4);
+        ? selected ? t.selected : t.raised
+        : isRevealed ? t.background : Background.pattern_slash(t.dim, 1, 4);
     const edge = isCenter ? t.foreground : entry ? (selected ? t.accent : t.muted) : t.border;
     const stroke = isCenter ? paths.edgeSelected : selected ? paths.edgeSelected : paths.edge;
     const label = isCenter
@@ -510,7 +627,12 @@ export default class Town extends View {
       .w(tile.w)
       .h(tile.h)
       .cursor_pointer()
-      .on_click((_event, cx2) => this.select({ kind: "tile", cityId: city.cityId, x, y }, cx2))
+      .on_click((_event, cx2) => this.select(
+        entry
+          ? { kind: "expedition", cityId: city.cityId, rootSessionId: entry.rootSessionId, generation: entry.generation }
+          : { kind: "tile", cityId: city.cityId, x, y },
+        cx2,
+      ))
       .child(painted(paths.fill, fill, tile))
       .child(painted(stroke, edge, tile))
       .when(Boolean(label), (element) =>
@@ -530,7 +652,8 @@ export default class Town extends View {
 
   // ---- 右側：選取遠征或格子的詳情（§12 的入口）
 
-  detailPanel(detail, t, width) {
+  detailPanel(detail, t, width, cx) {
+    const actionLabels = { withdraw: "撤回", archive: "封存", redispatch: "重新派遣" };
     return v_flex()
       .id("detail")
       .w(width)
@@ -549,6 +672,11 @@ export default class Town extends View {
           detail.statusLabel ? statusBadge(detail.statusLabel, t) : null,
           detail.pointsTarget ? progress(detail, t) : null,
           ...detail.fields.map((field) => fieldRow(field, t)),
+          ...(detail.actions ?? []).map((action) =>
+            hookButton(actionLabels[action], t, (cx2) => this.operateLand(detail, action, cx2))),
+          detail.actionUnavailableReason
+            ? div().text_size(9).text_color(t.muted).child(detail.actionUnavailableReason)
+            : null,
         ].filter(Boolean),
       );
   }
