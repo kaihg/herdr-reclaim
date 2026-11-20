@@ -5,6 +5,8 @@
 //   3. 收成誤加 100 點（帳本只套 entry 帶的點數，不自己發明）
 //   4. 舊 generation 遲到收成仍按事件時間落回原代
 //   5. 長期段落超限（大量操作後每一段都還在單檔上限內）
+//   6. 封段要預留封段行的空間：最後一筆 entry 塞得下、加上封段行就超限時必須換段
+//      （原 §15.3 根因：1,024-byte 上限產生 1,039-byte 段）
 //
 // 另外驗證「封段後寫入者改到下一段並重新檢查前提」：別人先封段時，晚到的寫入者
 // CAS 失敗、重讀、改寫到下一段，並在重讀後的狀態上重新檢查。
@@ -201,6 +203,58 @@ describe("封段與晚到的寫入者", () => {
 
     const reopened = await open(dir, { segmentLimit: limit });
     expect((await tileOf(reopened, "sess-a")).harvestPoints).toBe(40); // claim-x + claim-y
+  });
+});
+
+describe("⑥ 封段要預留封段行的空間（原 §15.3 根因）", () => {
+  // 小額上限：最後一筆 entry 的位元組放得下，但同一段再加上封段行就會超過上限。
+  // 舊根因（proposal §15.3）：換段前沒預留 seal 的序列化空間，1,024-byte 上限產生
+  // 1,039-byte 段。這裡只看使用者可觀察的結果：journal 檔案的位元組與重播後的狀態。
+  test("段內容塞得下、加上封段行就超限的那一筆會被換到下一段，不會把段塞爆", async () => {
+    const limit = 910;
+    const dir = dirOf("seal-reserve");
+    const ledger = await open(dir, { segmentLimit: limit });
+    const total = 40;
+    const sessionIds = Array.from({ length: total }, (_, i) => `sess-${String(i).padStart(3, "0")}`);
+    for (const [i, sessionId] of sessionIds.entries()) {
+      expect((await ledger.submit(() => expeditionOp(sessionId, 1, i, -1))).status).toBe("applied");
+    }
+
+    // 段的檔案按編號連續讀（filesOf 的順序不保證是編號順序）。
+    const texts = [];
+    for (let index = 0; ; index++) {
+      const file = `${dir}/journal/${index}.json`;
+      if (!fs.existsSync(file)) break;
+      texts.push(fs.readFileSync(file, "utf8"));
+    }
+    expect(texts.length).toBeGreaterThan(5); // 真的換過很多段
+
+    // 使用者可觀察的結果：每一段（含封段行）的位元組都不超過上限。
+    for (const text of texts) expect(byteLen(text)).toBeLessThanOrEqual(limit);
+
+    // 邊界證明：存在一個已封段，使「再一筆 entry」放得下，但同一段再加上封段行就超限——
+    // 這正是舊根因會把段塞爆的位置（不是剛好沒有任何一段接近上限）。
+    const lineBytes = (line) => byteLen(line) + 1; // 含換行
+    const witness = texts.slice(0, -1).map((text, index) => {
+      const lines = text.split("\n").filter((line) => line !== "");
+      const entriesBytes = lines.slice(0, -1).reduce((sum, line) => sum + lineBytes(line), 0);
+      return {
+        segmentBytes: byteLen(text),
+        entriesBytes,
+        sealBytes: byteLen(text) - entriesBytes,
+        nextLineBytes: lineBytes(texts[index + 1].split("\n")[0]),
+      };
+    }).find(({ entriesBytes, sealBytes, nextLineBytes }) =>
+      entriesBytes + nextLineBytes <= limit && entriesBytes + nextLineBytes + sealBytes > limit);
+    expect(witness).toBeDefined();
+    // 這個見證段真的踩到邊界：段本身在限內，但只差一筆 entry 加封段行的空間。
+    expect(witness.segmentBytes).toBeLessThanOrEqual(limit);
+    expect(witness.entriesBytes).toBeGreaterThan(limit - witness.nextLineBytes - witness.sealBytes);
+
+    // 重播後狀態一致：換段沒有漏 entry。
+    const reopened = await open(dir, { segmentLimit: limit });
+    expect(entriesOf(await segmentsOf(reopened))).toHaveLength(total);
+    expect((await reopened.state()).opSeqs.size).toBe(total);
   });
 });
 
