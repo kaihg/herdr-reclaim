@@ -24,8 +24,8 @@ const LOCAL_CELL = { x: 0, y: 0 };
  * （選取或歷程跳轉），由呼叫端設定一次、這裡消費一次。
  */
 export function mapView({
-  city, tiles, revealed, selection, theme: t, tile, legendOpen, camera, viewport,
-  radius = MAP_RADIUS, onToggleLegend, onPick, onPan,
+  city, tiles, revealed, selection, theme: t, tile, legendOpen, camera,
+  radius = MAP_RADIUS, onToggleLegend, onPick, onPan, onLegendSize,
 }) {
   const size = contentSize(radius, tile);
   const origin = originInContent(radius, tile);
@@ -58,11 +58,11 @@ export function mapView({
     // 雙軸捲動：滾輪與觸控板的事件都在這裡收（delta 是裝置回報的像素）。
     .on_scroll_wheel((event, cx) => onPan(event.delta, cx))
     .child(div().id("map-view").relative().size_full().children(children))
-    .child(legendPanel(t, legendOpen, onToggleLegend));
+    .child(legendPanel(t, legendOpen, onToggleLegend, onLegendSize));
 }
 
 /** 圖例（§14 的素材與狀態）：只解釋畫面看得到的 mock，不新增玩法。 */
-function legendPanel(t, open, onToggle) {
+function legendPanel(t, open, onToggle, onSize) {
   const groups = legendGroups();
   const row = (text, color) => div().text_size(9).text_color(color).truncate().child(text);
   const swatch = (token) => div().size(8).flex_none().rounded(2).bg(t[token] ?? t.muted);
@@ -83,6 +83,8 @@ function legendPanel(t, open, onToggle) {
     .border_color(t.border)
     .cursor_pointer()
     .on_click((_event, cx) => onToggle(cx))
+    // 圖例自己回報量到的大小：可見區的判定要用實際覆蓋層尺寸，不能用假設值。
+    .on_size_change((size) => onSize(size))
     .child(h_flex().gap(6).items_center()
       .child(row("城市地圖 · 素材 mock（向量）", t.dim))
       .child(row(open ? "▾ 收合" : "▸ 展開", t.accent)))

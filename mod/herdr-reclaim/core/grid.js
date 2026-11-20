@@ -136,18 +136,20 @@ export function panCamera(camera, delta, size, viewport) {
  * 選取／跳轉的保證：那一格的**整個菱形**要落在視窗內。在相機上做最小位移；
  * 視窗比一格還小的時候（極窄 pane）就把它置中（至少整格看得到）。
  */
-export function ensureVisible(cell, camera, viewport, radius = MAP_RADIUS, tile = TILE) {
+export function ensureVisible(cell, camera, rect, radius = MAP_RADIUS, tile = TILE) {
   const origin = originInContent(radius, tile);
   const spot = projectTile(cell, tile);
-  const axis = (start, size, limit) => {
-    if (size >= limit) return limit / 2 - (start + size / 2);
-    if (start < 0) return -start;
+  const axis = (start, size, from, limit) => {
+    if (size >= limit - from) return from + (limit - from) / 2 - (start + size / 2); // 比可見區大：置中
+    if (start < from) return from - start;
     if (start + size > limit) return limit - (start + size);
     return 0;
   };
+  const x0 = rect.x ?? 0;
+  const y0 = rect.y ?? 0;
   return {
-    x: camera.x + axis(camera.x + origin.left + spot.left, tile.w, viewport.width),
-    y: camera.y + axis(camera.y + origin.top + spot.top, tile.h, viewport.height),
+    x: camera.x + axis(camera.x + origin.left + spot.left, tile.w, x0, x0 + rect.width),
+    y: camera.y + axis(camera.y + origin.top + spot.top, tile.h, y0, y0 + rect.height),
   };
 }
 
@@ -167,11 +169,24 @@ export function cellAtPoint(point, radius = MAP_RADIUS, tile = TILE) {
  * 這樣「地圖一打開就在這座城身上」與「選取／跳轉的那一格帶進畫面」都不必依賴
  * 捲動容器自己的偏移（scroll_to_item 對絕對定位的子元素沒有作用）。
  */
-export function cameraFor(cell, viewport, radius = MAP_RADIUS, tile = TILE) {
+export function cameraFor(cell, rect, radius = MAP_RADIUS, tile = TILE) {
   const origin = originInContent(radius, tile);
   const spot = projectTile(cell, tile);
+  const x0 = rect.x ?? 0;
+  const y0 = rect.y ?? 0;
   return {
-    x: Math.round(viewport.width / 2 - (origin.left + spot.left + tile.w / 2)),
-    y: Math.round(viewport.height / 2 - (origin.top + spot.top + tile.h / 2)),
+    x: Math.round(x0 + rect.width / 2 - (origin.left + spot.left + tile.w / 2)),
+    y: Math.round(y0 + rect.height / 2 - (origin.top + spot.top + tile.h / 2)),
   };
+}
+
+/**
+ * 地圖框扣掉覆蓋層之後「真正看得見」的區域。
+ * 覆蓋層（左上角的圖例、左下角的量測面板）尺寸是 render 量到後回報的實測值，不是假設值。
+ * 兩者都靠左緣，所以保守地把整條高度扣掉——寧可把選取格放低／放高，也不要被蓋住或被上緣裁掉。
+ */
+export function visibleRect(area, legendSize, metricsSize) {
+  const top = 6 + (legendSize?.height ?? 0) + 6;
+  const bottom = area.height - (metricsSize ? metricsSize.height + 12 : 0);
+  return { x: 0, y: top, width: area.width, height: Math.max(24, bottom - top) };
 }

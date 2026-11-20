@@ -5,7 +5,8 @@
 // (B) 地圖的平移（滾輪／觸控板）改由相機負責：往下捲＝內容往上，並夾在畫得出來的範圍。
 import { describe, expect, test } from "bun:test";
 
-import { TILE, cameraFor, cellAtEvent, cellAtOffset, clampCamera, contentSize, ensureVisible, eventPoint, originInContent, panCamera } from "../core/grid.js";
+import { BUILDING_MOCK, PLOT_DIAMOND, buildingPolygons } from "../ui/assets.js";
+import { MAP_RADIUS, TILE, cameraFor, cellAtEvent, cellAtOffset, clampCamera, contentSize, ensureVisible, eventPoint, originInContent, panCamera, projectTile, visibleRect } from "../core/grid.js";
 
 const tile = { w: 84, h: 44 };
 const zoom = 1.2; // 真視窗的預設縮放（settings.zoom）
@@ -102,9 +103,12 @@ describe("平移（panCamera）", () => {
   });
 });
 
-// QA4 的失敗：600 UI px 窄 pane 選了圖書館（建築）卻沒有入畫。
-// 這一組要求：任何視窗寬高 × 任何選取格（含靠邊的格）→ 那一格的菱形完整落在視窗內。
-describe("選取入畫（cameraFor + clampCamera + ensureVisible）", () => {
+// QA4／final-smoke 的失敗：600 UI px 的**四角格**「在框內卻沒有完整可見」——
+// (-9,-9) 被頂部圖例蓋住／落在上緣外、(9,9) 落下緣、(9,-9) 地物被裁。
+// 根因是「可見區」的判定用了整個地圖框，沒有扣掉覆蓋層（圖例、量測面板）。
+// 這一組把可見區換成 `visibleRect`（覆蓋層尺寸由 render 實測回報），並要求：
+// 任何視窗寬高 × 四角＋四邊中點 × 最高建築的格子外框，全部落在可見區裡。
+describe("選取入畫（可見區＝地圖框扣掉覆蓋層）", () => {
   // main.js 的欄寬規則：左 clamp(96, 19%, 240)、右 clamp(108, 26%, 292)，其餘給地圖。
   const mapAreaOf = (paneWidthUi, paneHeightUi = 700) => {
     const clamp = (min, value, max) => Math.max(min, Math.min(max, value));
@@ -112,59 +116,70 @@ describe("選取入畫（cameraFor + clampCamera + ensureVisible）", () => {
     const rightW = Math.round(clamp(108, paneWidthUi * 0.26, 292));
     return { width: Math.max(80, paneWidthUi - leftW - rightW), height: paneHeightUi - 104 };
   };
-  const viewports = {
-    "600 UI px": mapAreaOf(599),
-    "820 UI px": mapAreaOf(819),
-    "寬版 1200 UI px": mapAreaOf(1200),
-    "極窄（比一格還小）": { width: 40, height: 24 },
-  };
+  // 圖例與量測面板的尺寸是 render 量到的（窄 pane 文字換行 → 比較高）。
+  const legends = { "圖例 62px": { width: 300, height: 62 }, "圖例 104px（窄 pane 換行）": { width: 280, height: 104 } };
+  const viewports = { "600 UI px": mapAreaOf(599), "820 UI px": mapAreaOf(819), "寬版 1200 UI px": mapAreaOf(1200) };
   const cells = [
-    { x: 0, y: 0 }, { x: 1, y: -1 }, { x: -1, y: 0 },
-    { x: 9, y: -9 }, { x: -9, y: 9 }, { x: 9, y: 9 }, { x: 0, y: -9 }, { x: -9, y: 0 },
+    { x: -9, y: -9 }, { x: 9, y: -9 }, { x: -9, y: 9 }, { x: 9, y: 9 }, // 四角
+    { x: 0, y: -9 }, { x: 0, y: 9 }, { x: -9, y: 0 }, { x: 9, y: 0 }, // 四邊中點
+    { x: 1, y: -1 }, { x: 0, y: 0 }, // 最高建築（圖書館）與中心
   ];
-  const radius = 9;
-  // main.js 的格子大小：寬度除以 5.4、夾在 56–84；600 UI px 的 pane 約 60 px 一格。
-  const tileOf = (viewport) => {
-    const w = Math.max(56, Math.min(84, Math.floor(viewport.width / 5.4)));
+  const tileOf = (area) => {
+    const w = Math.max(56, Math.min(84, Math.floor(area.width / 5.4)));
     return { w, h: Math.round(w / 1.909) };
   };
-
-  /** 相機定好之後，某一格的方框（視窗內的版面 px）。 */
   const boxOf = (cell, camera, tile) => {
-    const origin = originInContent(radius, tile);
-    const spot = { left: ((cell.x - cell.y) * tile.w) / 2, top: ((cell.x + cell.y) * tile.h) / 2 };
+    const origin = { left: contentSize(MAP_RADIUS, tile).width / 2 - tile.w / 2, top: contentSize(MAP_RADIUS, tile).height / 2 - tile.h / 2 };
+    const spot = projectTile(cell, tile);
     return { left: camera.x + origin.left + spot.left, top: camera.y + origin.top + spot.top, width: tile.w, height: tile.h };
   };
+  /** 與 main.js 同一條路徑：夾範圍（整個地圖框）→ ensureVisible（可見區）。 */
+  const cameraOf = (cell, area, visible, tile) => {
+    const size = contentSize(MAP_RADIUS, tile);
+    const centred = cameraFor(cell, visible, MAP_RADIUS, tile);
+    return ensureVisible(cell, clampCamera(centred, size, area), visible, MAP_RADIUS, tile);
+  };
 
-  for (const [name, viewport] of Object.entries(viewports)) {
-    test(`${name}：任何選取格都完整落在視窗內`, () => {
-      const tile = tileOf(viewport);
-      const size = contentSize(radius, tile);
-      for (const cell of cells) {
-        const centred = cameraFor(cell, viewport, radius, tile);
-        const camera = ensureVisible(cell, clampCamera(centred, size, viewport), viewport, radius, tile);
-        const box = boxOf(cell, camera, tile);
-        if (box.width >= viewport.width || box.height >= viewport.height) {
-          // 視窗比一格還小：做不到「整格入畫」，至少把它擺在視窗中央。
-          expect(Math.abs(box.left + box.width / 2 - viewport.width / 2)).toBeLessThanOrEqual(0.5);
-          expect(Math.abs(box.top + box.height / 2 - viewport.height / 2)).toBeLessThanOrEqual(0.5);
-          continue;
+  for (const [areaName, area] of Object.entries(viewports)) {
+    for (const [legendName, legend] of Object.entries(legends)) {
+      test(`${areaName}／${legendName}：四角＋四邊中點＋最高建築格都完整落在可見區內`, () => {
+        const tile = tileOf(area);
+        const visible = visibleRect(area, legend, null);
+        for (const cell of cells) {
+          const box = boxOf(cell, cameraOf(cell, area, visible, tile), tile);
+          expect(box.left).toBeGreaterThanOrEqual(visible.x - 0.5);
+          expect(box.top).toBeGreaterThanOrEqual(visible.y - 0.5);
+          expect(box.left + box.width).toBeLessThanOrEqual(visible.x + visible.width + 0.5);
+          expect(box.top + box.height).toBeLessThanOrEqual(visible.y + visible.height + 0.5);
         }
-        expect(box.left).toBeGreaterThanOrEqual(-0.5);
-        expect(box.top).toBeGreaterThanOrEqual(-0.5);
-        expect(box.left + box.width).toBeLessThanOrEqual(viewport.width + 0.5);
-        expect(box.top + box.height).toBeLessThanOrEqual(viewport.height + 0.5);
-      }
-    });
+      });
+    }
   }
 
-  test("視窗比一格大時，置中就是把那一格擺在正中央", () => {
-    const viewport = { width: 323, height: 596 };
-    const tile = tileOf(viewport);
-    const camera = cameraFor({ x: 1, y: -1 }, viewport, radius, tile);
-    const box = boxOf({ x: 1, y: -1 }, camera, tile);
-    // cameraFor 會把相機取整（版面像素），所以允許 0.5 px 內的差。
-    expect(Math.abs(box.left + box.width / 2 - viewport.width / 2)).toBeLessThanOrEqual(0.5);
-    expect(Math.abs(box.top + box.height / 2 - viewport.height / 2)).toBeLessThanOrEqual(0.5);
+  test("辨識力：可見區若用整個地圖框（舊假設），(-9,-9) 這種上緣格就會落在圖例下面", () => {
+    const area = mapAreaOf(599);
+    const tile = tileOf(area);
+    const legend = legends["圖例 104px（窄 pane 換行）"];
+    const visible = visibleRect(area, legend, null);
+    // 舊假設：可見區＝整個地圖框。內容區最上面那一列（y=-9）本來就貼著內容上緣，
+    // 相機最多只能到 0，所以那一列的格子會被釘在框頂＝圖例底下。
+    const naive = ensureVisible({ x: -9, y: -9 }, clampCamera(cameraFor({ x: -9, y: -9 }, area, MAP_RADIUS, tile), contentSize(MAP_RADIUS, tile), area), area, MAP_RADIUS, tile);
+    const naiveBox = boxOf({ x: -9, y: -9 }, naive, tile);
+    expect(naiveBox.top).toBeLessThan(visible.y); // ← 會被圖例蓋住（舊行為）
+    const fixedBox = boxOf({ x: -9, y: -9 }, cameraOf({ x: -9, y: -9 }, area, visible, tile), tile);
+    expect(fixedBox.top).toBeGreaterThanOrEqual(visible.y - 0.5); // 修好後在圖例下方
+  });
+
+  test("最高的 mock 建築（圖書館）畫在格子方框內，所以「格＋地物外框」＝格子方框", () => {
+    const inUnitBox = (points) => points.every(([x, y]) => x >= 0 && x <= 100 && y >= 0 && y <= 100);
+    const library = buildingPolygons(BUILDING_MOCK.library);
+    expect(inUnitBox(library.roof)).toBe(true);
+    expect(inUnitBox(library.body)).toBe(true);
+    expect(inUnitBox(PLOT_DIAMOND)).toBe(true);
+    for (const mock of Object.values(BUILDING_MOCK)) {
+      const shape = buildingPolygons(mock);
+      expect(inUnitBox(shape.roof)).toBe(true);
+      expect(inUnitBox(shape.body)).toBe(true);
+    }
   });
 });
