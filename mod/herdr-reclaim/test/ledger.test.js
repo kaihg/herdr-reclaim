@@ -4,7 +4,7 @@
 import { describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import { bfsNextTile } from "../core/grid.js";
-import { CasConflict, CrashAfterContent, CrashAfterJournal, CrashAfterSeal, CityLedger, byteLen } from "../core/ledger.js";
+import { CasConflict, CityLedger, CrashAfterContent, CrashAfterJournal, CrashAfterSeal, byteLen, claimKey, hashText } from "../core/ledger.js";
 import { ingestActivities } from "../core/ingest.js";
 import { readTownFromLedger } from "../core/town.js";
 import { AT } from "../scenarios/first-expedition.js";
@@ -421,5 +421,121 @@ describe("journal 快照的一致性與封段後的中斷恢復", () => {
     expect([...(await ledger.state()).activities.values()][0].events).toHaveLength(1);
     expect(filesUnder(`${dir}/blobs`)).toHaveLength(1);
     expect(await townsOf(await open(dir))).toEqual(await townsOf(ledger));
+  });
+});
+
+describe("checkpoint 是衍生索引：不完整就整份丟棄、從 journal 重建", () => {
+  const harvestAt = (sessionId, claim) => ({
+    opId: `harvest:${sessionId}:${claim}`,
+    kind: "harvest",
+    at: AT,
+    cityId: CITY_ID,
+    rootSessionId: sessionId,
+    generation: 1,
+    claim,
+    points: 20,
+    resources: { wood: 10 },
+    blobs: { claim, paths: [`src/${claim}.ts`] },
+  });
+
+  test("manifest 壞掉：從 journal 重建，不是整座城讀不出來", async () => {
+    const dir = dirOf("ckpt-manifest");
+    const ledger = await open(dir);
+    await ledger.submit((state) => expeditionOp(state, "sess-a"));
+    await ledger.submit(() => harvestAt("sess-a", "claim-1"));
+    const expected = await townsOf(ledger);
+    const { seq } = await ledger.checkpoint();
+    fs.writeFileSync(`${dir}/checkpoints/${seq}/manifest.json`, "{ 壞掉的 JSON");
+
+    const reopened = await open(dir);
+    expect(await townsOf(reopened)).toEqual(expected);
+    expect((await reopened.state()).claims.size).toBe(1);
+  });
+
+  test("索引頁不見了：庫存與去重資料不會跟著少，已領過的 claim 仍被擋下", async () => {
+    const dir = dirOf("ckpt-missing-page");
+    const ledger = await open(dir, createFileIo(), { pageLimit: 700 });
+    const sessions = ["sess-a", "sess-b", "sess-c", "sess-d"];
+    for (const sessionId of sessions) {
+      expect((await ledger.submit((state) => expeditionOp(state, sessionId))).status).toBe("applied");
+      expect((await ledger.submit(() => harvestAt(sessionId, `claim-${sessionId}`))).status).toBe("applied");
+    }
+    const { seq } = await ledger.checkpoint();
+    const claimsDir = `${dir}/checkpoints/${seq}/claims`;
+    const lostClaim = `claim-${sessions[0]}`;
+    const prefix = hashText(claimKey(CITY_ID, lostClaim)).slice(0, 2);
+    const root = JSON.parse(fs.readFileSync(`${claimsDir}/root.json`, "utf8"));
+    expect(root.c).toContain(prefix); // 這個 claim 真的在這一頁
+    fs.rmSync(`${claimsDir}/${prefix}.json`);
+
+    const reopened = await open(dir, createFileIo(), { pageLimit: 700 });
+    const state = await reopened.state();
+    expect(state.claims.size).toBe(sessions.length);
+    expect(state.opSeqs.size).toBe(sessions.length * 2);
+    // 已經領過的成果再送一次（不同 operation ID）：城級去重仍然擋得住。
+    const duplicate = await reopened.submit(() => ({ ...harvestAt(sessions[0], lostClaim), opId: "harvest:other-id" }));
+    expect(duplicate.status).toBe("rejected");
+    expect(duplicate.reason).toBe("claim_exists");
+    expect((await reopened.state()).resources.wood).toBe(sessions.length * 10);
+    // 壞掉的 checkpoint 已經從 head 拿掉，讀取端不會每次都再讀一次。
+    expect(JSON.parse(fs.readFileSync(`${dir}/head.json`, "utf8")).checkpoint).toBe(-1);
+  });
+
+  test("同一個座標大量撤回重用：checkpoint 不再因座標分塊超限而失敗，歷程仍完整", async () => {
+    const dir = dirOf("chunk-reuse");
+    const pageLimit = 512;
+    const ledger = await open(dir, createFileIo(), { pageLimit });
+    const generations = 40;
+    const repo = { commonDir: CITY_ID, checkout: "/reclaim/city-durable" };
+    const reclaim = (generation) => ({
+      opId: `expedition:${CITY_ID}:sess-cycle:${generation}`,
+      kind: "expedition",
+      at: AT + generation,
+      activatedAt: AT + generation,
+      cityId: CITY_ID,
+      rootSessionId: "sess-cycle",
+      generation,
+      x: 0,
+      y: -1,
+      cli: "omp",
+      repo,
+    });
+    for (let generation = 1; generation <= generations; generation++) {
+      expect((await ledger.submit(() => reclaim(generation))).status).toBe("applied");
+      expect((await ledger.submit(() => ({
+        opId: `withdraw:${CITY_ID}:sess-cycle:${generation}`,
+        kind: "landAction",
+        at: AT + generation,
+        cityId: CITY_ID,
+        rootSessionId: "sess-cycle",
+        generation,
+        action: "withdraw",
+      }))).status).toBe("applied");
+    }
+
+    // 同一格已經全部撤回：沒有「畫得出來、佔得住」的格子，分塊是空的（不會被撐爆）。
+    const checkpointed = await ledger.checkpoint();
+    expect(checkpointed.counts.chunks).toBe(0);
+    expect(checkpointed.counts.tiles).toBe(generations);
+    for (const dirname of ["checkpoints", "blobs"]) {
+      for (const file of filesUnder(`${dir}/${dirname}`)) expect(fs.statSync(file).size).toBeLessThan(pageLimit);
+    }
+    for (const file of filesUnder(dir)) expect(fs.statSync(file).size).toBeLessThan(256 * 1024);
+
+    // 歷程與遠征索引仍然查得到每一代（包含已撤回的那些）。
+    expect((await ledger.lookupExpedition("sess-cycle", 1)).tile.landStage).toBe("withdrawn");
+    expect((await ledger.lookupExpedition("sess-cycle", generations)).tile.generation).toBe(generations);
+    const history = await ledger.historyOf("sess-cycle", 7);
+    expect(history.entries.filter((entry) => entry.kind === "expedition")).toHaveLength(1);
+    expect(history.entries.filter((entry) => entry.kind === "landAction")).toHaveLength(1);
+    expect(await ledger.tilesInChunk(0, -1)).toEqual([]);
+
+    // 重新派遣之後：分塊只列活著的那一代。
+    expect((await ledger.submit(() => reclaim(generations))).status).toBe("duplicate");
+    expect((await ledger.submit(() => reclaim(generations + 1))).status).toBe("applied");
+    await ledger.checkpoint();
+    expect((await ledger.tilesInChunk(0, -1)).map((tile) => tile.generation)).toEqual([generations + 1]);
+    const reopened = await open(dir, createFileIo(), { pageLimit });
+    expect(await townsOf(reopened)).toEqual(await townsOf(ledger));
   });
 });

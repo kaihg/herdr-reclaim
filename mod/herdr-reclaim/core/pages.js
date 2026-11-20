@@ -88,28 +88,37 @@ export class PrefixIndex {
     return { pages: await this.countPages(), keys: [...entries].length };
   }
 
-  /** 索引裡的全部資料（走訪靠根頁與拆分標記，不列目錄）。 */
-  async all() {
+  /**
+   * 索引裡的全部資料（走訪靠根頁與拆分標記，不列目錄）。
+   *
+   * `strict`：遇到「根頁／拆分標記列到、檔案卻不在」就報錯。checkpoint 這種衍生索引
+   * 壞掉時必須看得見（否則缺頁會被當成「沒有資料」，庫存與去重資料靜靜地少掉）。
+   */
+  async all({ strict = false } = {}) {
     const root = await this.readPage(this.rootPath());
+    if (strict && !root) throw new Error(`索引根頁不見了：${this.rootPath()}`);
     const out = new Map();
     for (const prefix of root?.c ?? []) {
-      for (const [key, value] of await this.collect(prefix)) out.set(key, value);
+      for (const [key, value] of await this.collect(prefix, { strict })) out.set(key, value);
     }
     return out;
   }
 
   /** 一個前綴底下的所有資料。 */
-  async collect(prefix) {
+  async collect(prefix, { strict = false } = {}) {
     const page = await this.readPage(this.pagePath(prefix));
     const out = new Map();
-    if (!page) return out;
+    if (!page) {
+      if (strict) throw new Error(`索引頁不見了：${this.pagePath(prefix)}`);
+      return out;
+    }
     if (page.t === "e") {
       for (const [key, value] of Object.entries(page.e)) out.set(key, value);
       return out;
     }
     if (page.t !== "s") throw new Error(`不是索引頁：${prefix}`);
     for (const child of page.c ?? []) {
-      for (const [key, value] of await this.collect(child)) out.set(key, value);
+      for (const [key, value] of await this.collect(child, { strict })) out.set(key, value);
     }
     return out;
   }
