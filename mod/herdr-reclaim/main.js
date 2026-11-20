@@ -18,14 +18,15 @@ import { Background, PathBuilder, View, div } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
 import { appHome, checking, exec, readTextFile, settings, theme, watchFolder, writeTextFile } from "herdr";
 import { ADAPTER_DIR, activityDir, adapterRoot, citiesOf, loadActivities, repoFactsOf } from "./core/adapter.js";
-import { loadCommitEvidence, parseRawDiff, parseReflogEvidence, ingestCommits, unharvestedCommitReasons } from "./core/commit-evidence.js";
+import { commitContexts, ingestCommits, loadCommitEvidence, parseRawDiff, parseReflogEvidence, unharvestedCommitReasons } from "./core/commit-evidence.js";
 import { MAP_RADIUS, keyOf, projectTile } from "./core/grid.js";
-import { ingestScenario, processLand, redispatch } from "./core/ingest.js";
+import { ingestResearch, ingestScenario, processBoost, processBuild, processLand, processTrade, redispatch } from "./core/ingest.js";
 import { hostIo } from "./core/host-io.js";
 import { CasConflict, CityLedger, cityDir } from "./core/ledger.js";
 import { installHooks, removeHooks } from "./core/hooks.js";
+import { RESEARCH_TOKENS_PER_PARCHMENT, RESOURCE_LABELS, RULES_VERSION } from "./core/rules.js";
 import { defaultSelection, parseUi, resolveSelection, selectionOf, serializeUi, withSelection } from "./core/selection.js";
-import { CLEAR_POINTS, readTown, readTownFromLedger, selectionDetail } from "./core/town.js";
+import { CLEAR_POINTS, formatResearch, readTown, readTownFromLedger, selectionDetail } from "./core/town.js";
 import { firstExpedition } from "./scenarios/first-expedition.js";
 
 const MIN_LEFT_W = 96;
@@ -51,6 +52,9 @@ const COMMIT_REASON_LABELS = {
   "no-matching-adapter-session": "對不到 adapter session",
   "no-eligible-changes": "沒有可收成變更",
 };
+
+/** 操作失敗時的一行訊息（§7.6 的三種操作）。 */
+const ECONOMY_LABELS = { boost: "加速", build: "蓋房", trade: "市集" };
 
 const clamp = (min, value, max) => Math.max(min, Math.min(max, value));
 
@@ -184,6 +188,8 @@ async function loadTown(io) {
   const expeditions = [];
   const unharvested = {};
   const resources = {};
+  const research = {};
+  const market = {};
   for (const cityId of cityIds) {
     const ledger = await new CityLedger({ io, dir: cityDir(adapterRoot(appHome()), cityId), cityId }).open();
     await ingestScenario(ledger, replay, cityId);
@@ -201,7 +207,13 @@ async function loadTown(io) {
         return result.code === 0 ? parseRawDiff(result.stdout) : [];
       },
     });
+    // 研究羊皮卷（§7.4）排在收成之後：這個回合有沒有歸屬確定的 commit 要用同一份來源核對。
     const state = await ledger.state();
+    await ingestResearch(ledger, {
+      activities: [...state.activities.values()],
+      commits: commitContexts({ ...evidence, activities: [...state.activities.values()], remoteMerges: remoteMerges.get(cityId) }),
+      cityId,
+    });
     unharvested[cityId] = unharvestedCommitReasons({
       cityId,
       ...evidence,
@@ -210,6 +222,8 @@ async function loadTown(io) {
       state,
     });
     resources[cityId] = state.resources;
+    research[cityId] = state.research;
+    market[cityId] = state.market;
     stored.push(...state.activities.values());
     expeditions.push(...state.tiles);
   }
@@ -223,6 +237,8 @@ async function loadTown(io) {
     expeditions,
     repoFacts,
     resources,
+    research,
+    market,
     unresolvedActivities,
     unharvestedCommits: unharvested,
   });
@@ -371,6 +387,39 @@ export default class Town extends View {
       cx2.notify();
     });
   }
+  /**
+   * 加速、蓋房與市集（§7.6）：每一筆都是帳本的一筆 CAS 操作。同一次點擊只產生一個
+   * operation ID，重送（中斷後重試）不會重複扣卷或重複扣料；前提不符就整筆不成立。
+   */
+  operateEconomy(kind, detail, payload, cx) {
+    if (!detail?.cityId) return;
+    cx.spawn(async (cx2) => {
+      try {
+        const ledger = await new CityLedger({
+          io: this.io,
+          dir: cityDir(adapterRoot(appHome()), detail.cityId),
+          cityId: detail.cityId,
+        }).open();
+        const at = Date.now();
+        const operation = kind === "boost"
+          ? processBoost(ledger, { rootSessionId: detail.rootSessionId, generation: detail.generation, scrolls: payload.scrolls, at })
+          : kind === "build"
+            ? processBuild(ledger, { rootSessionId: detail.rootSessionId, generation: detail.generation, recipe: payload.recipe, at })
+            : processTrade(ledger, { from: payload.from, to: payload.to, amount: payload.amount, at });
+        const result = await operation;
+        if (result.status !== "applied" && result.status !== "duplicate") {
+          this.note = `${ECONOMY_LABELS[kind]}未完成：${result.reason ?? result.status}`;
+        } else {
+          this.town = await loadTown(this.io);
+          this.note = null;
+        }
+      } catch (error) {
+        this.note = `${ECONOMY_LABELS[kind]}失敗：${error}`;
+      }
+      cx2.notify();
+    });
+  }
+
 
   retryTown(cx) {
     cx.spawn(async (cx2) => {
@@ -483,7 +532,10 @@ export default class Town extends View {
           .justify_center()
           .gap(14)
           .child(div().text_size(10).text_color(t.dim).child("庫存"))
-          .children(RESOURCES.map((resource) => resourceChip(resource, city.resources[resource.key], t))),
+          .children(RESOURCES.map((resource) => resourceChip(resource, city.resources[resource.key], t)))
+          // §7.4 的研究計量器：每滿 100,000 換 1 張羊皮卷，餘數按城保留。
+          .child(div().text_size(10).text_color(t.dim).child("研究"))
+          .child(div().text_size(12.5).child(`${city.research?.tokens ?? 0} / ${RESEARCH_TOKENS_PER_PARCHMENT}`)),
         v_flex()
           .w(176)
           .flex_none()
@@ -491,6 +543,7 @@ export default class Town extends View {
           .gap(4)
           .child(div().text_size(10).text_color(t.dim).child("主要行會"))
           .child(div().text_size(12.5).child(city.guild ? city.guild.name : "未知"))
+          .child(div().text_size(9).text_color(t.dim).child(`規則 v${RULES_VERSION}`))
           .child(h_flex().gap(5).children([
             hookButton("安裝收成", t, (cx2) => this.manageHooks(city, false, cx2)),
             hookButton("移除", t, (cx2) => this.manageHooks(city, true, cx2)),
@@ -678,9 +731,51 @@ export default class Town extends View {
           detail.actionUnavailableReason
             ? div().text_size(9).text_color(t.muted).child(detail.actionUnavailableReason)
             : null,
+          ...this.economySection(detail, t, cx),
+          this.note ? div().text_size(9).text_color(t.muted).child(this.note) : null,
         ].filter(Boolean),
       );
   }
+
+  /**
+   * §7.6 的操作區（右側詳情）：只列出現在做得到的操作 —— 庫存足以支付完整配方的建築、
+   * 這一格用得起的加速張數，以及庫存換得起的市集配對。做得到的才畫按鈕。
+   */
+  economySection(detail, t, cx) {
+    const rows = [];
+    const boost = detail.boost;
+    if (boost?.available && boost.scrolls > 0) {
+      rows.push(hookButton(
+        `加速 ${boost.scrolls} 卷（+${boost.scrolls * boost.pointsPerScroll} 點）`,
+        t,
+        (cx2) => this.operateEconomy("boost", detail, { scrolls: boost.scrolls }, cx2),
+      ));
+    }
+    if (detail.buildable?.length) {
+      rows.push(div().text_size(10).text_color(t.dim).child("蓋房（一次扣除整份配方）"));
+      for (const recipe of detail.buildable) {
+        rows.push(hookButton(`${recipe.label} · ${costsLabel(recipe.costs)}`, t,
+          (cx2) => this.operateEconomy("build", detail, { recipe: recipe.name }, cx2)));
+      }
+    }
+    if (detail.market?.length) {
+      rows.push(div().text_size(10).text_color(t.dim).child("市集 3 換 1"));
+      for (const pair of detail.market) {
+        rows.push(hookButton(`${pair.label}（可得 ${pair.amount}）`, t,
+          (cx2) => this.operateEconomy("trade", detail, { from: pair.from, to: pair.to, amount: 1 }, cx2)));
+      }
+    }
+    if (boost && !boost.available && boost.reason) {
+      rows.push(div().text_size(9).text_color(t.muted).child(`不能加速：${boost.reason}`));
+    }
+    return rows;
+  }
+}
+
+
+/** 配方的實付資源一行（main.js 只負責顯示；扣款與版本在帳本那一層）。 */
+function costsLabel(costs = {}) {
+  return Object.entries(costs).map(([key, amount]) => `${RESOURCE_LABELS[key] ?? key}${amount}`).join("・");
 }
 
 function hookButton(label, t, action) {

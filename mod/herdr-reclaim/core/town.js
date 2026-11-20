@@ -7,11 +7,12 @@
 // 土地生命週期、commit 收成、建築與額度由 #4／#5 接上；庫存與行會在這裡先固定成
 // 「還沒有收成」與「沒有額度來源」。
 import { CENTER, bfsNextTile, keyOf } from "./grid.js";
+import { BOOST_POINTS_PER_PARCHMENT, CLEAR_POINTS, RECIPES, RESEARCH_TOKENS_PER_PARCHMENT, RESOURCE_LABELS, TRADE_RATE, buildableRecipes } from "./rules.js";
 
 export const SCHEMA = 1;
 
-/** §10：開墾完成的門檻（試玩參數）。 */
-export const CLEAR_POINTS = 100;
+/** §10：開墾完成的門檻（試玩參數）；規則表在 core/rules.js。 */
+export { CLEAR_POINTS } from "./rules.js";
 
 const MINUTE_MS = 60_000;
 
@@ -231,6 +232,8 @@ export function readTownFromLedger(replay = {}) {
           harvestPoints: entry.harvestPoints ?? 0,
           workPoints: entry.workPoints ?? 0,
           boostPoints: entry.boostPoints ?? 0,
+          building: entry.building ?? null,
+          scrollsUsed: entry.scrollsUsed ?? 0,
         }
       : null;
   });
@@ -244,6 +247,8 @@ export function readTownFromLedger(replay = {}) {
         name: cityNameOf(entry.cityId, entry.repo?.checkout ?? null),
         center: centerOf(entry.cityId, replay.repoFacts ?? {}),
         resources: { wood: 0, stone: 0, iron: 0, parchment: 0 },
+        research: { tokens: 0 },
+        market: { in: { wood: 0, stone: 0, iron: 0, parchment: 0 }, out: { wood: 0, stone: 0, iron: 0, parchment: 0 } },
         guild: null,
         tiles: [],
         unharvestedCommits: replay.unharvestedCommits?.[entry.cityId] ?? [],
@@ -271,6 +276,8 @@ export function readTownFromLedger(replay = {}) {
         harvestPoints: entry.harvestPoints ?? 0,
         workPoints: entry.workPoints ?? 0,
         boostPoints: entry.boostPoints ?? 0,
+        building: entry.building ?? null,
+        scrollsUsed: entry.scrollsUsed ?? 0,
       }),
     );
   }
@@ -301,6 +308,8 @@ export function readTownFromLedger(replay = {}) {
   }
   for (const city of town.cities) {
     city.resources = replay.resources?.[city.cityId] ?? city.resources;
+    city.research = replay.research?.[city.cityId] ?? city.research;
+    city.market = replay.market?.[city.cityId] ?? city.market;
     city.unharvestedCommits = replay.unharvestedCommits?.[city.cityId] ?? [];
   }
   town.unresolvedActivities = replay.unresolvedActivities ?? [];
@@ -400,6 +409,9 @@ function replayTown(replay, place) {
       center: centerOf(city.cityId, repoFacts),
       // 收成（#4／#5）之前，庫存是空的；行會沒有額度來源時顯示未知（§9）。
       resources: { wood: 0, stone: 0, iron: 0, parchment: 0 },
+      // 研究計量器與市集統計由帳本模式的 replay 帶進來（#8）。
+      research: { tokens: 0 },
+      market: { in: { wood: 0, stone: 0, iron: 0, parchment: 0 }, out: { wood: 0, stone: 0, iron: 0, parchment: 0 } },
       guild: null,
       unharvestedCommits: city.unharvestedCommits,
       tiles: city.tiles,
@@ -439,6 +451,8 @@ function newTile(session, city, visit, planned) {
     harvestPoints: planned.harvestPoints ?? 0,
     workPoints: planned.workPoints ?? 0,
     boostPoints: planned.boostPoints ?? 0,
+    building: planned.building ?? null,
+    scrollsUsed: planned.scrollsUsed ?? 0,
   };
 }
 
@@ -499,6 +513,9 @@ function finishTile(tile) {
     harvestPoints,
     boostPoints,
     points,
+    // 蓋房與加速的實際支付（§7.6、§10 的造價顯示）：建築保留在格子上，收成照常發生。
+    building: tile.building ?? null,
+    scrollsUsed: tile.scrollsUsed ?? 0,
     usage: sumUsage(tile.sources, tile.cityId, startedAt, endedAt),
     harvested: tile.harvested === true,
     landStage: tile.landStage ?? derivedStage,
@@ -559,8 +576,27 @@ function detail(kind, city, tile, title, statusLabel, fields) {
     statusLabel,
     points: null,
     pointsTarget: null,
+    // 下方三個欄位是 §7.6 的操作入口：庫存足夠的配方、這一格能不能加速、市集可換的配對。
+    buildable: [],
+    boost: null,
+    market: marketDetail(city),
     fields,
   };
+}
+
+/** 市集（§7.6）：3 換 1，列出庫存換得起的所有配對，畫面只顯示這些。 */
+function marketDetail(city) {
+  if (!city) return [];
+  const pairs = [];
+  for (const from of Object.keys(RESOURCE_LABELS)) {
+    const amount = Math.floor(Number(city.resources?.[from] ?? 0) / TRADE_RATE);
+    if (amount <= 0) continue;
+    for (const to of Object.keys(RESOURCE_LABELS)) {
+      if (to === from) continue;
+      pairs.push({ from, to, amount, label: `${RESOURCE_LABELS[from]} → ${RESOURCE_LABELS[to]}` });
+    }
+  }
+  return pairs;
 }
 
 function expeditionDetail(city, tile) {
@@ -591,17 +627,59 @@ function expeditionDetail(city, tile) {
     pointsTarget: CLEAR_POINTS,
     actions,
     actionUnavailableReason: tile.harvested ? "已有 commit 收成，不能撤回或封存" : null,
+    // §7.6：庫存足以支付完整配方的建築才列出來；加速只列這一格用得起的那一種。
+    buildable: tile.landStage === "cleared" ? buildableRecipes(city.resources) : [],
+    boost: boostDetail(city, tile),
+    market: marketDetail(city),
     fields: [
       { label: "工作時間", value: formatDuration(tile.workMs) },
       { label: "點數", value: `工作 ${tile.workPoints} · 收成 ${tile.harvestPoints} · 加速 ${tile.boostPoints}` },
       { label: "用量", value: formatUsage(tile.usage) },
       { label: "土地", value: stageLabel },
+      ...(tile.building ? [{
+        label: "建築",
+        value: `${RECIPES[tile.building.recipe]?.label ?? tile.building.recipe}（實付 ${formatCosts(tile.building.costs)}，規則 v${tile.building.rulesVersion}）`,
+      }] : []),
+      ...(tile.scrollsUsed ? [{ label: "加速用量", value: `${tile.scrollsUsed} 張羊皮卷` }] : []),
       { label: "座標", value: `${tile.x}, ${tile.y}` },
       { label: "CLI", value: tile.cli ?? "未知" },
       { label: "session", value: tile.rootSessionId },
       { label: "checkout", value: tile.repo.checkout ?? tile.repo.commonDir },
     ],
   };
+}
+
+/**
+ * 加速（§7.6）：目標必須是同城、現役的那一代、沒有撤回或封存、未滿 100 點，而且庫存足夠。
+ * 畫面一次用掉「還差多少就滿 100」與庫存中較小的那個張數，超出的點數不退。
+ */
+function boostDetail(city, tile) {
+  const stock = Number(city.resources?.parchment ?? 0);
+  const current = city.tiles.reduce(
+    (latest, candidate) => candidate.rootSessionId === tile.rootSessionId && candidate.generation > (latest?.generation ?? 0)
+      ? candidate
+      : latest,
+    null,
+  );
+  const reason = tile.landStage === "withdrawn" || tile.landStage === "archived"
+    ? "已撤回或封存"
+    : tile.generation !== (current?.generation ?? tile.generation) ? "不是現役的那一代"
+      : tile.points >= CLEAR_POINTS ? "已滿 100 點"
+        : stock <= 0 ? "沒有羊皮卷"
+          : null;
+  const toClear = Math.max(1, Math.ceil((CLEAR_POINTS - tile.points) / BOOST_POINTS_PER_PARCHMENT));
+  return {
+    available: reason === null,
+    reason,
+    stock,
+    scrolls: Math.min(stock, toClear),
+    pointsPerScroll: BOOST_POINTS_PER_PARCHMENT,
+  };
+}
+
+/** 配方的實付資源一行（§10 的造價顯示）。 */
+function formatCosts(costs = {}) {
+  return Object.entries(costs).map(([key, amount]) => `${RESOURCE_LABELS[key] ?? key}${amount}`).join("・");
 }
 
 function centerDetail(city) {
@@ -621,9 +699,28 @@ function centerDetail(city) {
       { label: "座標", value: `${city.center.x}, ${city.center.y}` },
       { label: "遠征", value: `${city.tiles.length} 支` },
       { label: "庫存", value: inventory },
+      { label: "研究", value: formatResearch(city.research) },
+      { label: "市集", value: formatMarket(city.market) },
       { label: "城的身份", value: city.cityId },
     ],
   };
+}
+
+/** §7.4：這座城還沒換成羊皮卷的研究進度（計量器餘數）。 */
+export function formatResearch(research = {}) {
+  const tokens = Number(research?.tokens ?? 0);
+  return `${tokens} / ${RESEARCH_TOKENS_PER_PARCHMENT}（每 ${RESEARCH_TOKENS_PER_PARCHMENT.toLocaleString("en-US")} 換 1 張）`;
+}
+
+/** §11：市集轉入與轉出跟 commit 的直接發放分開顯示。 */
+export function formatMarket(market = {}) {
+  const entries = (side) => Object.entries(market?.[side] ?? {})
+    .filter(([, amount]) => Number(amount) > 0)
+    .map(([key, amount]) => `${RESOURCE_LABELS[key] ?? key} ${amount}`);
+  const inSide = entries("in");
+  const outSide = entries("out");
+  if (!inSide.length && !outSide.length) return "還沒有交易";
+  return `轉入 ${inSide.join("・") || "無"} · 轉出 ${outSide.join("・") || "無"}`;
 }
 
 function shortId(sessionId) {

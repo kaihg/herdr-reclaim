@@ -62,6 +62,27 @@ mod 以 `find` 列活動檔，成功寫 journal 後按 epoch 寫 ack，並用 `w
 第一次開一座城會把當下顯示的選取記下來；重開 herdr 後還原同一個選取，城或格子已經不在
 時回到預設。
 
+## 研究、加速、市集與蓋房（#8）
+
+規則表在 `core/rules.js`（有版本號 `RULES_VERSION`，每筆 entry 都存當時的版本，§8.2）：
+研究匯率 100,000 token 換 1 張羊皮卷、加速每張 +10 點、市集 3 換 1、五種建築配方。
+
+- **研究羊皮卷**（`core/research.js`，§7.4）：回合 = 一次 `interval_open` 到它的 `interval_close`。
+  只算互動遠征樹（root 互動；child 的回合也併進同一座城的計量器）。回合內沒有歸屬確定的
+  commit 才累加 non-cache input + output；`usage.unknownFields` 非空的回合不計、cache 不計。
+  這段時間內有待核對來源的 commit（`no-session-source`、`no-hook-repository-evidence`）時
+  **暫不結算**；來源補齊後若確認歸屬，這個回合不發；列為來源不明則視為沒有歸屬。
+  結算寫成一筆 `research` entry（operation ID 由回合身份決定），所以重播不重複發、晚到的來源
+  不倒扣計量器或已發羊皮卷，也不產生欠款；餘數按城保留（`state.research.tokens`）。
+- **加速**（`boost`）：目標是「遠征身份 + generation」，同城、現役、未撤回或封存、還佔著座標、
+  未滿 100 點、庫存足夠才成立；一項不符就整筆不扣卷。超過 100 的部分不退還。
+- **市集**（`trade`）：任兩種資源 3 換 1，庫存不足整筆不執行；轉入／轉出另外記在
+  `state.market`，跟 commit 的直接發放分開（§11）。
+- **蓋房**（`build`）：只列庫存足以支付完整配方的建築；一次扣完整份配方，格子保存配方、
+  實付資源與規則版本；已建的格子不能再蓋，之後的 resume 與 commit 收成仍保留建築。
+- 畫面（`main.js`）：上方顯示研究計量器與規則版本，右側詳情列出當下做得到的加速、蓋房與
+  市集操作（`economySection`）；每一筆都是帳本的一筆 CAS 操作，兩個畫面競爭只會有一筆成立。
+
 ## 跑測試
 
 ```sh

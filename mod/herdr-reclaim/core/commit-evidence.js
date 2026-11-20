@@ -109,37 +109,71 @@ function rootSession(sessionId, activities) {
   return current;
 }
 
-export async function ingestCommits({ ledger, hooks, sources, activities, diffForCommit, remoteMerges = new Set() }) {
-  const state = await ledger.state();
-  const results = [];
+/**
+ * §7.4：回合結算要等這段時間內、這個 session 的各個 checkout 上的提交完成來源核對
+ * （確認歸屬或列為來源不明）。這兩個原因代表「已經看到提交，但來源證據還可能晚到」：
+ * 讀到的當下先不結算研究，等來源補齊再判。其餘原因（只有 terminal ID、session 證據衝突、
+ * 對不到 adapter session…）是已經完成的核對結果，視為沒有歸屬。
+ */
+export const PENDING_REASONS = new Set(["no-session-source", "no-hook-repository-evidence"]);
+
+/**
+ * 每一條 commit 證據的判定結果（收成與研究共用同一個來源核對）。
+ * `attributed` 代表歸屬確定（`rootId` 是往上追到的 root）；`pending` 代表來源可能晚到。
+ */
+export function commitContexts({ hooks = [], sources = [], activities = [], remoteMerges = new Set() }) {
+  const contexts = [];
   const shas = new Set([...hooks, ...sources].map((record) => record.sha));
   for (const sha of shas) {
     const attribution = attributionFor(sha, hooks, sources, activities);
-    const isRemoteMerge = remoteMerges.has(sha);
-    const rootId = !isRemoteMerge && attribution.identity ? rootSession(attribution.identity.sessionId, activities) : null;
+    const remoteMerge = remoteMerges.has(sha);
     const records = [...hooks, ...sources].filter((record) => record.sha === sha);
-    const commitAt = Math.min(...records.map((record) => Number(record.at) || Date.now()));
+    const at = Math.min(...records.map((record) => Number(record.at) || Date.now()));
+    const rootId = !remoteMerge && attribution.identity ? rootSession(attribution.identity.sessionId, activities) : null;
+    const reason = remoteMerge ? "remote-merge" : attribution.reason;
+    contexts.push({
+      sha,
+      cityId: attribution.cityId,
+      at,
+      sessionId: attribution.identity?.sessionId ?? null,
+      cli: attribution.identity?.cli ?? null,
+      basis: attribution.identity?.basis ?? null,
+      rootId,
+      reason,
+      attributed: Boolean(rootId),
+      pending: Boolean(!remoteMerge && reason && PENDING_REASONS.has(reason)),
+      remoteMerge,
+    });
+  }
+  return contexts;
+}
+
+export async function ingestCommits({ ledger, hooks, sources, activities, diffForCommit, remoteMerges = new Set() }) {
+  const state = await ledger.state();
+  const results = [];
+  for (const context of commitContexts({ hooks, sources, activities, remoteMerges })) {
+    const { sha, rootId, at: commitAt, remoteMerge: isRemoteMerge } = context;
     const tile = rootId ? generationAt(state, rootId, commitAt) : null;
     const generation = tile?.generation ?? null;
-    const reason = isRemoteMerge ? "remote-merge" : attribution.reason ?? (!tile ? "no-matching-expedition" : null);
+    const reason = context.reason ?? (!tile ? "no-matching-expedition" : null);
     const commitOp = {
-      opId: `commit:${sha}:${reason ?? "verified"}:${isRemoteMerge ? "unknown" : attribution.identity?.sessionId ?? "unknown"}`,
+      opId: `commit:${sha}:${reason ?? "verified"}:${isRemoteMerge ? "unknown" : context.sessionId ?? "unknown"}`,
       kind: "commit",
       cityId: ledger.cityId,
       sha,
-      repo: attribution.cityId,
+      repo: context.cityId,
       at: commitAt,
       reason: reason ?? "verified",
       ...(reason ? {} : {
-        sessionId: attribution.identity?.sessionId ?? null,
-        cli: attribution.identity?.cli ?? null,
-        basis: attribution.identity?.basis ?? null,
+        sessionId: context.sessionId,
+        cli: context.cli,
+        basis: context.basis,
         hookKinds: hooks.filter((record) => record.sha === sha).map((record) => record.hook),
       }),
     };
     if (!state.opSeqs.has(commitOp.opId)) results.push(await ledger.submit(() => commitOp));
     if (reason) continue;
-    const hook = hooks.find((record) => record.sha === sha && record.commonDir === attribution.cityId);
+    const hook = hooks.find((record) => record.sha === sha && record.commonDir === context.cityId);
     const changes = await diffForCommit(sha, hook);
     const harvest = harvestForCommit({ cityId: ledger.cityId, rootSessionId: rootId, generation, sha, changes, state, tile });
     if (!harvest.units.length) continue;

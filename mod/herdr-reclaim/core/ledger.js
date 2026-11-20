@@ -32,6 +32,7 @@ import { BlobStore } from "./blobs.js";
 import { byteLen, canonicalJson, hashText } from "./bytes.js";
 import { casWrite, rejectUnlessConflict } from "./cas.js";
 import { PrefixIndex } from "./pages.js";
+import { BOOST_POINTS_PER_PARCHMENT, CLEAR_POINTS, RECIPES, RESEARCH_TOKENS_PER_PARCHMENT, RESOURCES, RULES_VERSION, TRADE_RATE, affordable } from "./rules.js";
 
 export { byteLen, hashText };
 
@@ -39,7 +40,8 @@ export { byteLen, hashText };
 export const SCHEMA = 2;
 /** 活動紀錄的格式版本：`core/town.js` 的重播就是認這個號碼。 */
 export const ACTIVITY_SCHEMA = 1;
-export const RULES_VERSION = 1;
+/** 規則表版本（core/rules.js）：每一筆 entry 都存當時的版本（§8.2）。 */
+export { RULES_VERSION };
 
 /** §13.1：每段上限 256 KiB；herdr 單檔讀取上限是 1 MiB。 */
 export const SEGMENT_LIMIT = 256 * 1024;
@@ -116,9 +118,13 @@ export const activityKey = (record) => `${record.sessionId}@@${record.writerEpoc
 /** 座標分塊的名字（32×32 格）。 */
 export const chunkName = (x, y) => `${Math.floor(x / CHUNK_SIDE)},${Math.floor(y / CHUNK_SIDE)}`;
 
+const zeroResources = () => Object.fromEntries(RESOURCES.map((key) => [key, 0]));
+
 /**
  * 空狀態。`tiles`／`activities` 的順序就是 journal 的附加順序，重播結果因此可重現。
  * `opSeqs`／`claims` 是索引（§13.2）；`currentGen` 是每支遠征的現役 generation。
+ * `research.tokens` 是這座城還沒換成羊皮卷的研究進度（餘數，§7.4）；
+ * `market` 分開記錄市集轉入與轉出，跟 commit 的直接發放分開（§11）。
  */
 export function emptyState(cityId) {
   return {
@@ -132,8 +138,41 @@ export function emptyState(cityId) {
     activities: new Map(),
     opSeqs: new Map(),
     claims: new Map(),
-    resources: { wood: 0, stone: 0, iron: 0, parchment: 0 },
+    resources: zeroResources(),
+    research: { tokens: 0 },
+    market: { in: zeroResources(), out: zeroResources() },
   };
+}
+
+/** 一格的總開墾點：自然工作、收成與加速分開保存，再加總（§10）。 */
+export function pointsOf(tile) {
+  return Number(tile?.workPoints ?? 0) + Number(tile?.harvestPoints ?? 0) + Number(tile?.boostPoints ?? 0);
+}
+
+/** 一格現在的階段；舊 entry 沒有 `landStage` 時由點數推得（§10）。 */
+export function stageOf(tile) {
+  return tile?.landStage ?? (pointsOf(tile) >= CLEAR_POINTS ? "cleared" : "reserved");
+}
+
+/** 開墾點一滿就把階段推進到已開墾；已撤回／已封存／已建不覆寫。 */
+function settleStage(tile) {
+  if (!tile.landStage && pointsOf(tile) >= CLEAR_POINTS) tile.landStage = "cleared";
+  return tile;
+}
+
+/** 操作指定的遠征 generation 必須是現役的那一代（#7 的身份規則）。 */
+function targetTile(state, op) {
+  const generation = op.generation ?? 1;
+  if (state.currentGen.get(`${op.cityId}@@${op.rootSessionId}`) !== generation) return null;
+  return state.tileById.get(tileId(op.cityId, op.rootSessionId, generation)) ?? null;
+}
+
+/** 實付資源必須就是規則表裡的那份配方，不能少扣或多扣（§7.6）。 */
+function sameCosts(costs, recipe) {
+  const entries = Object.entries(costs ?? {});
+  const expected = Object.entries(recipe ?? {});
+  return entries.length === expected.length &&
+    expected.every(([key, need]) => Number(costs[key]) === Number(need));
 }
 
 /** 把一格放進狀態（順序由呼叫端決定；`tiles` 的順序就是重播順序）。 */
@@ -254,7 +293,7 @@ export const KINDS = {
         harvested: false,
       });
       tile.workPoints = naturalWorkPoints(state, tile);
-      if (tile.workPoints >= 100) tile.landStage = "cleared";
+      settleStage(tile);
     },
   },
   landAction: {
@@ -264,7 +303,7 @@ export const KINDS = {
       const tile = state.tileById.get(tileId(op.cityId, op.rootSessionId, generation));
       if (!tile) return "no_expedition";
       if (tile.harvested) return "has_commit_harvest";
-      const stage = tile.landStage ?? (tile.workPoints + tile.harvestPoints + tile.boostPoints >= 100 ? "cleared" : "reserved");
+      const stage = stageOf(tile);
       if (op.action === "withdraw" && stage !== "reserved") return "not_withdrawable";
       if (op.action === "archive" && stage !== "cleared") return "not_archivable";
       if (op.action !== "withdraw" && op.action !== "archive") return "invalid_action";
@@ -278,16 +317,101 @@ export const KINDS = {
       if (entry.action === "withdraw") state.taken.delete(tileKey(entry.cityId, tile.x, tile.y));
     },
   },
+  /**
+   * 蓋房（§7.6、§8.1）：只列庫存足以支付完整配方的建築；一次扣完整份配方，
+   * 並把配方、實付資源與當時的規則版本存進那一格。已建好的格子不能再蓋。
+   * 蓋房不影響收成：已建的格子之後 resume 又有新 commit，收成照常發生（§17.1 情境 7）。
+   */
   build: {
     precheck(state, op) {
-      const tile = state.tileById.get(tileId(op.cityId, op.rootSessionId, op.generation));
-      return !tile || state.currentGen.get(`${op.cityId}@@${op.rootSessionId}`) !== op.generation
-        ? "stale_generation"
-        : tile.landStage !== "cleared" ? "not_cleared" : null;
+      if (op.cityId !== state.cityId) return "wrong_city";
+      const tile = targetTile(state, op);
+      if (!tile) return "stale_generation";
+      const stage = stageOf(tile);
+      if (stage === "withdrawn" || stage === "archived") return "inactive_expedition";
+      if (stage === "built") return "already_built";
+      if (stage !== "cleared") return "not_cleared";
+      const recipe = RECIPES[op.recipe];
+      if (!recipe) return "unknown_recipe";
+      if (!sameCosts(op.costs, recipe.costs)) return "recipe_mismatch";
+      if (!affordable(recipe.costs, state.resources)) return "insufficient_resources";
+      return null;
     },
     apply(state, entry) {
-      const tile = state.tileById.get(tileId(entry.cityId, entry.rootSessionId, entry.generation));
+      const tile = targetTile(state, entry);
       tile.landStage = "built";
+      tile.building = { recipe: entry.recipe, costs: entry.costs, rulesVersion: entry.rulesVersion };
+      for (const [key, amount] of Object.entries(entry.costs ?? {})) {
+        state.resources[key] = Number(state.resources[key] ?? 0) - Number(amount);
+      }
+    },
+  },
+  /**
+   * 加速（§7.6）：目標是「遠征身份 + generation」，不是座標。同城、現役、沒撤回或封存、
+   * 還佔著原本的座標、未滿 100 點、庫存足夠 —— 只要有一項不符就整筆不扣卷、不加點。
+   * 超過 100 的部分不退還，也不會轉到其他格。
+   */
+  boost: {
+    precheck(state, op) {
+      if (op.cityId !== state.cityId) return "wrong_city";
+      const tile = targetTile(state, op);
+      if (!tile) return "stale_generation";
+      const stage = stageOf(tile);
+      if (stage === "withdrawn" || stage === "archived") return "inactive_expedition";
+      if (!state.taken.has(tileKey(op.cityId, tile.x, tile.y))) return "tile_released";
+      const scrolls = Number(op.scrolls);
+      if (!Number.isInteger(scrolls) || scrolls <= 0) return "invalid_scrolls";
+      if (pointsOf(tile) >= CLEAR_POINTS) return "already_cleared";
+      if (Number(state.resources.parchment ?? 0) < scrolls) return "insufficient_parchment";
+      return null;
+    },
+    apply(state, entry) {
+      const tile = targetTile(state, entry);
+      const scrolls = Number(entry.scrolls);
+      tile.boostPoints = Number(tile.boostPoints ?? 0) + scrolls * BOOST_POINTS_PER_PARCHMENT;
+      tile.scrollsUsed = Number(tile.scrollsUsed ?? 0) + scrolls;
+      state.resources.parchment = Number(state.resources.parchment ?? 0) - scrolls;
+      settleStage(tile);
+    },
+  },
+  /**
+   * 市集（§7.6、§11）：同城任兩種資源 3 換 1，一次一筆 CAS。庫存不足時整筆不執行，
+   * 不會產生部分交易。市集轉入與轉出另外記，跟 commit 的直接發放分開（§11）。
+   */
+  trade: {
+    precheck(state, op) {
+      if (op.cityId !== state.cityId) return "wrong_city";
+      const amount = Number(op.amount);
+      const invalid = !RESOURCES.includes(op.from) || !RESOURCES.includes(op.to) || op.from === op.to ||
+        !Number.isInteger(amount) || amount <= 0;
+      if (invalid) return "invalid_trade";
+      if (Number(state.resources[op.from] ?? 0) < amount * TRADE_RATE) return "insufficient_resources";
+      return null;
+    },
+    apply(state, entry) {
+      const amount = Number(entry.amount);
+      const spent = amount * TRADE_RATE;
+      state.resources[entry.from] = Number(state.resources[entry.from] ?? 0) - spent;
+      state.resources[entry.to] = Number(state.resources[entry.to] ?? 0) + amount;
+      state.market.out[entry.from] = Number(state.market.out[entry.from] ?? 0) + spent;
+      state.market.in[entry.to] = Number(state.market.in[entry.to] ?? 0) + amount;
+    },
+  },
+  /**
+   * 研究（§7.4）：沒有可歸屬 commit 的回合，把 non-cache input + output token 加進這座城的
+   * 計量器；每滿 100,000 換 1 張羊皮卷，餘數按城保留。operation ID 由回合身份決定，
+   * 重播不會再次發放；已經落帳的進度與已發的羊皮卷不會因為來源晚到而倒扣。
+   */
+  research: {
+    precheck(_state, op) {
+      return Number.isInteger(Number(op.tokens)) && Number(op.tokens) > 0 ? null : "invalid_research";
+    },
+    apply(state, entry) {
+      const tokens = Number(entry.tokens);
+      const total = Number(state.research.tokens ?? 0) + tokens;
+      state.research.tokens = total % RESEARCH_TOKENS_PER_PARCHMENT;
+      const scrolls = Math.floor(total / RESEARCH_TOKENS_PER_PARCHMENT);
+      if (scrolls > 0) state.resources.parchment = Number(state.resources.parchment ?? 0) + scrolls;
     },
   },
   /**
@@ -328,7 +452,7 @@ export const KINDS = {
       for (const tile of state.tiles) {
         if (tile.landStage) continue;
         tile.workPoints = naturalWorkPoints(state, tile);
-        if (tile.workPoints + (tile.harvestPoints ?? 0) + (tile.boostPoints ?? 0) >= 100) tile.landStage = "cleared";
+        settleStage(tile);
       }
     },
   },
@@ -353,9 +477,7 @@ export const KINDS = {
       tile.harvestPoints = (tile.harvestPoints ?? 0) + Number(entry.points ?? 0);
       tile.harvestedPaths = [...new Set([...(tile.harvestedPaths ?? []), ...(entry.paths ?? [])])];
       tile.harvested = tile.harvested || (entry.paths ?? []).length > 0;
-      if ((tile.workPoints ?? 0) + tile.harvestPoints + (tile.boostPoints ?? 0) >= 100 && !tile.landStage) {
-        tile.landStage = "cleared";
-      }
+      settleStage(tile);
       for (const [name, amount] of Object.entries(entry.resources ?? {})) {
         state.resources[name] = (state.resources[name] ?? 0) + Number(amount);
       }
@@ -702,6 +824,8 @@ export class CityLedger {
       seq,
       segment,
       resources: state.resources,
+      research: state.research,
+      market: state.market,
       counts: {
         tiles: state.tiles.length,
         activities: state.activities.size,
@@ -752,6 +876,8 @@ export class CityLedger {
     for (const [key, value] of await index("claims").all()) state.claims.set(key, value);
     for (const [key, packed] of await index("activities").all()) state.activities.set(key, await this.unpackRecord(packed));
     state.resources = manifest.resources ?? state.resources;
+    state.research = manifest.research ?? state.research;
+    state.market = manifest.market ?? state.market;
     return { state, segment: manifest.segment ?? 0 };
   }
 
