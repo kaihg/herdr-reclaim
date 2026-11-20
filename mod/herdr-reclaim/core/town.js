@@ -398,12 +398,15 @@ export const ZERO_USAGE = { inputNonCache: 0, cacheRead: 0, cacheWrite: 0, outpu
  */
 function sumUsage(sources, cityId) {
   const total = { ...ZERO_USAGE };
+  const unknownFields = new Set();
   for (const session of sources) {
     for (const usage of session.usage.values()) {
       if (usage.cityId !== cityId) continue;
       for (const key of Object.keys(total)) total[key] += Number(usage[key]) || 0;
+      for (const field of usage.unknownFields ?? []) unknownFields.add(field);
     }
   }
+  if (unknownFields.size) total.unknownFields = [...unknownFields].sort();
   return total;
 }
 
