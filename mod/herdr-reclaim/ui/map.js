@@ -80,7 +80,8 @@ function legendPanel(t, open, onToggle) {
     .absolute()
     .left(8)
     .top(6)
-    .max_w(620)
+    // 圖例不超過地圖視窗：窄 pane（600 UI px）不會被右緣裁掉。
+    .max_w("100%")
     .gap(2)
     .p(6)
     .rounded(4)
