@@ -15,7 +15,11 @@ export function hashText(text) {
   return low.toString(16).padStart(8, "0") + high.toString(16).padStart(8, "0");
 }
 
-/** UTF-8 長度，不配置暫存字串（跟 JavaScript 字串的碼元數不同）。 */
+/**
+ * UTF-8 長度，不配置暫存字串（跟 JavaScript 字串的碼元數不同）。
+ * 一對有效的代理算一個字元（4 bytes）；不成對的代理算 3 bytes（等於 U+FFFD 的長度），
+ * 而且**不會**吃掉下一個字元——舊版對不成對的高代理直接 index++ 會漏算後面的內容。
+ */
 export function byteLen(text) {
   let bytes = 0;
   for (let index = 0; index < text.length; index++) {
@@ -23,8 +27,11 @@ export function byteLen(text) {
     if (code < 0x80) bytes += 1;
     else if (code < 0x800) bytes += 2;
     else if (code >= 0xd800 && code <= 0xdbff) {
-      bytes += 4;
-      index++;
+      const next = text.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        index++;
+      } else bytes += 3;
     } else bytes += 3;
   }
   return bytes;

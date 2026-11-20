@@ -246,3 +246,107 @@ describe("commit 證據 replay", () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
+
+describe("commit 證據只落在它真正屬於的那座城", () => {
+  test("同一支 root 在兩座城都有遠征時，A 城的 commit 不會在 B 城再收成一次", async () => {
+    const cityA = "/tmp/reclaim-two-cities-a/.git";
+    const cityB = "/tmp/reclaim-two-cities-b/.git";
+    const stamp = `${process.pid}-${Math.random().toString(36).slice(2)}`;
+    const ledgerA = await new CityLedger({ io: createFileIo(), dir: `/tmp/reclaim-two-cities/a-${stamp}`, cityId: cityA }).open();
+    const ledgerB = await new CityLedger({ io: createFileIo(), dir: `/tmp/reclaim-two-cities/b-${stamp}`, cityId: cityB }).open();
+    const sessionId = "sess-two-cities";
+    const at = (ms) => 1_700_000_000_000 + ms;
+    // 同一支遠征先在 A 城工作、再到 B 城工作：兩邊都有重疊時間窗的格子。
+    const record = (cityId, epoch) => activity({
+      sessionId,
+      writerEpoch: epoch,
+      events: [
+        visitStart(`v-${epoch}`, at(0), { commonDir: cityId, checkout: cityId.slice(0, -5) }),
+        { kind: "interval_open", at: at(0) },
+        { kind: "interval_close", at: at(60_000) },
+      ],
+    });
+    await ingestScenario(ledgerA, { activities: [record(cityA, "a1")], repoFacts: { [cityA]: { hadHead: true } } }, cityA);
+    await ingestScenario(ledgerB, { activities: [record(cityB, "b1")], repoFacts: { [cityB]: { hadHead: true } } }, cityB);
+
+    const sha = "f".repeat(40);
+    const hooks = [{ schema: 1, sha, hook: "post-commit", commonDir: cityA, toplevel: cityA.slice(0, -5), at: at(30_000), env: { PI_SESSION_ID: sessionId } }];
+    const sources = [{ schema: 1, sha, cli: "omp", sessionId, at: at(30_000) }];
+    const diffForCommit = async () => [{ status: "A", path: "src/a.js", resultBlob: "blob-a" }];
+
+    const appliedA = await ingestCommits({
+      ledger: ledgerA, hooks, sources, diffForCommit,
+      activities: [...(await ledgerA.state()).activities.values()],
+    });
+    expect(appliedA.some((result) => result.status === "applied")).toBe(true);
+    expect((await ledgerA.state()).resources.wood).toBe(10);
+
+    const beforeB = await ledgerB.state();
+    const appliedB = await ingestCommits({
+      ledger: ledgerB, hooks, sources, diffForCommit,
+      activities: [...beforeB.activities.values()],
+    });
+    // B 城的庫存、去重與歷程都不動：同一份證據不是它的。
+    expect(appliedB).toEqual([]);
+    const afterB = await ledgerB.state();
+    expect(afterB.resources).toEqual(beforeB.resources);
+    expect(afterB.claims.size).toBe(0);
+    expect((await ledgerB.historyRecords()).filter((record_) => record_.sha === sha)).toEqual([]);
+  });
+});
+
+describe("沒有可信時間的提交", () => {
+  test("舊 recorder 的 at=0：記下來但不收成，也不用重播當下冒充", async () => {
+    const cityId = "/tmp/reclaim-unknown-time/.git";
+    const dir = `/tmp/reclaim-unknown-time/${process.pid}-${Math.random().toString(36).slice(2)}`;
+    const ledger = await new CityLedger({ io: createFileIo(), dir, cityId }).open();
+    const sessionId = "sess-unknown-time";
+    await ingestScenario(ledger, {
+      activities: [activity({
+        sessionId,
+        writerEpoch: "u1",
+        events: [
+          visitStart("v-unknown", 1_700_000_000_000, { commonDir: cityId, checkout: "/tmp/reclaim-unknown-time" }),
+          { kind: "interval_open", at: 1_700_000_000_000 },
+          { kind: "interval_close", at: 1_700_000_060_000 },
+        ],
+      })],
+      repoFacts: { [cityId]: { hadHead: true } },
+    }, cityId);
+
+    const sha = "e".repeat(40);
+    // 舊 recorder 寫的證據：at = 0（沒有時間）。
+    const hooks = [{ schema: 1, sha, hook: "post-commit", commonDir: cityId, toplevel: "/tmp/reclaim-unknown-time", at: 0, env: { PI_SESSION_ID: sessionId } }];
+    const diffForCommit = async () => [{ status: "A", path: "src/app.js", resultBlob: "blob-unknown" }];
+    const state = await ledger.state();
+    const results = await ingestCommits({ ledger, hooks, sources: [], activities: [...state.activities.values()], diffForCommit });
+    expect(results).toContainEqual(expect.objectContaining({ status: "applied" }));
+    const after = await ledger.state();
+    // 記在歷程裡（看得到），但沒有資源、沒有格子、沒有 claim。
+    expect(after.resources.wood).toBe(0);
+    expect(after.claims.size).toBe(0);
+    expect(after.tileById.get(`${cityId}@@${sessionId}@@1`).harvestPoints).toBe(0);
+    expect((await ledger.historyRecords()).filter((record) => record.sha === sha).map((record) => record.reason)).toContain("unknown-commit-time");
+    expect(unharvestedCommitReasons({ cityId, hooks, sources: [], activities: [...after.activities.values()], state: after }))
+      .toEqual([{ sha, repo: cityId, reason: "unknown-commit-time" }]);
+
+    // 重播同一份證據：結果一模一樣（沒有用「現在」補時間）。
+    await ingestCommits({ ledger, hooks, sources: [], activities: [...(await ledger.state()).activities.values()], diffForCommit });
+    const replayed = await ledger.state();
+    expect(replayed.resources).toEqual(after.resources);
+    expect(replayed.claims.size).toBe(0);
+    const entries = (await ledger.scanSegments()).flatMap((segment) => segment.entries).filter((entry) => entry.sha === sha);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].at).toBe(0);
+  });
+
+  test("reflog 證據帶真正的提交時間（%ct），舊的兩欄格式仍讀得懂", () => {
+    const sha = "a".repeat(40);
+    const parsed = parseReflogEvidence(`${sha}\t1700000000\tpull origin/main: Fast-forward\n`, "/tmp/city/.git", "/tmp/city");
+    expect(parsed.records[0]).toMatchObject({ sha, at: 1_700_000_000_000, reflog: "pull origin/main: Fast-forward" });
+    expect(parsed.remoteMerges.has(sha)).toBe(true);
+    // 舊格式（沒有時間欄）：at = 0，訊息不被誤判成時間。
+    const legacy = parseReflogEvidence(`${sha}\tcommit: 訊息\n`, "/tmp/city/.git", "/tmp/city");
+    expect(legacy.records[0]).toMatchObject({ sha, at: 0, reflog: "commit: 訊息" });
+  });
+});

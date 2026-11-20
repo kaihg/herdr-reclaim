@@ -83,6 +83,28 @@ export class CrashAfterJournal extends Error {
   }
 }
 
+/** 故障注入用：封段行已附加、下一段還沒建立時中斷（§13.1 的恢復情境）。 */
+export class CrashAfterSeal extends Error {
+  constructor(opId) {
+    super(`封段已寫、下一段未建立：${opId}`);
+    this.name = "CrashAfterSeal";
+    this.opId = opId;
+  }
+}
+
+
+/**
+ * checkpoint（衍生索引）不完整：manifest 欄位、頁面存在與否或筆數對不上。
+ * 呼叫端要整份丟棄、從 journal 重建——缺頁不能當成「沒有資料」。
+ */
+export class CheckpointIncomplete extends Error {
+  constructor(seq, reason) {
+    super(`checkpoint 不完整（${seq}）：${reason}`);
+    this.name = "CheckpointIncomplete";
+    this.seq = seq;
+    this.reason = reason;
+  }
+}
 /** 城的目錄名：cityId 是絕對路徑，不能直接當檔名。 */
 export function cityDir(baseDir, cityId) {
   return `${baseDir}/cities/${hashText(cityId)}`;
@@ -193,18 +215,37 @@ export function addTile(state, tile) {
  */
 const MINUTE_MS = 60_000;
 
+/**
+ * §6.1：只有 role=child 的 session 併進它的 parent；互動 fork 是**獨立的 root**，
+ * 保留自己的格。這裡跟 `core/town.js` 的歸戶規則用同一套（每個 session 取 writerEpoch
+ * 最小的那一筆 epoch 當身份），否則帳本說「沒開墾」而畫面說「已開墾」。
+ */
+function rootLookup(activities) {
+  const byId = new Map();
+  const ordered = [...activities].sort((a, b) => a.sessionId === b.sessionId
+    ? String(a.writerEpoch ?? "").localeCompare(String(b.writerEpoch ?? ""))
+    : a.sessionId.localeCompare(b.sessionId));
+  for (const record of ordered) {
+    if (byId.has(record.sessionId)) continue;
+    byId.set(record.sessionId, { role: record.role ?? "root", parentSessionId: record.parentSessionId ?? null });
+  }
+  return (sessionId) => {
+    const seen = new Set();
+    let current = byId.get(sessionId);
+    let root = sessionId;
+    while (current?.role === "child" && current.parentSessionId && !seen.has(sessionId)) {
+      seen.add(sessionId);
+      sessionId = current.parentSessionId;
+      root = sessionId;
+      current = byId.get(sessionId);
+    }
+    return root;
+  };
+}
+
 /** Intervals clipped to a generation's activation window, then unioned. */
 function naturalWorkPoints(state, tile) {
-  const parentById = new Map([...state.activities.values()].map((record) => [record.sessionId, record.parentSessionId]));
-  const rootOf = (sessionId) => {
-    const seen = new Set();
-    let current = sessionId;
-    while (parentById.get(current) && !seen.has(current)) {
-      seen.add(current);
-      current = parentById.get(current);
-    }
-    return current;
-  };
+  const rootOf = rootLookup(state.activities.values());
   const intervals = [];
   for (const record of state.activities.values()) {
     if (rootOf(record.sessionId) !== tile.rootSessionId) continue;
@@ -405,8 +446,17 @@ export const KINDS = {
    * 重播不會再次發放；已經落帳的進度與已發的羊皮卷不會因為來源晚到而倒扣。
    */
   research: {
-    precheck(_state, op) {
-      return Number.isInteger(Number(op.tokens)) && Number(op.tokens) > 0 ? null : "invalid_research";
+    precheck(state, op) {
+      if (!(Number.isInteger(Number(op.tokens)) && Number(op.tokens) > 0)) return "invalid_research";
+      // §5.3：這個回合要與這支遠征某一代**現役**的時間窗重疊（跟 town.js 的工時一樣把
+      // 區間裁到時間窗）；完全落在撤回／封存空窗裡的回合不算。
+      const to = Number(op.at);
+      const from = Number(op.openAt ?? op.at);
+      const active = state.tiles.some((tile) =>
+        tile.rootSessionId === op.rootSessionId &&
+        Number(tile.activatedAt ?? 0) <= to &&
+        from <= (tile.deactivatedAt == null ? Infinity : Number(tile.deactivatedAt)));
+      return active ? null : "outside_generation";
     },
     apply(state, entry) {
       const tokens = Number(entry.tokens);
@@ -598,32 +648,41 @@ export class CityLedger {
     return { text, head: JSON.parse(text) };
   }
 
-  /** head 指到的尾段；head 落後時跟著封段標記往前。 */
-  async tailView() {
-    const { text: headText, head } = await this.head();
-    let index = head.segment;
-    let text = await this.io.read(this.segmentPath(index));
-    let parsed = parseSegment(text ?? "");
-    let guard = 0;
-    while (parsed.sealed) {
-      if (guard++ > 4096) throw new Error("封段鏈太長");
-      index = parsed.sealNext;
-      text = await this.io.read(this.segmentPath(index));
-      parsed = parseSegment(text ?? "");
-    }
-    return { head, headText, index, text, entries: parsed.entries };
-  }
-
-  /** 第 `from` 段起連續存在的所有段（讀取與 checkpoint 重播都走這裡）。 */
+  /**
+   * 第 `from` 段起沿著封段標記走出來的段（讀取、重播與 checkpoint 都走這裡）。
+   *
+   * 讀到封段標記、它指的下一段還不存在時（封段 CAS 成功、建立下一段之前中斷），
+   * 由讀到 seal 的寫入者補上（§13.1）。不是接在 seal 後面的缺口一律當損壞，不猜。
+   */
   async scanSegments(from = 0) {
     const segments = [];
-    for (let index = from; ; index++) {
-      const text = await this.io.read(this.segmentPath(index));
-      if (text === null) break;
+    let index = from;
+    for (let guard = 0; ; guard++) {
+      if (guard > 8192) throw new Error("封段鏈太長");
+      let text = await this.io.read(this.segmentPath(index));
+      if (text === null) {
+        const previous = segments[segments.length - 1];
+        if (!previous?.sealed || previous.sealNext !== index) break;
+        await this.create(this.segmentPath(index), "");
+        text = await this.io.read(this.segmentPath(index));
+        if (text === null) throw new Error(`封段後的下一段建立不起來：${index}`);
+      }
       if (byteLen(text) > this.limit) throw new Error(`第 ${index} 段超過上限`);
-      segments.push({ index, text, ...parseSegment(text) });
+      const parsed = parseSegment(text);
+      segments.push({ index, text, ...parsed });
+      // 尾段之後還讀一段：正常情況下它是 null（就是「到這裡為止」的證明），
+      // 也讓「掃描完成的讀取」跟「尾段是哪一段」由同一條讀取鏈決定。
+      index = parsed.sealed && Number.isInteger(parsed.sealNext) ? parsed.sealNext : index + 1;
     }
     return segments;
+  }
+
+  /** 掃描結果的尾段：下一筆 entry 要附加的那一段。 */
+  tailOf(segments, fallback) {
+    const last = segments[segments.length - 1];
+    return last
+      ? { index: last.index, text: last.text, entries: last.entries.length }
+      : { index: fallback, text: "", entries: 0 };
   }
 
   /** checkpoint + 之後的 journal → 狀態，並把讀取快取一起準備好。 */
@@ -632,32 +691,36 @@ export class CityLedger {
     let state = emptyState(this.cityId);
     let from = 0;
     if (head.checkpoint >= 0) {
-      const loaded = await this.loadCheckpoint(head.checkpoint);
-      state = loaded.state;
-      from = loaded.segment;
+      try {
+        const loaded = await this.loadCheckpoint(head.checkpoint);
+        state = loaded.state;
+        from = loaded.segment;
+      } catch (error) {
+        if (!(error instanceof CheckpointIncomplete)) throw error;
+        // 衍生索引不完整：整份丟棄、從 authoritative journal 從頭重播（Issue #1），
+        // 並把 head 的 checkpoint 歸零，之後不用每次讀取都再讀一次壞掉的快照。
+        await this.discardCheckpoint();
+        state = emptyState(this.cityId);
+        from = 0;
+      }
     }
     // checkpoint 指到的段被刪掉時不能靜靜地少讀後面的 entry。
     if (from > 0 && (await this.io.read(this.segmentPath(from))) === null) {
       throw new Error(`checkpoint 指到的第 ${from} 段不見了`);
     }
-    let segment = from;
-    for (const part of await this.scanSegments(from)) {
+    // 重播與 CAS 前提必須來自**同一份掃描結果**：尾段直接取這份結果，不再另外重讀
+    // 一次。否則別的寫入者在兩次讀取之間附加的 entry 會讓 state 停在 N−1、CAS 前提
+    // 卻已經含著它，下一個 submit 就會對最新尾段寫出重複的序號（§13.1）。
+    const parts = await this.scanSegments(from);
+    for (const part of parts) {
       for (const entry of part.entries) {
         if (entry.journalSeq <= state.lastSeq) continue;
         applyTo(state, entry, await this.contentOf(entry));
-        segment = part.index;
       }
     }
-    const view = await this.tailView();
-    this.cache = {
-      state,
-      head,
-      headText,
-      segment,
-      tail: { index: view.index, text: view.text ?? "", entries: view.entries.length },
-      stale: false,
-    };
-    return { state, segment };
+    const tail = this.tailOf(parts, from);
+    this.cache = { state, head, headText, segment: tail.index, tail, stale: false };
+    return { state, segment: tail.index };
   }
 
   /** entry 引用的內容檔（沒有就回 null）。 */
@@ -668,6 +731,7 @@ export class CityLedger {
   /**
    * 讀取快取同步：`state()` 一律重讀尾段（別人的寫入才看得到）；`submit()` 平常只信快取，
    * CAS 失敗時才標成 stale 強制重讀——所以一百萬筆操作的路徑上不是每筆都掃整個 journal。
+   * 重讀的尾段同樣取自這份掃描結果（跟 rebuild 一樣的理由）。
    */
   async refresh({ force = false } = {}) {
     if (!this.cache) {
@@ -675,18 +739,19 @@ export class CityLedger {
       return;
     }
     if (!force && !this.cache.stale) return;
-    const view = await this.tailView();
-    const from = Math.min(this.cache.segment, view.index);
-    for (const part of await this.scanSegments(from)) {
+    const { text: headText, head } = await this.head();
+    const parts = await this.scanSegments(this.cache.segment);
+    for (const part of parts) {
       for (const entry of part.entries) {
         if (entry.journalSeq <= this.cache.state.lastSeq) continue;
         applyTo(this.cache.state, entry, await this.contentOf(entry));
-        this.cache.segment = part.index;
       }
     }
-    this.cache.head = view.head;
-    this.cache.headText = view.headText;
-    this.cache.tail = { index: view.index, text: view.text ?? "", entries: view.entries.length };
+    const tail = this.tailOf(parts, this.cache.segment);
+    this.cache.head = head;
+    this.cache.headText = headText;
+    this.cache.segment = tail.index;
+    this.cache.tail = tail;
     this.cache.stale = false;
   }
 
@@ -747,6 +812,7 @@ export class CityLedger {
           last = { status: "rotated" };
           continue;
         }
+        if (options.crash === "after-seal") throw new CrashAfterSeal(op.opId);
         await this.create(this.segmentPath(tail.index + 1), "");
         this.cache.head = { ...this.cache.head, segment: tail.index + 1 };
         this.cache.tail = { index: tail.index + 1, text: "", entries: 0 };
@@ -828,9 +894,12 @@ export class CityLedger {
     }
     await index("history").build(historyEntries);
 
-    // 座標分塊：每塊 32×32 格，只記格子鍵（遠征資料在 expeditions 索引）。
+    // 座標分塊：每塊 32×32 格，只記「畫得出來、佔得住」的格子鍵（遠征資料在 expeditions
+    // 索引）。已撤回／已封存的格子只是同一格的歷史，不進分塊——同一個座標同時只會有一格
+    // 佔著，所以每一塊的鍵數有界（≤ 32×32），十萬次撤回重用同一格也不會把分塊撐爆。
     const chunks = new Map();
     for (const tile of state.tiles) {
+      if (tile.landStage === "withdrawn" || tile.landStage === "archived") continue;
       const name = chunkName(tile.x, tile.y);
       if (!chunks.has(name)) chunks.set(name, []);
       chunks.get(name).push(`${tile.rootSessionId}@@${tile.generation}`);
@@ -891,34 +960,82 @@ export class CityLedger {
     return typeof record === "string" ? JSON.parse(record) : this.unpackRecord(record);
   }
 
-  /** checkpoint → 狀態（不含 checkpoint 之後的 journal）。 */
+  /**
+   * checkpoint → 狀態（不含 checkpoint 之後的 journal）。
+   *
+   * checkpoint 是**衍生**索引：manifest 欄位、每一頁的存在與筆數都要對得上，任何一項
+   * 不完整就丟 `CheckpointIncomplete`，由呼叫端整份丟棄、從 journal 重建（Issue #1）。
+   * 缺頁不能當成「沒有資料」——那會讓庫存留著、去重資料卻消失。
+   */
   async loadCheckpoint(seq) {
     const dir = this.checkpointDir(seq);
     const text = await this.io.read(`${dir}/manifest.json`);
-    if (text === null) throw new Error(`checkpoint 不見了：${seq}`);
-    const manifest = JSON.parse(text);
+    const incomplete = (reason) => new CheckpointIncomplete(seq, reason);
+    if (text === null) throw incomplete("manifest 不見了");
+    let manifest;
+    try {
+      manifest = JSON.parse(text);
+    } catch {
+      throw incomplete("manifest 不是合法 JSON");
+    }
+    const counts = manifest?.counts;
+    const shaped = manifest?.t === "ckpt" && manifest.schema === SCHEMA && Number.isInteger(manifest.seq) &&
+      manifest.seq === seq && Number.isInteger(manifest.segment) &&
+      counts && ["tiles", "activities", "ops", "claims", "chunks"].every((key) => Number.isInteger(counts[key]));
+    if (!shaped) throw incomplete("manifest 欄位不完整");
     const index = (part) => new PrefixIndex({ io: this.io, dir: `${dir}/${part}`, limit: this.pageLimit });
+    let ops;
+    let claims;
+    let expeditions;
+    let activities;
+    let chunks;
+    try {
+      ops = await index("ops").all({ strict: true });
+      claims = await index("claims").all({ strict: true });
+      expeditions = await index("expeditions").all({ strict: true });
+      activities = await index("activities").all({ strict: true });
+      chunks = await index("chunk-index").all({ strict: true });
+    } catch (error) {
+      throw incomplete(String(error?.message ?? error));
+    }
+    const mismatch = ops.size !== counts.ops || claims.size !== counts.claims ||
+      expeditions.size !== counts.tiles || activities.size !== counts.activities || chunks.size !== counts.chunks;
+    if (mismatch) throw incomplete(`筆數不符（ops ${ops.size}/${counts.ops}、claims ${claims.size}/${counts.claims}、expeditions ${expeditions.size}/${counts.tiles}、activities ${activities.size}/${counts.activities}、chunks ${chunks.size}/${counts.chunks}）`);
     const state = emptyState(this.cityId);
-    state.lastSeq = manifest.seq ?? seq;
-    for (const [, record] of await index("expeditions").all()) addTile(state, await this.unpackExpeditionRecord(record));
+    state.lastSeq = manifest.seq;
+    for (const [, record] of expeditions) addTile(state, await this.unpackExpeditionRecord(record));
     state.tiles.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
-    for (const [key, value] of await index("ops").all()) state.opSeqs.set(key, value);
-    for (const [key, value] of await index("claims").all()) state.claims.set(key, value);
-    for (const [key, packed] of await index("activities").all()) state.activities.set(key, await this.unpackRecord(packed));
+    for (const [key, value] of ops) state.opSeqs.set(key, value);
+    for (const [key, value] of claims) state.claims.set(key, value);
+    for (const [key, packed] of activities) state.activities.set(key, await this.unpackRecord(packed));
     state.resources = manifest.resources ?? state.resources;
     state.research = manifest.research ?? state.research;
     state.market = manifest.market ?? state.market;
-    return { state, segment: manifest.segment ?? 0 };
+    return { state, segment: manifest.segment };
   }
 
-  /** 最新的 checkpoint（有的話）：目錄、manifest 與代號。 */
+  /** checkpoint 不完整時把它從 head 拿掉：之後不會每次讀取都再讀一次壞掉的快照。 */
+  async discardCheckpoint() {
+    const { text, head } = await this.head();
+    if (!(head.checkpoint >= 0)) return;
+    await this.updateHead({ head, headText: text }, { checkpoint: -1 });
+  }
+
+  /** 最新的 checkpoint（有的話）：目錄、manifest 與代號。manifest 明顯壞掉就當沒有。 */
   async checkpointInfo() {
     const { head } = await this.head();
     if (!head.checkpoint || head.checkpoint < 0) return null;
     const dir = this.checkpointDir(head.checkpoint);
     const text = await this.io.read(`${dir}/manifest.json`);
     if (text === null) return null;
-    return { seq: head.checkpoint, dir, manifest: JSON.parse(text) };
+    let manifest;
+    try {
+      manifest = JSON.parse(text);
+    } catch {
+      return null;
+    }
+    if (manifest?.t !== "ckpt" || manifest.seq !== head.checkpoint) return null;
+    return { seq: head.checkpoint, dir, manifest };
   }
 
   // ---- 查詢介面（#9 接手用；不做畫面） ------------------------------------------------
@@ -964,23 +1081,47 @@ export class CityLedger {
     return found ? { tile: found, seq: found.seq, source: "journal" } : null;
   }
 
-  /** 一個座標分塊裡的格子（地圖用；32×32 格）：checkpoint 的分塊加上之後新增的。 */
+  /**
+   * 一個座標分塊裡的格子（地圖用；32×32 格）：checkpoint 的分塊加上之後新增的。
+   *
+   * 分塊只列「畫得出來、佔得住」的格子（已撤回／已封存的格子是歷史，由 expeditions
+   * 索引查）。分塊自己壞掉（檔案不見、筆數跟 chunk-index 對不上、遠征頁缺了）時不能
+   * 當成「這一塊沒有格子」：把 checkpoint 丟掉、改用完整重播的狀態。
+   */
   async tilesInChunk(x, y) {
     const name = chunkName(x, y);
     const info = await this.checkpointInfo();
     const tiles = [];
+    let readable = true;
     if (info) {
+      const listed = await new PrefixIndex({ io: this.io, dir: `${info.dir}/chunk-index`, limit: this.pageLimit }).get(name);
       const text = await this.io.read(`${info.dir}/chunks/${name}.json`);
+      let keys = null;
+      try {
+        keys = text === null ? null : JSON.parse(text).tiles;
+      } catch {
+        keys = null;
+      }
+      readable = listed === null ? keys === null : Array.isArray(keys) && keys.length === listed;
       const index = this.expeditionIndex(info.dir);
-      for (const key of text === null ? [] : JSON.parse(text).tiles) {
+      for (const key of readable ? keys ?? [] : []) {
         const [rootSessionId, generation] = key.split("@@");
         const hit = await index.get(tileId(this.cityId, rootSessionId, Number(generation)));
-        if (hit !== null) tiles.push(await this.unpackExpeditionRecord(hit));
+        if (hit === null) {
+          readable = false; // 遠征頁不見了：整塊分塊不可信
+          break;
+        }
+        tiles.push(await this.unpackExpeditionRecord(hit));
+      }
+      if (!readable) {
+        tiles.length = 0;
+        await this.discardCheckpoint();
       }
     }
     // checkpoint 之後才落帳的格子也要在：查詢接點讀的是「checkpoint + 後續 journal」。
     const seen = new Set(tiles.map((tile) => tileId(tile.cityId, tile.rootSessionId, tile.generation)));
     for (const tile of (await this.state()).tiles) {
+      if (tile.landStage === "withdrawn" || tile.landStage === "archived") continue;
       if (chunkName(tile.x, tile.y) !== name) continue;
       const id = tileId(tile.cityId, tile.rootSessionId, tile.generation);
       if (seen.has(id)) continue;
@@ -1001,12 +1142,20 @@ export class CityLedger {
     let lastSeq = -1;
     let from = 0;
     if (info) {
-      const indexed = await new PrefixIndex({ io: this.io, dir: `${info.dir}/history`, limit: this.pageLimit }).all();
-      for (const record of indexed.values()) {
-        records.push(record);
-        lastSeq = Math.max(lastSeq, Number(record.seq));
+      let indexed = null;
+      try {
+        indexed = await new PrefixIndex({ io: this.io, dir: `${info.dir}/history`, limit: this.pageLimit }).all({ strict: true });
+      } catch {
+        indexed = null; // 歷程索引缺頁：整份丟棄，從 journal 重建
+        await this.discardCheckpoint();
       }
-      from = Number(info.manifest.segment ?? 0);
+      if (indexed) {
+        for (const record of indexed.values()) {
+          records.push(record);
+          lastSeq = Math.max(lastSeq, Number(record.seq));
+        }
+        from = Number(info.manifest.segment ?? 0);
+      }
     }
     for (const part of await this.scanSegments(from)) {
       for (const entry of part.entries) {

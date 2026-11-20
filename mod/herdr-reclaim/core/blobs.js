@@ -12,6 +12,7 @@
 //
 // 檔名是「檔案內容」的雜湊，所以同一份內容只寫一次；重試時直接沿用，不重寫。
 import { byteLen, canonicalJson, hashText } from "./bytes.js";
+import { rejectUnlessConflict } from "./cas.js";
 
 export const BLOB_LIMIT = 256 * 1024;
 
@@ -102,9 +103,22 @@ export class BlobStore {
     return out;
   }
 
-  /** 已經有同樣的內容就不重寫（重試不會多寫檔案）。 */
+  /**
+   * 已經有同樣的內容就不重寫（重試不會多寫檔案）。
+   *
+   * 檔名是內容的雜湊，所以「建立時才發現已經有人建好」不是錯：兩個 pane 第一次處理
+   * 同一份內容就會同時以 expected=null 建立。這裡重讀確認內容相同後沿用；內容不同
+   * （不可能同時又是同一個雜湊）或其他 I/O 錯誤照常丟出。
+   */
   async store(hash, text) {
-    if ((await this.io.read(this.path(hash))) === null) await this.io.write(this.path(hash), text, null);
+    if ((await this.io.read(this.path(hash))) === null) {
+      try {
+        await this.io.write(this.path(hash), text, null);
+      } catch (error) {
+        rejectUnlessConflict(error);
+        if ((await this.io.read(this.path(hash))) !== text) throw error;
+      }
+    }
     return hash;
   }
 
@@ -158,29 +172,38 @@ export function splitToLeaves(text, limit) {
   return pieces.length ? pieces : [""];
 }
 
-/** 從 `start` 起最多能取幾個字元，使其 JSON 跳脫後的位元組數 ≤ budget。 */
+/** 一個碼元（可能是一對代理）跳脫後的位元組數與佔用的碼元數。 */
+function escapedUnit(text, index) {
+  const code = text.charCodeAt(index);
+  if (code === 0x22 || code === 0x5c) return { bytes: 2, units: 1 }; // " 與 \
+  if (code >= 0x08 && code <= 0x0d) return { bytes: 2, units: 1 }; // \b \t \n \f \r
+  if (code < 0x20) return { bytes: 6, units: 1 }; // \u00XX
+  if (code >= 0xd800 && code <= 0xdbff) {
+    const next = text.charCodeAt(index + 1);
+    // 有效的一對代理：跳脫後就是原本的 4 個位元組，而且兩個碼元要一起走。
+    if (next >= 0xdc00 && next <= 0xdfff) return { bytes: 4, units: 2 };
+    return { bytes: 6, units: 1 }; // 不成對的高代理（JSON 會跳脫）
+  }
+  if (code >= 0xdc00 && code <= 0xdfff) return { bytes: 6, units: 1 }; // 不成對的低代理
+  if (code < 0x80) return { bytes: 1, units: 1 };
+  if (code < 0x800) return { bytes: 2, units: 1 };
+  return { bytes: 3, units: 1 };
+}
+
+/**
+ * 從 `start` 起最多能取幾個碼元，使其 JSON 跳脫後的位元組數 ≤ budget。
+ *
+ * 先確認整「個字元」放得下才前進：一對代理是兩個碼元一起決定，所以切點永遠不會落在
+ * 高低代理之間（切開的話每一片的位元組數加起來會對不上 manifest 的原始位元組數）。
+ */
 function takeEscaped(text, start, budget) {
   let used = 0;
   let index = start;
   while (index < text.length) {
-    const code = text.charCodeAt(index);
-    let size;
-    if (code === 0x22 || code === 0x5c) size = 2; // " 與 \
-    else if (code >= 0x08 && code <= 0x0d) size = 2; // \b \t \n \f \r
-    else if (code < 0x20) size = 6;
-    else if (code >= 0xd800 && code <= 0xdbff) {
-      const next = text.charCodeAt(index + 1);
-      if (next >= 0xdc00 && next <= 0xdfff) {
-        size = 4;
-        index++; // 代理對是一個字元
-      } else size = 6;
-    } else if (code >= 0xdc00 && code <= 0xdfff) size = 6;
-    else if (code < 0x80) size = 1;
-    else if (code < 0x800) size = 2;
-    else size = 3;
-    if (used + size > budget) break;
-    used += size;
-    index++;
+    const { bytes, units } = escapedUnit(text, index);
+    if (used + bytes > budget) break;
+    used += bytes;
+    index += units;
   }
   return index;
 }

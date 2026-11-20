@@ -52,9 +52,17 @@ export function parseReflogEvidence(output, cityId, checkout) {
   for (const line of output.split(/\r?\n/)) {
     const [sha, ...parts] = line.split("\t");
     if (!/^[0-9a-f]{40,64}$/i.test(sha ?? "")) continue;
-    const reflog = parts.join("\t");
+    // `git reflog --format=%H%x09%ct%x09%gs`：第二欄是提交時間（秒）。舊格式沒有它，
+    // 那就留 at=0（沒有時間），不要用讀取當下冒充。
+    let at = 0;
+    let rest = parts;
+    if (/^\d{9,}$/.test(parts[0] ?? "")) {
+      at = Number(parts[0]) * 1000;
+      rest = parts.slice(1);
+    }
+    const reflog = rest.join("\t");
     if (/^(?:pull(?:\s|:)|merge (?:remote-tracking branch|(?:origin|upstream)[/ ])|reset: moving to (?:origin|upstream)\/|commit: Merge pull request\b)/i.test(reflog)) remoteMerges.add(sha);
-    records.push({ schema: 1, sha, hook: "reflog", commonDir: cityId, toplevel: checkout, at: 0, env: {}, reflog });
+    records.push({ schema: 1, sha, hook: "reflog", commonDir: cityId, toplevel: checkout, at, env: {}, reflog });
   }
   return { records, remoteMerges };
 }
@@ -139,9 +147,11 @@ export function commitContexts({ hooks = [], sources = [], activities = [], remo
     const attribution = attributionFor(sha, hooks, sources, activities);
     const remoteMerge = remoteMerges.has(sha);
     const records = [...hooks, ...sources].filter((record) => record.sha === sha);
-    const at = records.map((record) => plausibleAt(record.at)).filter((value) => value !== null).sort((a, b) => a - b)[0] ?? Date.now();
+    const at = records.map((record) => plausibleAt(record.at)).filter((value) => value !== null).sort((a, b) => a - b)[0] ?? null;
     const rootId = !remoteMerge && attribution.identity ? rootSession(attribution.identity.sessionId, activities) : null;
-    const reason = remoteMerge ? "remote-merge" : attribution.reason;
+    // 沒有可信時間的證據（舊 recorder 的 at=0）不能用「重播當下」冒充：那會把提交歸到
+    // 處理時才存在的新 generation，而且每次重播的結果都不一樣。記下來、不給資源。
+    const reason = remoteMerge ? "remote-merge" : attribution.reason ?? (at === null ? "unknown-commit-time" : null);
     contexts.push({
       sha,
       cityId: attribution.cityId,
@@ -163,11 +173,14 @@ export async function ingestCommits({ ledger, hooks, sources, activities, diffFo
   const state = await ledger.state();
   const results = [];
   for (const context of commitContexts({ hooks, sources, activities, remoteMerges })) {
+    // 這是**這一座城**的帳本：只有證據自己說屬於這座城（repo 身分相符）才落帳。
+    // repo 未確定的證據不複製到每座城，更不能拿 A 城的 commit 去 B 城找格子發資源。
+    if (context.cityId !== ledger.cityId) continue;
     const { sha, rootId, at: commitAt, remoteMerge: isRemoteMerge } = context;
     const evidence = [...hooks, ...sources].find((record) => record.sha === sha);
     const subject = evidence?.subject ?? (evidence?.reflog ? evidence.reflog.replace(/^commit(?: \(amend\))?:\s*/, "") : null) ??
       (subjectForCommit ? await subjectForCommit(sha, evidence) : null);
-    const tile = rootId ? generationAt(state, rootId, commitAt) : null;
+    const tile = rootId && commitAt !== null ? generationAt(state, rootId, commitAt) : null;
     const generation = tile?.generation ?? null;
     const reason = context.reason ?? (!tile ? "no-matching-expedition" : null);
     const commitOp = {
@@ -178,7 +191,8 @@ export async function ingestCommits({ ledger, hooks, sources, activities, diffFo
       rootSessionId: rootId,
       generation,
       repo: context.cityId,
-      at: commitAt,
+      // 沒有可信時間就以 0 落帳（0 = 沒有時間，不是 epoch）：不要用當下時間冒充。
+      at: commitAt ?? 0,
       subject,
       reason: reason ?? "verified",
       ...(reason ? {} : {
@@ -221,7 +235,9 @@ export function unharvestedCommitReasons({ cityId, hooks, sources, activities, r
   for (const sha of shas) {
     const attribution = attributionFor(sha, hooks, sources, activities);
     if (attribution.cityId !== cityId) continue;
-    let reason = remoteMerges.has(sha) ? "remote-merge" : attribution.reason;
+    const records = [...hooks, ...sources].filter((record) => record.sha === sha);
+    const at = records.map((record) => plausibleAt(record.at)).filter((value) => value !== null).sort((a, b) => a - b)[0] ?? null;
+    let reason = remoteMerges.has(sha) ? "remote-merge" : attribution.reason ?? (at === null ? "unknown-commit-time" : null);
     if (!reason) {
       const rootId = rootSession(attribution.identity.sessionId, activities);
       const generation = state.currentGen.get(`${cityId}@@${rootId}`) ?? 1;

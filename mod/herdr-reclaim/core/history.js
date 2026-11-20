@@ -12,6 +12,8 @@ const REASON_LABELS = {
   "no-matching-expedition": "沒有匹配遠征",
   "no-matching-adapter-session": "對不到 adapter session",
   "no-eligible-changes": "沒有可收成變更",
+  "unknown-commit-time": "提交沒有可信時間",
+  "outside_generation": "不在現役時間窗內",
   "remote-merge": "遠端合併",
   unresolved: "活動尚未解析",
 };

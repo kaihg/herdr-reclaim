@@ -15,7 +15,8 @@ export function hookScript({ hook, appHome }) {
 `if [ -x "$original" ]; then\n  if [ "$HOOK" = post-rewrite ]; then printf '%s\\n' "$input" | "$original" "$@"; else "$original" "$@"; fi\nfi\n` +
 `facts=$(git rev-parse --path-format=absolute --git-common-dir --show-toplevel HEAD 2>/dev/null) || exit 0\n` +
 `{ IFS= read -r common; IFS= read -r top; IFS= read -r sha; } <<HERDR_RECLAIM_FACTS\n$facts\nHERDR_RECLAIM_FACTS\n` +
-`at=0\n` +
+`at=$(date +%s 2>/dev/null)\n` +
+`if [ \${#at} -ge 9 ]; then at="\${at}000"; else at=0; fi\n` +
 `if [ -n "$PI_SESSION_ID$CODEX_THREAD_ID$CLAUDE_CODE_SESSION_ID" ]; then reason=; elif [ -n "$HC_TERMINAL_ID" ]; then reason=terminal-only; else reason=no-session-source; fi\n` +
 `mkdir -p "$ROOT" 2>/dev/null || exit 0\n` +
 `tmp="$ROOT/.$sha.$HOOK.$$"\n` +
@@ -42,10 +43,15 @@ async function repoInfo(repo, exec) {
     command(exec, "git", ["-C", repo, "config", "--local", "--get", "core.hooksPath"]),
   ]);
   if (![hooks, top, common].every(successful)) return null;
-  return {
-    hooksPath: hooks.stdout.trim(), top: top.stdout.trim(), commonDir: common.stdout.trim(),
-    configuredHooksPath: successful(configured) ? configured.stdout.trim() : null,
-  };
+  const hooksPath = hooks.stdout.trim();
+  const commonDir = common.stdout.trim();
+  const configuredHooksPath = successful(configured) ? configured.stdout.trim() : null;
+  // `--git-path hooks` 給的是**有效**路徑（含 global／system 的 core.hooksPath），
+  // 而 configuredHooksPath 只讀 repo-local 設定。有效路徑不是預設的 `<common>/hooks`
+  // 而且不是這個 repo 自己設的，就是繼承來的共用目錄。
+  const inheritedSharedHooksPath = configuredHooksPath === null &&
+    hooksPath !== `${commonDir.replace(/\/$/, "")}/hooks`;
+  return { hooksPath, top: top.stdout.trim(), commonDir, configuredHooksPath, inheritedSharedHooksPath };
 }
 
 async function trackedHooks(repo, hooksPath, top, exec) {
@@ -61,6 +67,17 @@ async function trackedHooks(repo, hooksPath, top, exec) {
 export async function installHooks({ repo, io, exec, appHome }) {
   const info = await repoInfo(repo, exec);
   if (!info) return { status: "not-git-repository" };
+  // 繼承自 global／system 的 core.hooksPath 是別的 repo 也可能在用的共用目錄：這一座城
+  // 不能在那裡搬動既有 hook 或寫入 recorder（那不是它的目錄，改的是全域 hook 的行為）。
+  // repo-local 自己設定的路徑（含 repo 內的自訂目錄）照舊。
+  if (info.inheritedSharedHooksPath) {
+    return {
+      status: "refused",
+      reason: "inherited-hooks-path",
+      hooksPath: info.hooksPath,
+      message: `core.hooksPath 繼承自 global／system（${info.hooksPath}）：請改用 repo-local 的 core.hooksPath 再安裝`,
+    };
+  }
   const husky = /(^|[/.])husky([/.]|$)/i.test(info.configuredHooksPath ?? info.hooksPath) ||
     await command(exec, "test", ["-d", `${info.top}/.husky`]).then(successful);
   const tracked = await trackedHooks(repo, info.hooksPath, info.top, exec);

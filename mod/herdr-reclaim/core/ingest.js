@@ -188,13 +188,31 @@ export async function processBuild(ledger, { rootSessionId, generation, recipe, 
 }
 
 /**
+ * 這座城每一支遠征的各代現役時間窗（§5.3）：撤回／封存到重新派遣之間的空窗不算成績。
+ * `deactivatedAt == null` 代表這一格還活著（開放到無限）。
+ */
+function generationWindows(state, cityId) {
+  const windows = new Map();
+  for (const tile of state.tiles) {
+    if (tile.cityId !== cityId) continue;
+    const list = windows.get(tile.rootSessionId) ?? [];
+    list.push({
+      activatedAt: Number(tile.activatedAt ?? 0),
+      deactivatedAt: tile.deactivatedAt == null ? Infinity : Number(tile.deactivatedAt),
+    });
+    windows.set(tile.rootSessionId, list);
+  }
+  return windows;
+}
+
+/**
  * 研究（§7.4）：把可以結算的回合寫成帳本的一筆 entry。operation ID 由回合身份決定，
  * 所以重播同一份活動與證據不會再次發放；已經落帳的進度不因為來源晚到而倒扣。
  * `activities` 要用帳本裡保存的活動紀錄（adapter 的快照會被 ack compact，帳本不會）。
  */
 export async function ingestResearch(ledger, { activities, commits, cityId = ledger.cityId }) {
-  const plan = planResearch({ activities, commits, cityId });
   const state = await ledger.state();
+  const plan = planResearch({ activities, commits, cityId, generations: generationWindows(state, cityId) });
   const results = [];
   for (const settlement of plan.settlements) {
     if (state.opSeqs.has(settlement.opId)) continue;
@@ -202,6 +220,7 @@ export async function ingestResearch(ledger, { activities, commits, cityId = led
       opId: settlement.opId,
       kind: "research",
       at: settlement.at,
+      openAt: settlement.openAt,
       cityId,
       rootSessionId: settlement.rootSessionId,
       sessionId: settlement.sessionId,

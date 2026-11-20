@@ -27,7 +27,7 @@ import { installHooks, removeHooks } from "./core/hooks.js";
 import { RESEARCH_TOKENS_PER_PARCHMENT, RESOURCE_LABELS, RULES_VERSION } from "./core/rules.js";
 import { defaultSelection, parseUi, resolveSelection, savedSelection, selectionOf, serializeUi, withSelection } from "./core/selection.js";
 import { QUOTA_SOURCE, parseQuotaReport } from "./core/quota-source.js";
-import { readQuotas } from "./core/provider-stats.js";
+import { quotaView, readQuotaView } from "./core/quota-view.js";
 import { CLEAR_POINTS, formatResearch, readTown, readTownFromLedger, selectionDetail } from "./core/town.js";
 import { firstExpedition } from "./scenarios/first-expedition.js";
 import {
@@ -183,7 +183,8 @@ async function loadTown(io) {
       .filter((event) => event.visit?.commonDir === cityId && event.visit.checkout)
       .map((event) => event.visit.checkout)));
     for (const checkout of checkouts) {
-      const reflog = await exec("git", ["-C", checkout, "reflog", "-n", "64", "--format=%H%x09%gs"]);
+      // %ct＝提交時間（秒）：沒有 hook env 的城仍要有一個真實事件時間，不能用讀取當下。
+      const reflog = await exec("git", ["-C", checkout, "reflog", "-n", "64", "--format=%H%x09%ct%x09%gs"]);
       if (reflog.code !== 0) continue;
       const parsed = parseReflogEvidence(reflog.stdout, cityId, checkout);
       for (const sha of parsed.remoteMerges) remoteMerges.get(cityId).add(sha);
@@ -297,7 +298,9 @@ async function refreshTown(io, previous) {
     market,
     unresolvedActivities: previous?.unresolvedActivities ?? [],
     unharvestedCommits,
-    ...(previous?.quotas ? { quotas: previous.quotas } : {}),
+    // 額度依「現在」重新判定是不是過期（§9）：沿用上一次的解析結果，畫面開著跨過
+    // TTL／resetsAt 之後還會顯示舊的 remaining。重算只用已存的原始快照，不打 provider。
+    ...(previous?.quotas ? { quotas: quotaView(previous.quotas.snapshot) } : {}),
   });
 }
 /**
@@ -312,13 +315,8 @@ async function refreshTown(io, previous) {
 const quotasPath = () => `${adapterRoot(appHome())}/quotas.json`;
 
 async function loadQuotas(io) {
-  const text = await io.read(quotasPath());
-  if (text === null) return readQuotas(null);
-  try {
-    return readQuotas(JSON.parse(text), { now: Date.now() });
-  } catch {
-    return readQuotas(null); // 壞掉的回報檔＝未知，不影響城鎮
-  }
+  // 模型帶著原始快照：之後的重繪／操作刷新都用「現在」重新判定新鮮度（不呼叫外部 CLI）。
+  return readQuotaView(io, quotasPath());
 }
 
 /** 選取狀態的檔案（不是城的帳本）：選取不產生資源，也不改變土地。 */
@@ -620,6 +618,9 @@ export default class Town extends View {
   }
 
   render(cx) {
+    // 顯示更新時重新判定額度是否過期（S4）：模型帶著原始快照，這裡用「現在」重算一次，
+    // 所以只是選取／重繪（沒有重新抓取）也會在跨過 TTL／resetsAt 後顯示未知。
+    if (this.town?.quotas?.snapshot !== undefined) this.town.quotas = quotaView(this.town.quotas.snapshot);
     const started = Date.now();
     const t = theme();
     const city = this.city();
@@ -698,12 +699,14 @@ export default class Town extends View {
         const result = remove
           ? await removeHooks({ repo, exec })
           : await installHooks({ repo, exec, io: storageIo(), appHome: appHome() });
-        this.topNotice = result.status === "needs-confirmation"
-          ? `需先確認：${result.reason}`
-          : result.status === "installed" ? "收成 hook 已安裝"
-          : result.status === "removed" ? "收成 hook 已移除"
-          : result.status === "not-installed" ? "目前沒有已安裝的 hook"
-          : `操作未完成：${result.reason ?? result.status}`;
+        this.topNotice = result.status === "refused"
+          ? `未安裝收成 hook：${result.message ?? result.reason}`
+          : result.status === "needs-confirmation"
+            ? `需先確認：${result.reason}`
+            : result.status === "installed" ? "收成 hook 已安裝"
+            : result.status === "removed" ? "收成 hook 已移除"
+            : result.status === "not-installed" ? "目前沒有已安裝的 hook"
+            : `操作未完成：${result.reason ?? result.status}`;
       } catch (error) {
         this.topNotice = `hook 操作失敗：${error}`;
       }
