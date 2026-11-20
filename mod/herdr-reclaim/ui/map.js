@@ -84,7 +84,7 @@ function legendPanel(t, open, onToggle, onSize) {
     .cursor_pointer()
     .on_click((_event, cx) => onToggle(cx))
     // 圖例自己回報量到的大小：可見區的判定要用實際覆蓋層尺寸，不能用假設值。
-    .on_size_change((size) => onSize(size))
+    .on_size_change((size, cx) => onSize(size, cx))
     .child(h_flex().gap(6).items_center()
       .child(row("城市地圖 · 素材 mock（向量）", t.dim))
       .child(row(open ? "▾ 收合" : "▸ 展開", t.accent)))

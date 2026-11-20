@@ -136,9 +136,13 @@ export function panCamera(camera, delta, size, viewport) {
  * 選取／跳轉的保證：那一格的**整個菱形**要落在視窗內。在相機上做最小位移；
  * 視窗比一格還小的時候（極窄 pane）就把它置中（至少整格看得到）。
  */
-export function ensureVisible(cell, camera, rect, radius = MAP_RADIUS, tile = TILE) {
+export function ensureVisible(cell, camera, rect, radius = MAP_RADIUS, tile = TILE, margin = 0) {
   const origin = originInContent(radius, tile);
   const spot = projectTile(cell, tile);
+  // 入畫的外框＝格子方框再加 margin：mock 地物與標籤畫在方框內，但留有幾 px 的安全邊，
+  // 邊緣的建築才不會看起來被切掉（`margin` 由呼叫端給，測試用同一個值）。
+  const width = tile.w + margin * 2;
+  const height = tile.h + margin * 2;
   const axis = (start, size, from, limit) => {
     if (size >= limit - from) return from + (limit - from) / 2 - (start + size / 2); // 比可見區大：置中
     if (start < from) return from - start;
@@ -148,8 +152,8 @@ export function ensureVisible(cell, camera, rect, radius = MAP_RADIUS, tile = TI
   const x0 = rect.x ?? 0;
   const y0 = rect.y ?? 0;
   return {
-    x: camera.x + axis(camera.x + origin.left + spot.left, tile.w, x0, x0 + rect.width),
-    y: camera.y + axis(camera.y + origin.top + spot.top, tile.h, y0, y0 + rect.height),
+    x: camera.x + axis(camera.x + origin.left + spot.left - margin, width, x0, x0 + rect.width),
+    y: camera.y + axis(camera.y + origin.top + spot.top - margin, height, y0, y0 + rect.height),
   };
 }
 
