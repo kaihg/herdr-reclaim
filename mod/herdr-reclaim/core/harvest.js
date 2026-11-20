@@ -35,8 +35,11 @@ export function harvestForCommit({ cityId, rootSessionId, generation, sha, chang
     const category = classifyPath(path);
     if (!category || seenPaths.has(path) || seenThisCommit.has(path)) continue;
     seenThisCommit.add(path);
-    const resultBlob = change.status === "D" ? change.oldBlob : change.resultBlob;
-    const claim = `${path}|${resultBlob ?? ""}`;
+    // §7.3 的城級 claim key：刪除是 cityId+path+"deleted"+firstParentBlob，與新增的
+    // cityId+path+resultBlob 不同；同一份內容版本的新增與刪除因此各自只發一次。
+    const claim = change.status === "D"
+      ? `${path}|deleted|${change.oldBlob ?? ""}`
+      : `${path}|${change.resultBlob ?? ""}`;
     if (state?.claims?.has(claimKey(cityId, claim))) continue;
     seenPaths.add(path);
     claims.push(claim);

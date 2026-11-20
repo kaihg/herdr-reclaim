@@ -44,6 +44,6 @@ describe("commit 收成", () => {
         { status: "R100", path: "src/new.js", oldPath: "src/old.js", oldBlob: "same", resultBlob: "same" },
       ], state: { claims: new Map() }, tile: { harvestedPaths: [] },
     });
-    expect(result.claims).toEqual(["src/old.js|prior"]);
+    expect(result.claims).toEqual(["src/old.js|deleted|prior"]);
   });
 });
