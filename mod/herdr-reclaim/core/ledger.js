@@ -1,8 +1,11 @@
 // 城帳本：append-only journal + CAS + checkpoint（proposal §13.1，ticket #3）。
 //
 // 這一層是純 JS：所有檔案 I/O 都走呼叫端給的 `io`（`read`／`write` 兩個非同步函式）。
-// mod 用 herdr 的 `readTextFile` 與 `writeTextFile(path, text, expected)`（expected 不符就拒絕）；
-// bun 測試用 node fs 的後端（test/fs-io.js）。協定本身不碰 host API。
+//
+// **儲存介面的契約**：`io.write(path, text, expected)` 只在快照不符（`expected` 不是現在
+// 的內容，`expected === null` 代表建立新檔）時拒絕，而且**一律拒絕成 `CasConflict`**；
+// 其他錯誤（權限、磁碟…）原樣往上丟。mod 端由 `core/host-io.js` 把 herdr 的原生錯誤
+// 轉成 `CasConflict`；bun 測試的後端（test/fs-io.js）直接說同一種語言。
 //
 // 檔案（每個城的目錄）：
 //   head.json                      固定大小：schemaVersion、rulesVersion、cityId、segment、checkpoint
@@ -25,13 +28,39 @@ export const SEAL_RESERVE = 96;
 /** CAS 失敗就重讀、重新檢查、再試；連續失敗到這個次數才放棄。 */
 const MAX_ATTEMPTS = 8;
 
-/** 寫入者拿到過期的快照；呼叫端應該重讀後重新判定（§13.1）。 */
-export class StaleWrite extends Error {
-  constructor(path) {
-    super(`快照已過期：${path}`);
-    this.name = "StaleWrite";
+/**
+ * 快照不符：呼叫端要重讀、重新檢查前提、再試（§13.1）。
+ * `kind`：`"stale"`＝指定的 `expected` 已經不是現在的內容；`"exists"`＝要建立的新檔已經有了。
+ */
+export class CasConflict extends Error {
+  constructor(path, kind = "stale") {
+    super(kind === "exists" ? `檔案已經存在：${path}` : `快照已過期：${path}`);
+    this.name = "CasConflict";
+    this.kind = kind;
     this.path = path;
   }
+}
+
+/** 真實 host 的 CAS 衝突訊息；host 的錯誤只有 message，所以這是主要線索。 */
+const HOST_CONFLICT = /changed outside Herdr|Reload before saving/i;
+
+/**
+ * 把儲存層的錯誤認成 `CasConflict`（回傳它），或回 null（不是 CAS 衝突，呼叫端原樣丟出）。
+ *
+ * 兩個線索互補：host 的訊息說「這是衝突」（`herdr.writeTextFile` 的錯誤只有 message 欄位，
+ * 建立既有檔案／過期更新／對不存在的檔案指定 expected 都是同一句）；實際內容與 `expected`
+ * 的關係決定是哪一種衝突。`current` 由呼叫端重讀後傳進來（讀不到就傳 undefined，只看訊息）。
+ */
+export function casConflictOf(error, { path, expected, current } = {}) {
+  const byMessage = HOST_CONFLICT.test(String(error?.message ?? ""));
+  const byContent = expected === null ? current != null : current !== undefined && current !== expected;
+  if (!byMessage && !byContent) return null;
+  return new CasConflict(path, expected === null ? "exists" : "stale");
+}
+
+/** 只有 CAS 衝突可以重試；其他錯誤原樣丟出，不要吞掉。 */
+function rejectUnlessConflict(error) {
+  if (!(error instanceof CasConflict)) throw error;
 }
 
 /** 故障注入用：內容檔已寫、journal 還沒附加時中斷。 */
@@ -265,12 +294,16 @@ export class CityLedger {
     return this;
   }
 
-  /** expected = null 的建立；別人在前面建好了就沿用（不是錯）。 */
+  /**
+   * expected = null 的建立；別人在前面建好了就沿用（不是錯）。
+   * 只有 CAS 衝突才這樣處理：其他錯誤（權限、磁碟…）原樣丟出，不吞。
+   */
   async create(path, text) {
     try {
       await this.io.write(path, text, null);
     } catch (error) {
-      if ((await this.io.read(path)) === null) throw error;
+      rejectUnlessConflict(error);
+      if ((await this.io.read(path)) === null) throw error; // 衝突但檔案還是不在：讓呼叫端知道
     }
   }
 
@@ -395,7 +428,8 @@ export class CityLedger {
             `${current}${JSON.stringify({ seal: state.lastSeq, next: view.index + 1 })}\n`,
             view.text,
           );
-        } catch {
+        } catch (error) {
+          rejectUnlessConflict(error);
           last = { status: "rotated" };
           continue; // 別人先封了（或有新的 entry）：重讀再試
         }
@@ -405,11 +439,11 @@ export class CityLedger {
         continue;
       }
 
-      // CAS：拿到過期快照就重讀、重新檢查前提、再試（§13.1）。
+      // CAS：快照不符就重讀、重新檢查前提、再試（§13.1）。其他錯誤原樣丟出。
       try {
         await this.io.write(this.segmentPath(view.index), `${current}${line}`, view.text);
       } catch (error) {
-        if (!(error instanceof StaleWrite)) throw error;
+        rejectUnlessConflict(error);
         last = { status: "stale" };
         continue;
       }
@@ -427,21 +461,19 @@ export class CityLedger {
     return hash;
   }
 
-  /** CAS 寫入；失敗轉成 StaleWrite，讓呼叫端重讀再試。 */
+  /** CAS 寫入：只有快照不符才失敗，交給呼叫端決定要不要重試。 */
   async write(path, text, expected) {
-    try {
-      await this.io.write(path, text, expected);
-    } catch (error) {
-      throw error instanceof StaleWrite ? error : new StaleWrite(path);
-    }
+    await this.io.write(path, text, expected);
   }
 
   async updateHead(view, changes) {
     const head = { ...view.head, ...changes };
     try {
       await this.io.write(this.headPath(), `${JSON.stringify(head)}\n`, view.headText);
-    } catch {
+    } catch (error) {
       // head 只是快取：讀取端跟著封段標記走，下次提交會再更新一次。
+      // 但只有 CAS 衝突可以吞；其他錯誤要讓呼叫端看到。
+      rejectUnlessConflict(error);
     }
   }
 
@@ -467,8 +499,17 @@ export class CityLedger {
     const path = this.ackPath(sessionId, writerEpoch);
     const expected = await this.io.read(path);
     const body = `${JSON.stringify({ sessionId, writerEpoch, ackedEventSeq, journalSeq })}\n`;
-    if (expected === null) await this.create(path, body);
-    else await this.write(path, body, expected);
+    if (expected === body) return path; // 已經寫過同樣的內容
+    try {
+      if (expected === null) await this.create(path, body);
+      else await this.write(path, body, expected);
+    } catch (error) {
+      rejectUnlessConflict(error); // 兩個視窗同時寫同一個 epoch 的 ack
+      const current = await this.io.read(path);
+      if (current === body) return path;
+      if (current === null) await this.create(path, body);
+      else await this.write(path, body, current);
+    }
     return path;
   }
 

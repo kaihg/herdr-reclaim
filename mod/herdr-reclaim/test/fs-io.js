@@ -1,10 +1,11 @@
 // bun 測試用的儲存後端：node fs 模擬 herdr 的
 // `writeTextFile(path, text, expected)`（expected 不符就拒絕，而且整段比較與替換不會被打斷）。
 //
-// 這一層只在測試裡；mod 載入的程式用 herdr 的 API，不碰 node。
+// 這一層只在測試裡；mod 載入的程式用 herdr 的 API（core/host-io.js），不碰 node。
+// 它跟 host 適配層說同一種語言：快照不符一律 `CasConflict`（`expected === null` 是 "exists"）。
 import fs from "node:fs";
 import path from "node:path";
-import { StaleWrite } from "../core/ledger.js";
+import { CasConflict } from "../core/ledger.js";
 
 const readSync = (file) => {
   try {
@@ -17,7 +18,7 @@ const readSync = (file) => {
 
 /** 比較與替換在同一個 JS 時段內完成，所以兩個寫入者不會同時過關。 */
 function swap(file, text, expected) {
-  if (readSync(file) !== expected) throw new StaleWrite(file);
+  if (readSync(file) !== expected) throw new CasConflict(file, expected === null ? "exists" : "stale");
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const temp = `${file}.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`;
   fs.writeFileSync(temp, text, "utf8");

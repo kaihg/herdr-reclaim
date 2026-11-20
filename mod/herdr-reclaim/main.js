@@ -19,7 +19,8 @@ import { h_flex, v_flex } from "gpui-base";
 import { appHome, checking, readTextFile, settings, theme, writeTextFile } from "herdr";
 import { MAP_RADIUS, keyOf, projectTile } from "./core/grid.js";
 import { ingestScenario } from "./core/ingest.js";
-import { CityLedger, cityDir } from "./core/ledger.js";
+import { hostIo } from "./core/host-io.js";
+import { CasConflict, CityLedger, cityDir } from "./core/ledger.js";
 import { defaultSelection, parseUi, resolveSelection, selectionOf, serializeUi, withSelection } from "./core/selection.js";
 import { CLEAR_POINTS, readTown, readTownFromLedger, selectionDetail } from "./core/town.js";
 import { firstExpedition } from "./scenarios/first-expedition.js";
@@ -52,12 +53,12 @@ function shortId(sessionId) {
 /** mod 的資料目錄（在 herdr 的 appHome 底下）。 */
 const DATA_DIR = "data/herdr-reclaim";
 
-/** mod 端的儲存層：herdr 的 readTextFile 與 writeTextFile（CAS，expected 不符就拒絕）。 */
+/**
+ * mod 端的儲存層：herdr 的 readTextFile 與 writeTextFile，經過 host 適配層，
+ * 讓原生 host 的 CAS 衝突（原生 Error）在帳本眼裡也是 CasConflict（core/host-io.js）。
+ */
 function storageIo() {
-  return {
-    read: (path) => readTextFile(path),
-    write: (path, text, expected) => writeTextFile(path, text, expected),
-  };
+  return hostIo({ readTextFile, writeTextFile });
 }
 
 /** 情境碰到的城：一個帳本只管一座城（§13）。 */
@@ -95,14 +96,15 @@ async function loadSelection(io, town) {
   return { selection: resolveSelection(town, saved), saved: Boolean(saved) };
 }
 
-/** 讀、改、CAS 寫；另一個視窗同時寫就重讀再試一次。 */
+/** 讀、改、CAS 寫；另一個視窗同時寫就重讀再試一次。其他錯誤原樣丟出。 */
 async function saveSelection(io, selection) {
   for (let attempt = 0; attempt < 3; attempt++) {
     const before = await io.read(uiPath());
     try {
       await io.write(uiPath(), serializeUi(withSelection(parseUi(before), selection.cityId, selection)), before);
       return;
-    } catch {
+    } catch (error) {
+      if (!(error instanceof CasConflict)) throw error;
       // 另一個視窗同時寫：重讀再試。
     }
   }

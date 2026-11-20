@@ -200,6 +200,34 @@ describe("城帳本：完成、重試與 CAS", () => {
     expect(await townsOf(await open(otherDir))).toEqual(withAck);
   });
 
+  test("兩個視窗同時寫同一個 epoch 的 ack：兩個都成功，內容一致", async () => {
+    const dir = dirOf("ack-race");
+    const gate = Promise.withResolvers();
+    let arrivals = 0;
+    let released = false;
+    const io = createFileIo({
+      async beforeWrite(file, expected) {
+        if (released || !file.includes("/acks/") || expected === null) return;
+        arrivals += 1;
+        if (arrivals === 2) {
+          released = true;
+          gate.resolve();
+          return;
+        }
+        await gate.promise;
+      },
+    });
+    const a = await open(dir, io);
+    const b = await open(dir, io);
+    const applied = await a.submit((state) => expeditionOp(state, "sess-a"));
+    const ack = { sessionId: "sess-a", writerEpoch: "epoch-1", ackedEventSeq: 3, journalSeq: applied.journalSeq };
+
+    // 先把 ack 檔準備成「兩個視窗都讀到同一份舊內容」，逼出競態。
+    await a.writeAck({ ...ack, ackedEventSeq: 1 });
+    await Promise.all([a.writeAck(ack), b.writeAck(ack)]);
+    expect(await a.readAck("sess-a", "epoch-1")).toEqual(ack);
+  });
+
   test("ack 只跟在 journal 後面：回覆前中斷時 ack 晚到，重播補上而且城鎮不變", async () => {
     const dir = dirOf("ack-late");
     const ledger = await open(dir);
