@@ -5,6 +5,8 @@
 import { bfsNextTile, keyOf } from "./grid.js";
 import { planExpeditions } from "./town.js";
 import { activityKey } from "./ledger.js";
+import { planResearch } from "./research.js";
+import { RECIPES, TRADE_RATE } from "./rules.js";
 
 /** 這支 session 的紀錄有沒有碰到這座城（含 compact 前已在帳本保存的 visit）。 */
 function touchesCity(record, cityId) {
@@ -135,4 +137,78 @@ export async function redispatch(ledger, { rootSessionId, at }) {
       repo: previous.repo,
     });
   });
+}
+
+/**
+ * 加速（§7.6）：目標用「遠征身份 + generation」指定，不用座標。前提不符就整筆不扣卷、不加點。
+ * `opId` 由呼叫端決定，同一次操作重送（中斷後重試）要沿用同一個 ID 才不會重複扣卷。
+ */
+export async function processBoost(ledger, { rootSessionId, generation, scrolls, at, opId }) {
+  return ledger.submit(() => ({
+    opId: opId ?? `boost:${ledger.cityId}:${rootSessionId}:${generation}:${at}`,
+    kind: "boost",
+    at,
+    cityId: ledger.cityId,
+    rootSessionId,
+    generation,
+    scrolls,
+  }));
+}
+
+/** 市集（§7.6、§11）：同城任兩種資源 3 換 1；庫存不足時整筆不執行，不會有部分交易。 */
+export async function processTrade(ledger, { from, to, amount, at, opId }) {
+  return ledger.submit(() => ({
+    opId: opId ?? `trade:${ledger.cityId}:${from}:${to}:${amount}:${at}`,
+    kind: "trade",
+    at,
+    cityId: ledger.cityId,
+    from,
+    to,
+    amount,
+    rate: TRADE_RATE,
+  }));
+}
+
+/**
+ * 蓋房（§7.6、§8.1）：配方由規則表決定，實付資源跟著 entry 一起存下來。
+ * 呼叫端只指定配方名稱；`costs` 在這裡從規則表複製，precheck 會核對它跟規則表一致。
+ */
+export async function processBuild(ledger, { rootSessionId, generation, recipe, at, opId }) {
+  const definition = RECIPES[recipe];
+  return ledger.submit(() => ({
+    opId: opId ?? `build:${ledger.cityId}:${rootSessionId}:${generation}:${recipe}:${at}`,
+    kind: "build",
+    at,
+    cityId: ledger.cityId,
+    rootSessionId,
+    generation,
+    recipe,
+    costs: definition ? { ...definition.costs } : null,
+  }));
+}
+
+/**
+ * 研究（§7.4）：把可以結算的回合寫成帳本的一筆 entry。operation ID 由回合身份決定，
+ * 所以重播同一份活動與證據不會再次發放；已經落帳的進度不因為來源晚到而倒扣。
+ * `activities` 要用帳本裡保存的活動紀錄（adapter 的快照會被 ack compact，帳本不會）。
+ */
+export async function ingestResearch(ledger, { activities, commits, cityId = ledger.cityId }) {
+  const plan = planResearch({ activities, commits, cityId });
+  const state = await ledger.state();
+  const results = [];
+  for (const settlement of plan.settlements) {
+    if (state.opSeqs.has(settlement.opId)) continue;
+    results.push(await ledger.submit(() => ({
+      opId: settlement.opId,
+      kind: "research",
+      at: settlement.at,
+      cityId,
+      rootSessionId: settlement.rootSessionId,
+      sessionId: settlement.sessionId,
+      writerEpoch: settlement.writerEpoch,
+      round: settlement.round,
+      tokens: settlement.tokens,
+    })));
+  }
+  return { ...plan, results };
 }
