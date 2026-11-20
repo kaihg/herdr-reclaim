@@ -274,7 +274,7 @@ describe("派系：投入最多的 provider（§9）", () => {
     expect(tileOf(town, ROOT).faction.name).toBe("OpenAI"); // 沒有同分，child 的投入最多
 
     const none = tileOf(readTown({ repoFacts, activities: [rootWithUsage(ROOT, 10)] }), ROOT);
-    expect(none.faction).toEqual({ id: "none", name: "無派系", provider: null, basis: "tokens", reason: "沒有 provider 用量" });
+    expect(none.faction).toEqual({ id: "none", name: "無派系", provider: null, basis: "tokens", reason: "沒有可歸戶的 provider 用量" });
   });
 
   test("同分且 root 沒有用量時，取決於固定的排序（可重播）", () => {
@@ -384,5 +384,92 @@ describe("派系與額度不改變數值（§9、§17.1 情境 8）", () => {
     expect(a.faction.name).toBe("Anthropic");
     expect(b.faction.name).toBe("無派系");
     expect(formatClock(0)).toBe("未知");
+  });
+});
+
+describe("完全未知的用量不算投入（QA 回歸：欄位全未知的佔位 0）", () => {
+  /** §6.1 的用量事件，但四個 token 欄位都沒有回報：值是正規化的 0 佔位。 */
+  const allUnknown = (at, provider) => usageEvent(at, provider, {
+    unknownFields: ["inputNonCache", "output", "cacheRead", "cacheWrite"],
+    costUnknownEntries: 1,
+  });
+  const detailOf = (activities, rootSessionId = ROOT) =>
+    selectionDetail(readTown({ repoFacts, activities }), { kind: "expedition", cityId: CITY, rootSessionId, generation: 1 });
+
+  test("只有完全未知的用量時：無派系、投入標成未知、主要行會也是無派系", () => {
+    const root = rootWithUsage(ROOT, 10, [allUnknown(T(60_000), "anthropic")]);
+    const town = readTown({ repoFacts, activities: [root] });
+
+    expect(tileOf(town, ROOT).faction).toEqual({
+      id: "none",
+      name: "無派系",
+      provider: null,
+      basis: "tokens",
+      reason: "沒有可歸戶的 provider 用量",
+    });
+    expect(tileOf(town, ROOT).investment.providers[0].measured).toBe(false);
+    expect(town.cities[0].guild).toMatchObject({ name: "無派系", provider: null });
+
+    const detail = detailOf([root]);
+    expect(detail.faction.name).toBe("無派系");
+    expect(detail.investmentNote).toBe("還沒有可歸戶的 provider 用量");
+    expect(investmentRows(tileOf(town, ROOT).investment)).toEqual([
+      { provider: "anthropic", name: "Anthropic", value: "未知（欄位未回報）", share: 0, measured: false, unknownFields: ["cacheRead", "cacheWrite", "inputNonCache", "output"] },
+    ]);
+  });
+
+  test("一個全未知、另一個全已知時，已知的那個勝出（不會因為同分而取 root provider）", () => {
+    const root = rootWithUsage(ROOT, 10, [
+      allUnknown(T(60_000), "anthropic"),
+      usageEvent(T(120_000), "openai-codex", { inputNonCache: 400, output: 20, costKnown: 1 }),
+    ]);
+    const tile = tileOf(readTown({ repoFacts, activities: [root] }), ROOT);
+
+    expect(tile.faction.name).toBe("OpenAI");
+    expect(tile.faction.provider).toBe("openai-codex");
+    // 有一筆未知（另一個 provider 的欄位沒回報）時整組就用 token 基準，但勝出的仍是有數字的 OpenAI。
+    expect(tile.faction.basis).toBe("tokens");
+    expect(investmentRows(tile.investment).find((row) => row.provider === "openai-codex")).toMatchObject({ measured: true, share: 100 });
+  });
+
+  test("全未知的 root ＋ 已知的 child：child 的 provider 才是派系（反過來也一樣）", () => {
+    const root = rootWithUsage(ROOT, 10, [allUnknown(T(60_000), "anthropic")]);
+    const child = activity({
+      sessionId: CHILD,
+      role: "child",
+      interactive: false,
+      parentSessionId: ROOT,
+      events: [visitStart(T(30_000)), intervalOpen(T(30_000)), usageEvent(T(60_000), "openai-codex", { inputNonCache: 40, costKnown: 0, costUnknownEntries: 1 }), intervalClose(T(60_000))],
+    });
+    expect(tileOf(readTown({ repoFacts, activities: [root, child] }), ROOT).faction.name).toBe("OpenAI");
+
+    const knownRoot = rootWithUsage(ROOT, 10, [usageEvent(T(60_000), "anthropic", { inputNonCache: 50, costKnown: 0, costUnknownEntries: 1 })]);
+    const unknownChild = activity({
+      sessionId: CHILD,
+      role: "child",
+      interactive: false,
+      parentSessionId: ROOT,
+      events: [visitStart(T(30_000)), intervalOpen(T(30_000)), allUnknown(T(60_000), "openai-codex"), intervalClose(T(60_000))],
+    });
+    expect(tileOf(readTown({ repoFacts, activities: [knownRoot, unknownChild] }), ROOT).faction.name).toBe("Anthropic");
+  });
+
+  test("未知與已知混合時，比較基準與限制的文字正確", () => {
+    const mixed = rootWithUsage(ROOT, 10, [
+      allUnknown(T(30_000), "anthropic"),
+      usageEvent(T(60_000), "anthropic", { inputNonCache: 500, costKnown: 5 }),
+      usageEvent(T(120_000), "openai-codex", { inputNonCache: 400, costKnown: 0, costUnknownEntries: 1 }),
+    ]);
+    const tile = tileOf(readTown({ repoFacts, activities: [mixed] }), ROOT);
+    expect(tile.investment.basis).toBe("tokens");
+    expect(basisNote(tile.investment)).toBe("成本未知：改用 non-cache input + output 比較");
+    // 同一個 provider 的已知與未知相加：500（已知）＋ 0（未知佔位），有數字的 anthropic 勝過 400 的 openai-codex。
+    expect(tile.faction.name).toBe("Anthropic");
+    expect(tile.investment.providers.map((entry) => entry.measured)).toEqual([true, true]);
+
+    const allKnown = rootWithUsage(ROOT, 10, [usageEvent(T(60_000), "anthropic", { inputNonCache: 100, costKnown: 5 })]);
+    expect(basisNote(tileOf(readTown({ repoFacts, activities: [allKnown] }), ROOT).investment)).toBe("費用以 API 等值比較");
+    const none = rootWithUsage(ROOT, 10, [allUnknown(T(60_000), "anthropic")]);
+    expect(basisNote(tileOf(readTown({ repoFacts, activities: [none] }), ROOT).investment)).toBe("還沒有可歸戶的 provider 用量");
   });
 });
