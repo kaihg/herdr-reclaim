@@ -79,15 +79,17 @@ refuse_real_codex() {
 
 CODEX_HOME_ARG=""
 UNINSTALL=0
+ALLOW_REAL=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --codex-home) CODEX_HOME_ARG="${2:-}"; shift 2 ;;
     --uninstall) UNINSTALL=1; shift ;;
+    --allow-real-codex-home) ALLOW_REAL=1; shift ;;
     *) printf 'unknown argument: %s\n' "$1" >&2; exit 2 ;;
   esac
 done
 
-[ -n "$CODEX_HOME_ARG" ] || { printf 'usage: install.sh --codex-home DIR [--uninstall]\n' >&2; exit 2; }
+[ -n "$CODEX_HOME_ARG" ] || { printf 'usage: install.sh --codex-home DIR [--uninstall] [--allow-real-codex-home]\n' >&2; exit 2; }
 CODEX_HOME_ARG=$(expand_home "$CODEX_HOME_ARG")
 [ -d "$CODEX_HOME_ARG" ] || { printf 'codex home does not exist: %s\n' "$CODEX_HOME_ARG" >&2; exit 2; }
 TARGET=$(real_path "$CODEX_HOME_ARG")
@@ -100,12 +102,15 @@ ENV_CODEX=""
 [ -n "${CODEX_HOME:-}" ] && ENV_CODEX=$(real_path "$CODEX_HOME")
 
 # 真實使用者的 ~/.codex（即使 $HOME 被改掉）、有效 $HOME/.codex、$CODEX_HOME
-# 都不能碰；子路徑也一樣拒絕。
-for candidate in "$REAL_CODEX" "$HOME_CODEX" "$ENV_CODEX"; do
-  [ -n "$candidate" ] || continue
-  if [ "$TARGET" = "$candidate" ]; then refuse_real_codex; fi
-  case "$TARGET" in "$candidate"/*) refuse_real_codex ;; esac
-done
+# 預設都不能碰；子路徑也一樣拒絕。使用者明確要裝進真實 Codex 時，必須自己傳
+# `--allow-real-codex-home`（測試與自動化流程不得傳）。
+if [ "$ALLOW_REAL" != 1 ]; then
+  for candidate in "$REAL_CODEX" "$HOME_CODEX" "$ENV_CODEX"; do
+    [ -n "$candidate" ] || continue
+    if [ "$TARGET" = "$candidate" ]; then refuse_real_codex; fi
+    case "$TARGET" in "$candidate"/*) refuse_real_codex ;; esac
+  done
+fi
 command -v jq >/dev/null 2>&1 || { printf 'jq is required\n' >&2; exit 2; }
 
 

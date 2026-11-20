@@ -136,4 +136,31 @@ describe("codex-adapter 安裝器的真實 Codex home 守衛", () => {
       fs.rmSync(home, { recursive: true, force: true });
     }
   });
+
+  test("使用者明確傳 --allow-real-codex-home 才能裝進（被判定為真實的）$HOME/.codex；沒傳一律拒絕", () => {
+    const home = makeTemp("optin");
+    try {
+      const fakeHome = path.join(home, "home");
+      const codex = path.join(fakeHome, ".codex");
+      fs.mkdirSync(codex, { recursive: true });
+      fs.writeFileSync(path.join(codex, "hooks.json"), JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: "echo other" }] }] } }));
+      const env = { ...process.env, HOME: fakeHome, XDG_CONFIG_HOME: undefined };
+
+      // 沒傳旗標：拒絕，原檔不動。
+      refuse("--codex-home", codex, env);
+      expect(JSON.parse(fs.readFileSync(path.join(codex, "hooks.json"), "utf8")).hooks.Stop).toHaveLength(1);
+
+      // 傳了旗標：安裝，且既有 hook 項目原樣保留（只附加）。
+      expect(run(["--codex-home", codex, "--allow-real-codex-home"], env).status).toBe(0);
+      const hooks = JSON.parse(fs.readFileSync(path.join(codex, "hooks.json"), "utf8"));
+      expect(hooks.hooks.Stop).toHaveLength(2);
+      expect(hooks.hooks.Stop[0].hooks[0].command).toBe("echo other");
+
+      // 卸載同樣要旗標，並且只移除我們自己的項目。
+      expect(run(["--codex-home", codex, "--uninstall", "--allow-real-codex-home"], env).status).toBe(0);
+      expect(JSON.parse(fs.readFileSync(path.join(codex, "hooks.json"), "utf8")).hooks.Stop).toHaveLength(1);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
 });
