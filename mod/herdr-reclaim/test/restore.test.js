@@ -70,7 +70,7 @@ describe("帳本重建城鎮", () => {
     expect(after).toEqual(before);
     expect(after.cities[0].tiles.map((tile) => [tile.x, tile.y])).toEqual([
       [0, -1],
-      [1, 0],
+      [1, -1],
     ]);
   });
 

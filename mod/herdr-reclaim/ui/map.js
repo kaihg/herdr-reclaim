@@ -11,7 +11,7 @@
 import { Background, PathBuilder, div } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
 
-import { MAP_RADIUS, cellAtEvent, contentSize, keyOf, originInContent, projectTile } from "../core/grid.js";
+import { CENTER, CENTER_CELLS, MAP_RADIUS, cellAtEvent, contentSize, keyOf, originInContent, projectTile } from "../core/grid.js";
 import { GROUND_MOCK, PLOT_DIAMOND, buildingOf, buildingPolygons, factionStyle, groundOf, legendGroups } from "./assets.js";
 
 const LOCAL = { left: 0, top: 0 };
@@ -24,7 +24,7 @@ const LOCAL_CELL = { x: 0, y: 0 };
  * （選取或歷程跳轉），由呼叫端設定一次、這裡消費一次。
  */
 export function mapView({
-  city, tiles, revealed, selection, theme: t, tile, legendOpen, camera,
+  city, tiles, revealed, selection, theme: t, tile, legendOpen, camera, devMode = false,
   radius = MAP_RADIUS, onToggleLegend, onPick, onPan, onLegendSize,
 }) {
   const size = contentSize(radius, tile);
@@ -46,7 +46,7 @@ export function mapView({
     fullPath(base.fog, Background.pattern_slash(t.dim, 1, 4), size, camera),
     fullPath(stroked(open, tile, origin), t.background, size, camera),
     fullPath(base.outline, t.border, size, camera),
-    centerCell(city, t, tile, origin, radius, onPick, camera),
+    ...centerBlock(city, t, tile, origin, radius, onPick, camera),
     ...occupied.map((entry) => cell(entry, selection, t, tile, origin, radius, onPick, camera)),
   ];
   return div()
@@ -58,11 +58,11 @@ export function mapView({
     // 雙軸捲動：滾輪與觸控板的事件都在這裡收（delta 是裝置回報的像素）。
     .on_scroll_wheel((event, cx) => onPan(event.delta, cx))
     .child(div().id("map-view").relative().size_full().children(children))
-    .child(legendPanel(t, legendOpen, onToggleLegend, onLegendSize));
+    .child(legendPanel(t, legendOpen, onToggleLegend, onLegendSize, devMode));
 }
 
 /** 圖例（§14 的素材與狀態）：只解釋畫面看得到的 mock，不新增玩法。 */
-function legendPanel(t, open, onToggle, onSize) {
+function legendPanel(t, open, onToggle, onSize, devMode) {
   const groups = legendGroups();
   const row = (text, color) => div().text_size(9).text_color(color).truncate().child(text);
   const swatch = (token) => div().size(8).flex_none().rounded(2).bg(t[token] ?? t.muted);
@@ -86,7 +86,7 @@ function legendPanel(t, open, onToggle, onSize) {
     // 圖例自己回報量到的大小：可見區的判定要用實際覆蓋層尺寸，不能用假設值。
     .on_size_change((size, cx) => onSize(size, cx))
     .child(h_flex().gap(6).items_center()
-      .child(row("城市地圖 · 素材 mock（向量）", t.dim))
+      .child(row(devMode ? "城市地圖 · 素材 mock（向量）" : "城市地圖", t.dim))
       .child(row(open ? "▾ 收合" : "▸ 展開", t.accent)))
     .when(open, (element) => element.children([
       h_flex().gap(8).items_center().flex_wrap()
@@ -99,7 +99,7 @@ function legendPanel(t, open, onToggle, onSize) {
       h_flex().gap(8).items_center().flex_wrap()
         .child(row("派系", t.dim))
         .children(groups.faction.map((faction) => entry(faction.token, faction.label))),
-      row("其他：▨ 迷霧 · ⚑ 來源不明（左側）· 已撤回／已封存只留在左側與詳情", t.dim),
+      row("其他：▨ 迷霧 · 空白格＝已揭開的空地 · ⚑ 來源不明（左側）· 已撤回／已封存只留在左側與詳情", t.dim),
     ]));
 }
 
@@ -189,13 +189,42 @@ function cellBox(cell, tile, origin, radius, onPick, camera) {
     });
 }
 
-function centerCell(city, t, tile, origin, radius, onPick, camera) {
+/**
+ * 城鎮中心是 2×2 四格：每一格自己收事件（點哪一格都是選到城鎮中心），外圈用強調色描出
+ * 整塊的輪廓。每格只畫朝外的兩條邊（頂點序列由 CENTER_EDGES 決定），中間的十字線是細線。
+ */
+const CENTER_EDGES = {
+  "0,0": ["left", "top", "right"],
+  "1,0": ["top", "right", "bottom"],
+  "0,1": ["bottom", "left", "top"],
+  "1,1": ["right", "bottom", "left"],
+};
+
+function centerBlock(city, t, tile, origin, radius, onPick, camera) {
   const points = localDiamond(tile);
-  return cellBox(city.center, tile, origin, radius, onPick, camera).children([
+  const vertex = { top: points[0], right: points[1], bottom: points[2], left: points[3] };
+  const cells = CENTER_CELLS.map((cellSpot) => cellBox(cellSpot, tile, origin, radius, onPick, camera).children([
     tilePath(fillPath(points), t.selected, tile),
-    tilePath(PathBuilder.stroke(2.5).add_polygon(points).close().build(), t.accent, tile),
-    markBox(city.center.label, t, tile, t.accent),
-  ]);
+    tilePath(PathBuilder.stroke(1).add_polygon(points).close().build(), t.muted, tile),
+    tilePath(
+      PathBuilder.stroke(2.5).add_polygon(CENTER_EDGES[keyOf(cellSpot)].map((name) => vertex[name]), false).build(),
+      t.accent,
+      tile,
+    ),
+  ]));
+  // 標籤壓在整塊的正中央（四格交會的那個頂點）；沒有事件，不擋點擊。
+  const anchor = projectTile(CENTER, tile);
+  const label = div()
+    .absolute()
+    .left(camera.x + origin.left + anchor.left)
+    .top(camera.y + origin.top + anchor.top + tile.h - labelSize(tile) - 1)
+    .w(tile.w)
+    .text_center()
+    .text_size(labelSize(tile) + 1)
+    .font_semibold()
+    .text_color(t.accent)
+    .child(city.center.label);
+  return [...cells, label];
 }
 
 function cell(entry, selection, t, tile, origin, radius, onPick, camera) {

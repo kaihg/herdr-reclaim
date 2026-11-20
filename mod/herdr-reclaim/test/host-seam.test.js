@@ -117,7 +117,7 @@ describe("host 接縫：真實 host 的 CAS 衝突", () => {
     expect(results.map((result) => result.status)).toEqual(["applied", "applied"]);
     const state = await a.state();
     expect(state.tiles).toHaveLength(2);
-    expect(new Set(state.tiles.map((tile) => `${tile.x},${tile.y}`))).toEqual(new Set(["0,-1", "1,0"]));
+    expect(new Set(state.tiles.map((tile) => `${tile.x},${tile.y}`))).toEqual(new Set(["0,-1", "1,-1"]));
     const appends = [...host.files.values()].join("\n").trim().split("\n").filter((line) => line.includes("expedition"));
     expect(appends).toHaveLength(2); // 沒有重複附加
   });

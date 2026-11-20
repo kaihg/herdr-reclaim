@@ -26,8 +26,9 @@ export function guildBlock(city, quotas, t) {
 /**
  * 右側詳情的投入區（§9）：依 provider 排行的投入、比較用的基準、限制與未知欄位。
  * 未知欄位來自 #11 的 usage.unknownFields；這裡明講「未知」，不當成 0。
+ * 比較基準的限制與未知欄位清單是工程說明，`dev`（開發模式）才顯示。
  */
-export function investmentSection(detail, t) {
+export function investmentSection(detail, t, dev = false) {
   const rows = investmentRows(detail.investment).map((row) =>
     h_flex()
       .w_full()
@@ -40,8 +41,8 @@ export function investmentSection(detail, t) {
   return [
     div().text_size(10).text_color(t.dim).child("投入（依 provider）"),
     ...(rows.length ? rows : [div().text_size(9).text_color(t.muted).child("沒有可歸戶的 provider 用量")]),
-    div().text_size(9).text_color(t.muted).child(detail.investmentNote),
-    unknownFields.length
+    dev ? div().text_size(9).text_color(t.muted).child(detail.investmentNote) : null,
+    dev && unknownFields.length
       ? div().text_size(9).text_color(t.muted).child(`未知欄位：${unknownFields.join("・")}（不補 0）`)
       : null,
     div().text_size(10).text_color(t.dim).child("建築派系"),

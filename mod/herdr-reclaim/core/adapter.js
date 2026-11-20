@@ -54,7 +54,7 @@ export function citiesOf(activities) {
 }
 
 /**
- * 開城時問 repo 有沒有 HEAD：舊城區與新村的唯一差別（§4）。
+ * 開城時問 repo 有沒有 HEAD：只決定城鎮中心用哪一張圖（`center.kind`），名字一律是「城鎮中心」（§4）。
  * 這是設定檔等級的唯讀事實，拿不到就不猜（顯示「城鎮中心」）。
  */
 export async function repoFactsOf(io, cityIds) {

@@ -145,7 +145,7 @@ describe("城帳本：完成、重試與 CAS", () => {
     expect(results.map((result) => result.status)).toEqual(["applied", "applied"]);
     const state = await a.state();
     expect(state.tiles).toHaveLength(2);
-    expect(new Set(state.tiles.map((tile) => `${tile.x},${tile.y}`))).toEqual(new Set(["0,-1", "1,0"]));
+    expect(new Set(state.tiles.map((tile) => `${tile.x},${tile.y}`))).toEqual(new Set(["0,-1", "1,-1"]));
     expect((await townsOf(a)).cities[0].tiles).toHaveLength(2);
   });
 

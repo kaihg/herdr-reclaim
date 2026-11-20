@@ -71,7 +71,7 @@ describe("城鎮讀取模型", () => {
     expect(reversed).toEqual(once);
   });
 
-  test("空城依序加入五個 root，分別落在北、東、南、西與中心北側第二格", () => {
+  test("空城依序加入五個 root：從中心 2×2 相接的 8 格依北、東、南、西開始，中心四格不會被佔走", () => {
     const town = readTown({
       repoFacts: { [CITY.commonDir]: { hadHead: false } },
       activities: [1, 2, 3, 4, 5].map((n) => session({ sessionId: cityId(n) })),
@@ -80,13 +80,13 @@ describe("城鎮讀取模型", () => {
     const city = town.cities[0];
     expect(city.tiles.map((tile) => [tile.x, tile.y])).toEqual([
       [0, -1],
-      [1, 0],
-      [0, 1],
-      [-1, 0],
-      [0, -2],
+      [1, -1],
+      [2, 0],
+      [2, 1],
+      [1, 2],
     ]);
-    // 中央是城鎮中心，永遠不會被遠征佔走。
-    expect(city.center).toEqual({ x: 0, y: 0, kind: "founded", label: "新村" });
+    // 新 repo 與舊 repo 的中心同名「城鎮中心」；kind 只記得開城時有沒有 HEAD。
+    expect(city.center).toEqual({ x: 0, y: 0, kind: "founded", label: "城鎮中心" });
   });
 
   test("print、headless 與 task child 不建格；互動 fork 建立自己的格", () => {
@@ -95,7 +95,7 @@ describe("城鎮讀取模型", () => {
     expect(town.cities.length).toBe(1);
     expect(town.cities[0].tiles.map((tile) => [tile.x, tile.y, tile.rootSessionId])).toEqual([
       [0, -1, ROOT_SESSION_ID],
-      [1, 0, FORK_SESSION_ID],
+      [1, -1, FORK_SESSION_ID],
     ]);
     const owners = town.cities[0].tiles.map((tile) => tile.rootSessionId);
     expect(owners).not.toContain(CHILD_SESSION_ID);
@@ -110,7 +110,7 @@ describe("城鎮讀取模型", () => {
     expect(root.points).toBe(74);
     expect(root.status).toBe("active");
 
-    const fork = tileAt(town, 1, 0);
+    const fork = tileAt(town, 1, -1);
     expect(fork.workMs).toBe(600_000); // fork 自己的 10 分鐘
     expect(fork.points).toBe(10);
     expect(fork.status).toBe("idle");
@@ -166,7 +166,7 @@ describe("C 版遠征指揮桌要用的資料", () => {
     expect(city.name).toBe("herdr-reclaim");
     expect(city.resources).toEqual({ wood: 0, stone: 0, iron: 0, parchment: 0 }); // 收成（#3）之前是空的
     expect(city.guild).toBe(null); // 沒有額度來源時畫面顯示未知（§9）
-    expect(city.center).toEqual({ x: 0, y: 0, kind: "oldtown", label: "舊城區" });
+    expect(city.center).toEqual({ x: 0, y: 0, kind: "oldtown", label: "城鎮中心" });
     expect(city.tiles.length).toBe(2);
   });
 
@@ -187,23 +187,45 @@ describe("C 版遠征指揮桌要用的資料", () => {
     expect(byExpedition.pointsTarget).toBe(100);
     expect(byExpedition.fields).toContainEqual({ label: "工作時間", value: "1 小時 14 分" });
 
-    const fork = selectionDetail(town, { kind: "tile", cityId: CITY.commonDir, x: 1, y: 0 });
+    const fork = selectionDetail(town, { kind: "tile", cityId: CITY.commonDir, x: 1, y: -1 });
     expect(fork.title).toBe(`遠征 ${FORK_SESSION_ID.slice(0, 8)} · 第 1 代`);
     expect(fork.statusLabel).toBe("駐紮");
   });
 
-  test("選取中央格顯示城市與舊城區；迷霧格沒有內容", () => {
+  test("選取中心 2×2 的任一格都顯示城鎮中心；旁邊一格是已揭開的空地；更遠是迷霧", () => {
     const town = readTown(firstExpedition);
-    const center = selectionDetail(town, { kind: "tile", cityId: CITY.commonDir, x: 0, y: 0 });
+    for (const [x, y] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
+      const center = selectionDetail(town, { kind: "tile", cityId: CITY.commonDir, x, y });
+      expect(center.kind).toBe("center");
+      expect(center.title).toBe("herdr-reclaim · 城鎮中心");
+      expect(center.fields).toContainEqual({ label: "遠征", value: "2 支" });
+    }
+    // 中心塊上下左右相接的 8 格：沒有遠征的 6 格看得到地面（北側兩格被這兩支遠征佔了）。
+    for (const [x, y] of [[2, 0], [2, 1], [1, 2], [0, 2], [-1, 1], [-1, 0]]) {
+      expect(selectionDetail(town, { kind: "tile", cityId: CITY.commonDir, x, y })).toMatchObject({
+        kind: "open",
+        title: "空地",
+        fields: [],
+      });
+    }
+    // 斜角不算相鄰；更遠的格子還在迷霧裡。
+    for (const [x, y] of [[-1, -1], [2, 2], [3, 3]]) {
+      expect(selectionDetail(town, { kind: "tile", cityId: CITY.commonDir, x, y })).toMatchObject({
+        kind: "fog",
+        title: "迷霧",
+        fields: [],
+      });
+    }
+  });
 
-    expect(center.kind).toBe("center");
-    expect(center.title).toBe("herdr-reclaim · 舊城區");
-    expect(center.fields).toContainEqual({ label: "遠征", value: "2 支" });
-    expect(selectionDetail(town, { kind: "tile", cityId: CITY.commonDir, x: 3, y: 3 })).toMatchObject({
-      kind: "fog",
-      title: "迷霧",
-      fields: [],
-    });
+  test("工程資訊的欄位帶 dev 旗標，玩家看得懂的欄位沒有", () => {
+    const town = readTown(firstExpedition);
+    const byExpedition = selectionDetail(town, { kind: "expedition", cityId: CITY.commonDir, rootSessionId: ROOT_SESSION_ID });
+    const plain = byExpedition.fields.filter((field) => !field.dev).map((field) => field.label);
+    const dev = byExpedition.fields.filter((field) => field.dev).map((field) => field.label);
+    expect(plain).toEqual(expect.arrayContaining(["工作時間", "派系", "土地"]));
+    expect(dev).toEqual(expect.arrayContaining(["座標", "CLI", "session", "checkout", "點數"]));
+    expect(plain).not.toContain("session");
   });
 
   test("3/4 投影與邏輯座標分開：中心在原點，北邊在北、東邊在東", () => {

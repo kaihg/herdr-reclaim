@@ -10,7 +10,7 @@
 export const UI_SCHEMA = 1;
 
 export function emptyUi() {
-  return { schema: UI_SCHEMA, selections: {} };
+  return { schema: UI_SCHEMA, selections: {}, dev: false };
 }
 
 export function parseUi(text) {
@@ -18,14 +18,19 @@ export function parseUi(text) {
   try {
     const data = JSON.parse(text);
     if (!data || typeof data !== "object" || !data.selections || typeof data.selections !== "object") return emptyUi();
-    return { schema: UI_SCHEMA, selections: data.selections };
+    return { schema: UI_SCHEMA, selections: data.selections, dev: data.dev === true };
   } catch {
     return emptyUi(); // 壞掉的 UI 檔不影響城鎮，回到預設選取
   }
 }
 
 export function withSelection(ui, cityId, selection) {
-  return { schema: UI_SCHEMA, selections: { ...ui.selections, [cityId]: selection } };
+  return { ...ui, schema: UI_SCHEMA, selections: { ...ui.selections, [cityId]: selection } };
+}
+
+/** 開發模式（顯示工程資訊）也是畫面自己的狀態，跟選取放在同一個檔案。 */
+export function withDev(ui, dev) {
+  return { ...ui, schema: UI_SCHEMA, dev: dev === true };
 }
 
 export function selectionOf(ui, cityId) {
@@ -33,21 +38,12 @@ export function selectionOf(ui, cityId) {
 }
 
 /**
- * 這一台機器可能有很多座城（不同 repo／worktree），畫面一次只顯示一座。
- * 以「有存過選取的那一座」為準（依城的排序取第一個），沒有存過才回 null
- * （呼叫端再退回預設選取）。少了這一步，多城時永遠只會看得到第一座城。
+ * 指揮桌一打開右邊就有東西：預設選第一支遠征。畫面一次顯示一座城（由目前的 space 決定），
+ * `cityId` 指定要看哪一座；沒指定或找不到就用第一座。
  */
-export function savedSelection(town, ui) {
-  for (const city of town?.cities ?? []) {
-    const saved = selectionOf(ui, city.cityId);
-    if (saved) return saved;
-  }
-  return null;
-}
-
-/** 指揮桌一打開右邊就有東西：預設選第一支遠征。 */
-export function defaultSelection(town) {
-  const city = town?.cities?.[0] ?? null;
+export function defaultSelection(town, cityId) {
+  const cities = town?.cities ?? [];
+  const city = (cityId ? cities.find((candidate) => candidate.cityId === cityId) : null) ?? cities[0] ?? null;
   const first = city?.tiles?.reduce((latest, tile) =>
     !latest || tile.generation > latest.generation ? tile : latest, null) ?? null;
   return first
@@ -59,7 +55,7 @@ export function defaultSelection(town) {
  * 還原後的選取：城或格子已經不在（例如帳本換了一座城）就回到預設，
  * 不讓畫面停在一個永遠找不到的選取上。
  */
-export function resolveSelection(town, saved) {
+export function resolveSelection(town, saved, cityId) {
   if (saved && typeof saved === "object") {
     const city = (town?.cities ?? []).find((candidate) => candidate.cityId === saved.cityId) ?? null;
     if (city) {
@@ -81,7 +77,7 @@ export function resolveSelection(town, saved) {
       }
     }
   }
-  return defaultSelection(town);
+  return defaultSelection(town, cityId ?? saved?.cityId);
 }
 
 export function serializeUi(ui) {

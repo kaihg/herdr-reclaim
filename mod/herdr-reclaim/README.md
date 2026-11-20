@@ -16,6 +16,7 @@ herdr 的開墾城鎮 mod。這個資料夾是 mod 本體：一個「遠征指�
 | `core/provider-stats.js` | 額度、投入與建築派系（§9）：S5 形狀的 provider 回報 → 顯示模型；一格依 provider 分開的投入與派系；不改變任何數值 |
 | `ui/standing.js` | 主要行會、額度與派系的畫面（上方那條、右側投入區、中央的行會人力清單） |
 | `core/grid.js` | 邏輯座標、BFS 選地與 3/4 投影（投影與規則分開） |
+| `core/space-city.js` | 目前的 space 對應哪一座城：用資料夾（repo 與 worktree checkout）比對，切換 space 城就跟著換 |
 | `core/host-io.js` | 儲存介面的 host 適配層：herdr 的原生 CAS 衝突 → `CasConflict`（見下） |
 | `core/selection.js` | 選取狀態的保存（不是城的帳本；見下） |
 | `scenarios/first-expedition.js` | `herdr-app check` 與固定情境測試用資料；正式 runtime 不拿它入帳 |

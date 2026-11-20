@@ -1,8 +1,32 @@
 // 邏輯格與 3/4 投影分開（proposal §4、§1）：BFS 選地只看邏輯座標，
 // 螢幕位置由 projectTile 另外算，之後換投影不用動規則。
 
-/** 城鎮中心：不分配給任何遠征，固定是城市的心臟。 */
+/**
+ * 城鎮中心：2×2 共四格，不分配給任何遠征，固定是城市的心臟。
+ * `CENTER` 是這一塊的錨點（左上角的邏輯座標），標籤與詳情都掛在它身上。
+ */
 export const CENTER = { x: 0, y: 0 };
+export const CENTER_CELLS = [
+  { x: 0, y: 0 },
+  { x: 1, y: 0 },
+  { x: 0, y: 1 },
+  { x: 1, y: 1 },
+];
+
+export function isCenterCell({ x, y }) {
+  return (x === 0 || x === 1) && (y === 0 || y === 1);
+}
+
+/**
+ * 中心塊上下左右相接的 8 格（§4 的相鄰只算 4 向，斜角不算）：開城就是已揭開的空地，
+ * 依北、東、南、西排，同一側由左到右、由上到下；這個順序也是 BFS 選地的起點順序。
+ */
+export const CENTER_RING = [
+  { x: 0, y: -1 }, { x: 1, y: -1 },
+  { x: 2, y: 0 }, { x: 2, y: 1 },
+  { x: 1, y: 2 }, { x: 0, y: 2 },
+  { x: -1, y: 1 }, { x: -1, y: 0 },
+];
 
 /** 4 鄰居，順序就是「距離相同時依北、東、南、西」（§4）。 */
 export const DIRECTIONS = [
@@ -26,14 +50,13 @@ export function keyOf({ x, y }) {
 }
 
 /**
- * 最近的未佔用格：從中心起 BFS，距離相同時依北、東、南、西（§4）。
- * 中心自己永遠不算可用格；空城的第一支遠征因此拿到 (0, -1)。
+ * 最近的未佔用格：從中心塊相接的 8 格起 BFS，距離相同時依北、東、南、西（§4）。
+ * 中心的四格永遠不算可用格；空城的第一支遠征因此拿到 (0, -1)。
  */
 export function bfsNextTile(isTaken) {
-  const seen = new Set([keyOf(CENTER)]);
+  const seen = new Set(CENTER_CELLS.map(keyOf));
   const queue = [];
-  for (const step of DIRECTIONS) {
-    const spot = { x: CENTER.x + step.x, y: CENTER.y + step.y };
+  for (const spot of CENTER_RING) {
     seen.add(keyOf(spot));
     queue.push(spot);
   }
@@ -48,6 +71,21 @@ export function bfsNextTile(isTaken) {
     }
   }
   throw new Error("找不到可用的格子");
+}
+
+/**
+ * 已揭開（看得到地面）的格子鍵：中心塊與它相接的 8 格從開城就是；
+ * 之後每一格達到 100 點（已開墾／已建）時，它自己和上下左右 4 格也揭開（§4）。
+ * 只回傳「看得到」的集合：有沒有遠征在上面是另一件事。
+ */
+export function revealedKeys(tiles = []) {
+  const revealed = new Set([...CENTER_CELLS, ...CENTER_RING].map(keyOf));
+  for (const tile of tiles) {
+    if (tile.landStage !== "cleared" && tile.landStage !== "built") continue;
+    revealed.add(keyOf(tile));
+    for (const step of DIRECTIONS) revealed.add(keyOf({ x: tile.x + step.x, y: tile.y + step.y }));
+  }
+  return revealed;
 }
 
 /** 邏輯座標 → 畫面上的位移（相對於中心那格）。 */

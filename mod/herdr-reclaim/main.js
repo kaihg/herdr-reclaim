@@ -16,19 +16,20 @@
 // 選取狀態不進城的帳本（見 core/selection.js 的說明），存在 mod 資料目錄下的小檔案。
 import { View, div } from "gpui-kit";
 import { InputState, h_flex, v_flex } from "gpui-base";
-import { appHome, checking, exec, readTextFile, settings, theme, watchFolder, writeTextFile } from "herdr";
+import { appHome, checking, exec, panes, props, readTextFile, settings, spaces, theme, watchFolder, writeTextFile } from "herdr";
 import { ADAPTER_DIR, activityDir, adapterRoot, citiesOf, loadActivities, repoFactsOf } from "./core/adapter.js";
 import { commitContexts, ingestCommits, loadCommitEvidence, parseRawDiff, parseReflogEvidence, unharvestedCommitReasons } from "./core/commit-evidence.js";
-import { MAP_RADIUS, cameraFor, clampCamera, contentSize, ensureVisible, keyOf, panCamera, visibleRect } from "./core/grid.js";
+import { MAP_RADIUS, cameraFor, clampCamera, contentSize, ensureVisible, isCenterCell, keyOf, panCamera, revealedKeys, visibleRect } from "./core/grid.js";
 import { ingestResearch, ingestScenario, processBoost, processBuild, processLand, processTrade, redispatch } from "./core/ingest.js";
 import { hostIo } from "./core/host-io.js";
 import { CasConflict, CityLedger, cityDir } from "./core/ledger.js";
 import { installHooks, removeHooks } from "./core/hooks.js";
 import { RESEARCH_TOKENS_PER_PARCHMENT, RESOURCE_LABELS, RULES_VERSION } from "./core/rules.js";
-import { defaultSelection, parseUi, resolveSelection, savedSelection, selectionOf, serializeUi, withSelection } from "./core/selection.js";
+import { defaultSelection, parseUi, resolveSelection, selectionOf, serializeUi, withDev, withSelection } from "./core/selection.js";
 import { QUOTA_SOURCE, parseQuotaReport } from "./core/quota-source.js";
 import { quotaView, readQuotaView } from "./core/quota-view.js";
 import { CLEAR_POINTS, formatResearch, readTown, readTownFromLedger, selectionDetail } from "./core/town.js";
+import { cityForFolders } from "./core/space-city.js";
 import { firstExpedition } from "./scenarios/first-expedition.js";
 import {
   historyChanged, historyJumped, historyLoadFailed, historyLoaded, historyOpened, historySubmitted,
@@ -46,6 +47,8 @@ const MAX_RIGHT_W = 292;
 const TOP_H = 104;
 /** 選取入畫時，格子方框再加這個安全邊（mock 地物與標籤的視覺外框）。 */
 const CELL_MARGIN = 6;
+/** 操作結果小提示顯示多久（ms）。 */
+const TOAST_MS = 6000;
 
 const RESOURCES = [
   { key: "wood", label: "木材", color: "ansi3" },
@@ -287,7 +290,7 @@ async function refreshTown(io, previous) {
     resources[city.cityId] = state.resources;
     research[city.cityId] = state.research;
     market[city.cityId] = state.market;
-    // 中心格的標籤（新村／舊城區）只依「開城時有沒有 HEAD」，上一份已經算過，不再開 git。
+    // 中心的種類（舊 repo／新 repo）只依「開城時有沒有 HEAD」，上一份已經算過，不再開 git。
     repoFacts[city.cityId] = { hadHead: city.center?.kind === "oldtown" ? true : city.center?.kind === "founded" ? false : undefined };
     unharvestedCommits[city.cityId] = city.unharvestedCommits ?? [];
   }
@@ -321,21 +324,15 @@ async function loadQuotas(io) {
   return readQuotaView(io, quotasPath());
 }
 
-/** 選取狀態的檔案（不是城的帳本）：選取不產生資源，也不改變土地。 */
+/** 選取與開發模式的檔案（不是城的帳本）：它們不產生資源，也不改變土地。 */
 const uiPath = () => `${appHome()}/${DATA_DIR}/ui.json`;
 
-/** 讀回上一次的選取（多座城時以「存過選取」的那一座為準）；沒有記過就回預設。 */
-async function loadSelection(io, town) {
-  const saved = savedSelection(town, parseUi(await io.read(uiPath())));
-  return { selection: resolveSelection(town, saved), saved: Boolean(saved) };
-}
-
 /** 讀、改、CAS 寫；另一個視窗同時寫就重讀再試一次。其他錯誤原樣丟出。 */
-async function saveSelection(io, selection) {
+async function updateUi(io, change) {
   for (let attempt = 0; attempt < 3; attempt++) {
     const before = await io.read(uiPath());
     try {
-      await io.write(uiPath(), serializeUi(withSelection(parseUi(before), selection.cityId, selection)), before);
+      await io.write(uiPath(), serializeUi(change(parseUi(before))), before);
       return;
     } catch (error) {
       if (!(error instanceof CasConflict)) throw error;
@@ -343,6 +340,8 @@ async function saveSelection(io, selection) {
     }
   }
 }
+
+const saveSelection = (io, selection) => updateUi(io, (ui) => withSelection(ui, selection.cityId, selection));
 
 /**
  * 一格的像素大小：地圖佔中央欄的大部分，格子最小 56 px（標籤一定看得清楚），
@@ -385,8 +384,13 @@ export default class Town extends View {
   init(_props, cx) {
     this.rootSize = { width: 0, height: 0 };
     this.selection = null;
+    this.ui = null;
+    this.devMode = false;
+    this.shownCityId = null;
+    this.syncedCityId = null;
+    this.missingFolder = null;
+    this.toast = null;
     this.note = "正在讀取城鎮帳本…";
-    this.topNotice = null;
     this.legendOpen = true;
     this.metricsOpen = false;
     this.camera = null;
@@ -418,13 +422,11 @@ export default class Town extends View {
       for (;;) {
         try {
           this.town = await loadTown(this.io);
-          const loaded = await loadSelection(this.io, this.town);
-          this.selection = loaded.selection;
-          // 第一次開這座城：把當下顯示的選取記下來，並把地圖開在它身上
-          // （選到已撤回／已封存時退回城的中心，不要留在內容區的角落）。
-          if (first) this.requestFocus(this.selection);
-          if (first && !this.focusCell && this.city()) this.focusCell = { x: this.city().center.x, y: this.city().center.y };
-          if (first && !loaded.saved && this.selection) await saveSelection(this.io, this.selection);
+          this.ui = parseUi(await this.io.read(uiPath()));
+          if (first) this.devMode = this.ui.dev;
+          // 畫面顯示哪一座城由目前的 space 決定（見 syncCity）；這裡只讓已選的遠征／格子
+          // 在帳本變動後仍然有效（不在了就退回那座城的預設）。
+          if (this.selection) this.selection = resolveSelection(this.town, this.selection, this.selection.cityId);
           this.note = null;
         } catch (error) {
           this.town = null;
@@ -441,18 +443,28 @@ export default class Town extends View {
     });
   }
 
+  /** 目前顯示的城（由 syncCity 在每次 render 時依 space 決定）。 */
   city() {
     const cities = this.town?.cities ?? [];
-    const wanted = this.selection?.cityId;
-    return (wanted ? cities.find((city) => city.cityId === wanted) : cities[0]) ?? null;
+    return (this.shownCityId ? cities.find((city) => city.cityId === this.shownCityId) : null) ?? null;
   }
 
   /** 選取：存檔＋把那一格帶進畫面；門檻 1（≤ 150 ms）＝按下到含新詳情的那一版畫面。 */
   select(selection, cx) {
     this.mark("pick");
     this.selection = selection;
+    this.ui = withSelection(this.ui ?? parseUi(null), selection.cityId, selection);
     if (this.io) saveSelection(this.io, selection).catch(() => {});
     this.requestFocus(selection);
+    cx.notify();
+  }
+
+  /** 開發模式：顯示工程資訊（規則版本、量測、座標、session、claim…）。存在 ui.json，重開還在。 */
+  toggleDev(cx) {
+    this.devMode = !this.devMode;
+    if (!this.devMode) this.metricsOpen = false;
+    this.ui = withDev(this.ui ?? parseUi(null), this.devMode);
+    if (this.io) updateUi(this.io, (ui) => withDev(ui, this.devMode)).catch(() => {});
     cx.notify();
   }
 
@@ -463,6 +475,11 @@ export default class Town extends View {
   requestFocus(selection) {
     const city = this.city();
     if (!city) return;
+    // 中心 2×2 的任何一格都把整塊中心帶進畫面（對準四格的正中央）。
+    if (selection?.kind === "tile" && isCenterCell(selection)) {
+      this.focusCell = { x: city.center.x + 0.5, y: city.center.y + 0.5 };
+      return;
+    }
     const tile = selection?.kind === "expedition"
       ? city.tiles.find((entry) => entry.rootSessionId === selection.rootSessionId && entry.generation === selection.generation)
       : selection?.kind === "tile" ? { x: selection.x, y: selection.y, landStage: null } : null;
@@ -482,7 +499,8 @@ export default class Town extends View {
         const records = [];
         const tiles = [];
         const cityNames = {};
-        for (const city of this.town?.cities ?? []) {
+        const shown = this.city();
+        for (const city of shown ? [shown] : []) {
           cityNames[city.cityId] = city.name;
           const ledger = await new CityLedger({
             io: this.io,
@@ -618,13 +636,64 @@ export default class Town extends View {
     });
   }
 
+  /**
+   * 這個 mod 所在的 space 的候選資料夾，依優先序：被指定的資料夾（props）→ 有焦點的終端
+   * → 目前分頁的終端 → 其他分頁的終端 → space 記錄的起始資料夾（它跟著焦點走，所以放最後）。
+   * 遠端機器的 space 與固定情境（herdr-app check）沒有本機資料夾，回空陣列。
+   */
+  spaceFolders() {
+    if (checking()) return [];
+    const wanted = props()?.space;
+    const space = spaces().find((entry) => (wanted ? entry.id === wanted : entry.active)) ?? null;
+    if (space?.machine) return [];
+    const folders = [];
+    if (typeof props()?.folder === "string") folders.push(props().folder);
+    if (space) {
+      const tabs = new Map(space.tabs.map((tab) => [tab.id, tab]));
+      const rank = (pane) => (pane.focused ? 0 : tabs.get(pane.tab)?.active ? 1 : 2);
+      const mine = panes()
+        .filter((pane) => tabs.has(pane.tab) && pane.terminal && pane.cwd)
+        .sort((a, b) => rank(a) - rank(b));
+      folders.push(...mine.map((pane) => pane.cwd), space.folder);
+    }
+    return folders.filter((folder) => typeof folder === "string" && folder);
+  }
+
+  /**
+   * 畫面顯示哪一座城：跟著目前的 space 走（切換 space，城就換）。對不上任何城時回 null，
+   * 畫面說明這個 space 還沒有城；拿不到 space 資訊時才退回選取過的那座城。
+   * 換城時選取還原成那座城上次的選取，地圖對位到它的中心（或選取的格子）。
+   */
+  syncCity() {
+    const cities = this.town?.cities ?? [];
+    const folders = this.spaceFolders();
+    let target;
+    if (folders.length) {
+      target = cityForFolders(cities, folders);
+      this.missingFolder = target ? null : folders[0];
+    } else {
+      target = (this.selection?.cityId ? cities.find((city) => city.cityId === this.selection.cityId) : null) ?? cities[0] ?? null;
+      this.missingFolder = null;
+    }
+    this.shownCityId = target?.cityId ?? null;
+    if (target && this.syncedCityId !== target.cityId) {
+      this.syncedCityId = target.cityId;
+      if (this.selection?.cityId !== target.cityId) {
+        this.selection = resolveSelection(this.town, selectionOf(this.ui, target.cityId), target.cityId);
+      }
+      this.requestFocus(this.selection);
+      if (!this.focusCell) this.focusCell = { x: target.center.x + 0.5, y: target.center.y + 0.5 };
+    }
+    return target;
+  }
+
   render(cx) {
     // 顯示更新時重新判定額度是否過期（S4）：模型帶著原始快照，這裡用「現在」重算一次，
-    // 所以只是選取／重繪（沒有重新抓取）也會在跨過 TTL／resetsAt 後顯示未知。
+    // 所以只是選取／重繪（沒有重新抓取）也會在跨過 TTL／resetsAt 之後顯示未知。
     if (this.town?.quotas?.snapshot !== undefined) this.town.quotas = quotaView(this.town.quotas.snapshot);
     const started = Date.now();
     const t = theme();
-    const city = this.city();
+    const city = this.syncCity();
     if (!city) {
       // 沒有城時也看得到未解析的活動（§4：不當成非 git，活動資料保留、可以重試）。
       const unresolved = this.town?.unresolvedActivities ?? [];
@@ -637,9 +706,11 @@ export default class Town extends View {
         .gap(8)
         .bg(t.canvas)
         .text_color(t.muted)
-        .child(div().child(this.note ?? "還沒有任何城市：互動的 root session 進到一個 Git repo 之後就會出現。"))
+        .child(div().child(this.note ?? (this.missingFolder
+          ? `這個 space（${this.missingFolder}）還沒有城鎮：在這個 repo 裡開一個互動的 agent session 就會出現。`
+          : "還沒有任何城市：互動的 root session 進到一個 Git repo 之後就會出現。")))
         .children(unresolved.map((activity) =>
-          div().text_size(10).child(`未解析 · ${activity.sessionId} · ${activity.cwd}`)))
+          div().text_size(10).child(this.devMode ? `未解析 · ${activity.sessionId} · ${activity.cwd}` : "未解析的活動")))
         .when(unresolved.length > 0, (element) =>
           element.child(hookButton("重試歸戶", t, (cx2) => this.retryTown(cx2))));
     }
@@ -691,16 +762,16 @@ export default class Town extends View {
   manageHooks(city, remove, cx) {
     const repo = city.tiles.find((tile) => tile.repo?.checkout)?.repo.checkout;
     if (!repo) {
-      this.topNotice = "沒有可用的 checkout";
-      cx.notify();
+      this.showToast("沒有可用的 checkout", cx);
       return;
     }
     cx.spawn(async (cx2) => {
+      let text;
       try {
         const result = remove
           ? await removeHooks({ repo, exec })
           : await installHooks({ repo, exec, io: storageIo(), appHome: appHome() });
-        this.topNotice = result.status === "refused"
+        text = result.status === "refused"
           ? `未安裝收成 hook：${result.message ?? result.reason}`
           : result.status === "needs-confirmation"
             ? `需先確認：${result.reason}`
@@ -709,9 +780,9 @@ export default class Town extends View {
             : result.status === "not-installed" ? "目前沒有已安裝的 hook"
             : `操作未完成：${result.reason ?? result.status}`;
       } catch (error) {
-        this.topNotice = `hook 操作失敗：${error}`;
+        text = `hook 操作失敗：${error}`;
       }
-      cx2.notify();
+      this.showToast(text, cx2);
     });
   }
 
@@ -721,29 +792,29 @@ export default class Town extends View {
    */
   refreshQuotas(cx) {
     cx.spawn(async (cx2) => {
-      this.topNotice = `正在抓取額度：${QUOTA_SOURCE.command} ${QUOTA_SOURCE.args.join(" ")}`;
-      cx2.notify();
+      this.showToast(`正在抓取額度：${QUOTA_SOURCE.command} ${QUOTA_SOURCE.args.join(" ")}`, cx2);
+      let text;
       try {
         const result = await exec(QUOTA_SOURCE.command, QUOTA_SOURCE.args);
         if (result.code !== 0) {
-          this.topNotice = `額度來源失敗（exit ${result.code}）：${String(result.stderr ?? "").trim().slice(0, 160) || "沒有輸出"}`;
+          text = `額度來源失敗（exit ${result.code}）：${String(result.stderr ?? "").trim().slice(0, 160) || "沒有輸出"}`;
         } else {
           const parsed = parseQuotaReport(result.stdout);
           if (parsed.error) {
-            this.topNotice = `額度回報無法使用：${parsed.error}`;
+            text = `額度回報無法使用：${parsed.error}`;
           } else {
             const before = await this.io.read(quotasPath());
             await this.io.write(quotasPath(), `${JSON.stringify(parsed.snapshot)}\n`, before);
-            this.topNotice = parsed.snapshot.warnings.length
+            text = parsed.snapshot.warnings.length
               ? `額度已更新（${parsed.snapshot.warnings.join("；")}）`
               : "額度已更新";
             this.town = await loadTown(this.io);
           }
         }
       } catch (error) {
-        this.topNotice = `額度更新失敗：${error}`;
+        text = `額度更新失敗：${error}`;
       }
-      cx2.notify();
+      this.showToast(text, cx2);
     });
   }
   topBar(city, t, leftW, rightW, width) {
@@ -793,18 +864,19 @@ export default class Town extends View {
           .gap(3)
           .children(guildBlock(city, this.town?.quotas, t))
           .child(h_flex().flex_wrap().gap(6).items_center().children([
+            hookButton("安裝收成", t, (cx2) => this.manageHooks(city, false, cx2)),
+            hookButton("移除", t, (cx2) => this.manageHooks(city, true, cx2)),
+            hookButton("更新額度", t, (cx2) => this.refreshQuotas(cx2)),
+            hookButton(this.devMode ? "開發模式 ✓" : "開發模式", t, (cx2) => this.toggleDev(cx2)),
+          ]))
+          // 規則版本與量測是開發用的工程資訊：開發模式才出現。
+          .when(this.devMode, (element) => element.child(h_flex().flex_wrap().gap(6).items_center().children([
             div().text_size(9).text_color(t.dim).child(`規則 v${RULES_VERSION}`),
             hookButton(this.metricsOpen ? "關閉量測" : "量測", t, (cx2) => {
               this.metricsOpen = !this.metricsOpen;
               cx2.notify();
             }),
-          ]))
-          .child(h_flex().flex_wrap().gap(6).items_center().children([
-            hookButton("安裝收成", t, (cx2) => this.manageHooks(city, false, cx2)),
-            hookButton("移除", t, (cx2) => this.manageHooks(city, true, cx2)),
-            hookButton("更新額度", t, (cx2) => this.refreshQuotas(cx2)),
-          ]))
-          .child(this.topNotice ? div().text_size(9).text_color(t.muted).truncate().child(this.topNotice) : div())
+          ])))
       ]);
   }
 
@@ -833,20 +905,25 @@ export default class Town extends View {
         div().text_size(10).text_color(t.dim).child("遠征（每格一支）"),
         div().text_size(13).font_semibold().child(`${city.tiles.length} 格土地`),
         div().text_size(9).text_color(t.muted).truncate().child(summary || "還沒有土地"),
+        // 來源不明與未解析是診斷資訊：一般只看到狀態與數量，原因、sha、cwd 在開發模式才展開。
         ...(city.unharvestedCommits?.length ? [
           h_flex().gap(5).items_center().child(statusBadge("來源不明", t))
-            .child(div().text_size(9).text_color(t.dim).child("不發資源、無人工補領")),
-          ...city.unharvestedCommits.map((commit) => div().text_size(9).text_color(t.muted).truncate()
-            .child(`⚑ ${commit.sha.slice(0, 8)} · ${COMMIT_REASON_LABELS[commit.reason] ?? commit.reason}`)),
+            .child(div().text_size(9).text_color(t.dim).child(
+              this.devMode ? "不發資源、無人工補領" : `${city.unharvestedCommits.length} 筆`,
+            )),
+          ...(this.devMode ? city.unharvestedCommits.map((commit) => div().text_size(9).text_color(t.muted).truncate()
+            .child(`⚑ ${commit.sha.slice(0, 8)} · ${COMMIT_REASON_LABELS[commit.reason] ?? commit.reason}`)) : []),
         ] : []),
         ...(unresolved.length ? [
           h_flex().gap(5).items_center().child(statusBadge("未解析", t))
             .child(div().text_size(9).text_color(t.dim).child(`${unresolved.length} 筆活動`)),
-          div().text_size(9).text_color(t.muted).child("cwd 不在、不是 git，或 repo 身份無法正規化；活動保留，可以重試。"),
-          ...unresolved.map((activity) => v_flex().gap(1).p(5).rounded(4).bg(t.surface)
-            .border(1).border_color(t.border)
-            .child(div().text_size(9).text_color(t.muted).truncate().child(activity.sessionId))
-            .child(div().text_size(9).text_color(t.dim).truncate().child(activity.cwd))),
+          ...(this.devMode ? [
+            div().text_size(9).text_color(t.muted).child("cwd 不在、不是 git，或 repo 身份無法正規化；活動保留，可以重試。"),
+            ...unresolved.map((activity) => v_flex().gap(1).p(5).rounded(4).bg(t.surface)
+              .border(1).border_color(t.border)
+              .child(div().text_size(9).text_color(t.muted).truncate().child(activity.sessionId))
+              .child(div().text_size(9).text_color(t.dim).truncate().child(activity.cwd))),
+          ] : []),
           hookButton("重試歸戶", t, (cx2) => this.retryTown(cx2)),
         ] : []),
         ...city.tiles.map((tile) => this.expeditionCard(city, tile, t, cx)),
@@ -883,7 +960,9 @@ export default class Town extends View {
           .child(div().text_size(11).text_color(status.color).child(status.label))
           .child(stageBadge(tile, t)),
         div().text_size(12.5).font_semibold().truncate().child(`遠征 ${shortId(tile.rootSessionId)} · 第 ${tile.generation} 代`),
-        div().text_size(11).text_color(t.muted).truncate().child(`${tile.points} / ${CLEAR_POINTS} · ${tile.cli ?? "未知"}`),
+        div().text_size(11).text_color(t.muted).truncate().child(
+          this.devMode ? `${tile.points} / ${CLEAR_POINTS} · ${tile.cli ?? "未知"}` : `${tile.points} / ${CLEAR_POINTS}`,
+        ),
         factionTag(tile, t),
       ]);
   }
@@ -901,40 +980,34 @@ export default class Town extends View {
       .h_full()
       .relative()
       .child(this.map(city, t, cx, area))
-      .when(this.metricsOpen, (element) => element.child(this.metricsPanel(t)));
+      .when(this.metricsOpen && this.devMode, (element) => element.child(this.metricsPanel(t)))
+      .when(this.toast !== null, (element) => element.child(this.toastView(t)));
   }
 
   map(city, t, cx, area) {
     const tiles = new Map(city.tiles
       .filter((entry) => entry.landStage !== "archived" && entry.landStage !== "withdrawn")
       .map((entry) => [keyOf(entry), entry]));
-    const revealed = new Set();
-    for (const tileEntry of city.tiles) {
-      if (tileEntry.landStage !== "cleared" && tileEntry.landStage !== "built") continue;
-      revealed.add(keyOf(tileEntry));
-      for (const [dx, dy] of [[0, -1], [1, 0], [0, 1], [-1, 0]]) {
-        revealed.add(keyOf({ x: tileEntry.x + dx, y: tileEntry.y + dy }));
-      }
-    }
+    // 看得到地面的格子：中心 2×2 與它旁邊一格從開城就是；開墾完成的格子再往外揭開（§4）。
+    const revealed = revealedKeys(city.tiles);
     const tile = tileSize(area);
     const size = contentSize(MAP_RADIUS, tile);
     // **真正可見的地圖區域**＝地圖框扣掉覆蓋層：頂部的圖例（左上角，實測高度）與
     // 開啟時的量測面板（左下角）。選取入畫用的是這一塊，不是整個地圖框——
     // 這就是 600 UI px 的四角格「在框內卻被圖例蓋住／被上緣裁掉」的原因。
-    const visible = visibleRect(area, this.legendSize, this.metricsOpen ? this.metricsSize : null);
-    const anchor = this.focusCell ?? this.anchorCell ?? { x: city.center.x, y: city.center.y };
-    const moved = this.focusCell
-      || !this.camera
-      || this.camera.cityId !== city.cityId
-      || visible.x !== this.viewport?.x
-      || visible.y !== this.viewport?.y
-      || visible.width !== this.viewport?.width
-      || visible.height !== this.viewport?.height;
+    const metricsShown = this.metricsOpen && this.devMode;
+    const visible = visibleRect(area, this.legendSize, metricsShown ? this.metricsSize : null);
+    const anchor = this.focusCell ?? this.anchorCell ?? { x: city.center.x + 0.5, y: city.center.y + 0.5 };
+    // 地圖只在「要帶一格進畫面」、換城、或地圖框本身變大小時重新對位。圖例展開／收合只改
+    // 覆蓋層的大小，**不能**讓整張圖跳動：那種情況只由下面的 ensureVisible 在選取格被蓋住時最小位移。
+    const resized = area.width !== this.mapArea?.width || area.height !== this.mapArea?.height;
+    const moved = this.focusCell || !this.camera || this.camera.cityId !== city.cityId || resized;
     if (moved) {
       this.anchorCell = anchor;
       this.camera = { cityId: city.cityId, ...cameraFor(anchor, visible, MAP_RADIUS, tile) };
     }
     this.viewport = visible;
+    this.mapArea = { width: area.width, height: area.height };
     // 先夾在畫得出來的範圍（用整個地圖框，平移不被圖例限制），再保證選取的那一格
     // （含最高的 mock 建築外框，它畫在格子方框內）完整落在**可見區**裡。
     this.camera = { ...this.camera, ...clampCamera(this.camera, size, area) };
@@ -949,13 +1022,16 @@ export default class Town extends View {
       tile,
       viewport: area,
       legendOpen: this.legendOpen,
+      devMode: this.devMode,
       camera: this.camera,
-      // 圖例（左上覆蓋層）把**量到的大小**回報給畫面：尺寸一變就重新對位（窄 pane 會換行變高）。
+      // 圖例（左上覆蓋層）把**量到的大小**回報給畫面。只有第一次量到時重新對位（開啟時圖例
+      // 才有高度）；之後展開／收合不重新置中，地圖不會跳。
       onLegendSize: (size, cx2) => {
+        const first = !this.legendSize;
         const changed = this.legendSize?.height !== size.height || this.legendSize?.width !== size.width;
         this.legendSize = size;
         if (changed) {
-          this.requestFocus(this.selection);
+          if (first) this.requestFocus(this.selection);
           cx2.notify();
         }
       },
@@ -989,7 +1065,46 @@ export default class Town extends View {
     });
   }
 
-  /** 量測面板（§0）：三個互動門檻的最近值／最大值，以及每次 render 的建樹時間。 */
+  /** 操作結果的一行小提示（浮在地圖下方）：幾秒後自己消失，點一下也能關。 */
+  showToast(text, cx) {
+    const id = (this.toastSeq = (this.toastSeq ?? 0) + 1);
+    this.toast = { id, text };
+    cx.notify();
+    cx.timer.after(TOAST_MS, (cx2) => {
+      if (this.toast?.id !== id) return;
+      this.toast = null;
+      cx2.notify();
+    });
+  }
+
+  toastView(t) {
+    return h_flex()
+      .id("toast")
+      .absolute()
+      .bottom(12)
+      .left(12)
+      .right(12)
+      .justify_center()
+      .child(
+        div()
+          .max_w("100%")
+          .px(10)
+          .py(6)
+          .rounded(6)
+          .bg(t.popover)
+          .border(1)
+          .border_color(t.border)
+          .text_size(11.5)
+          .cursor_pointer()
+          .on_click((_event, cx) => {
+            this.toast = null;
+            cx.notify();
+          })
+          .child(this.toast.text),
+      );
+  }
+
+  /** 量測面板（§0，開發模式）：三個互動門檻的最近值／最大值，以及每次 render 的建樹時間。 */
   metricsPanel(t) {
     return v_flex()
       .id("metrics")
@@ -1003,10 +1118,11 @@ export default class Town extends View {
       .border(1)
       .border_color(t.border)
       .on_size_change((size, cx2) => {
+        const first = !this.metricsSize;
         const changed = this.metricsSize?.height !== size.height || this.metricsSize?.width !== size.width;
         this.metricsSize = size;
         if (changed) {
-          this.requestFocus(this.selection);
+          if (first) this.requestFocus(this.selection);
           cx2.notify();
         }
       })
@@ -1066,11 +1182,14 @@ export default class Town extends View {
               ].filter(Boolean))
             : null,
           detail.kind === "fog"
-            ? div().text_size(9).text_color(t.muted).child("迷霧：這一格還沒有遠征進駐；達到 100 點的格子會揭開它自己和上下左右的鄰格。")
+            ? div().text_size(9).text_color(t.muted).child("迷霧：還沒有人到過這裡；達到 100 點的格子會揭開它自己和上下左右的鄰格。")
+            : null,
+          detail.kind === "open"
+            ? div().text_size(9).text_color(t.muted).child("已揭開的空地：看得到地面，還沒有遠征進駐。新的遠征會從離城鎮中心最近的空地開始。")
             : null,
           detail.pointsTarget ? progress(detail, t) : null,
-          ...detail.fields.map((field) => fieldRow(field, t)),
-          ...(detail.investment ? investmentSection(detail, t) : []),
+          ...detail.fields.filter((field) => this.devMode || !field.dev).map((field) => fieldRow(field, t)),
+          ...(detail.investment ? investmentSection(detail, t, this.devMode) : []),
           ...(detail.quota?.length ? quotaSection(detail, t) : []),
           ...(detail.actions ?? []).map((action) =>
             hookButton(actionLabels[action], t, (cx2) => this.operateLand(detail, action, cx2))),

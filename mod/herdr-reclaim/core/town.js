@@ -6,7 +6,7 @@
 //                                              「遠征取得土地」entry 決定（#3）
 // 土地生命週期、commit 收成、建築與額度由 #4／#5 接上；庫存與行會在這裡先固定成
 // 「還沒有收成」與「沒有額度來源」。
-import { CENTER, bfsNextTile, keyOf } from "./grid.js";
+import { CENTER, CENTER_CELLS, bfsNextTile, isCenterCell, keyOf, revealedKeys } from "./grid.js";
 import { BOOST_POINTS_PER_PARCHMENT, CLEAR_POINTS, RECIPES, RESEARCH_TOKENS_PER_PARCHMENT, RESOURCE_LABELS, TRADE_RATE, buildableRecipes } from "./rules.js";
 import { allTokensUnknown, basisNote, factionOf, formatFaction, investmentsOf, mergeInvestments, quotaLines } from "./provider-stats.js";
 
@@ -189,11 +189,14 @@ function cityNameOf(cityId, checkout) {
   return (repoPath ?? checkout ?? cityId).split("/").filter(Boolean).pop() ?? cityId;
 }
 
+/**
+ * 城鎮中心一律叫「城鎮中心」。`kind` 仍記得開城時 repo 有沒有 HEAD（舊 repo／新 repo，
+ * 將來可能換圖），但它不是顯示給玩家的名字（§4）。
+ */
 function centerOf(cityId, repoFacts) {
   const hadHead = repoFacts[cityId]?.hadHead;
-  const label = hadHead === true ? "舊城區" : hadHead === false ? "新村" : "城鎮中心";
   const kind = hadHead === true ? "oldtown" : hadHead === false ? "founded" : "unknown";
-  return { x: CENTER.x, y: CENTER.y, kind, label };
+  return { x: CENTER.x, y: CENTER.y, kind, label: "城鎮中心" };
 }
 
 /**
@@ -446,7 +449,7 @@ function createsTile(session) {
 function cityFor(cities, cityId, checkout) {
   let city = cities.get(cityId);
   if (!city) {
-    city = { cityId, name: null, checkout, taken: new Set([keyOf(CENTER)]), tiles: [] };
+    city = { cityId, name: null, checkout, taken: new Set(CENTER_CELLS.map(keyOf)), tiles: [] };
     cities.set(cityId, city);
   }
   if (!city.checkout) city.checkout = checkout;
@@ -588,8 +591,12 @@ export function selectionDetail(town, selection) {
   if (selection?.kind === "tile") {
     const tile = city.tiles.find((candidate) => candidate.x === selection.x && candidate.y === selection.y);
     if (tile) return expeditionDetail(city, tile);
-    if (selection.x === city.center.x && selection.y === city.center.y) return centerDetail(city, town.quotas);
-    return detail("fog", city, { x: selection.x, y: selection.y }, "迷霧", null, []);
+    if (isCenterCell(selection)) return centerDetail(city, town.quotas);
+    const spot = { x: selection.x, y: selection.y };
+    // 看得到地面但還沒有遠征進駐的空地（中心塊旁邊與已開墾格的鄰格），和還罩著迷霧的格子分開。
+    return revealedKeys(city.tiles).has(keyOf(spot))
+      ? detail("open", city, spot, "空地", null, [])
+      : detail("fog", city, spot, "迷霧", null, []);
   }
 
   return detail("none", city, null, "未選取", null, []);
@@ -675,33 +682,41 @@ function expeditionDetail(city, tile) {
     investmentNote: basisNote(tile.investment),
     fields: [
       { label: "工作時間", value: formatDuration(tile.workMs) },
-      { label: "工作區間", value: `${formatTimestamp(tile.activatedAt)} – ${tile.deactivatedAt == null ? "進行中" : formatTimestamp(tile.deactivatedAt)}` },
+      { label: "工作區間", value: `${formatTimestamp(tile.activatedAt)} – ${tile.deactivatedAt == null ? "進行中" : formatTimestamp(tile.deactivatedAt)}`, dev: true },
       ...(tile.visits ?? []).map((visit, index) => ({
         label: `Visit ${index + 1}`,
         value: `${formatTimestamp(visit.startedAt)} – ${visit.endedAt == null ? "進行中" : formatTimestamp(visit.endedAt)} · ${visit.checkout ?? visit.cwd ?? "路徑未知"}`,
+        dev: true,
       })),
       ...(tile.providerUsage ?? []).map(({ provider, usage }) => ({
         label: `投入 ${provider}`,
         // 每個欄位各自判斷未知（formatUsage）：部分未知時只有那個欄位是「未知」，不是 0。
         value: formatUsage(usage),
+        dev: true,
+      })),
+      // 玩家看到的是「這次 commit 收了什麼」；sha、claim、路徑與規則版本是開發模式的明細。
+      ...(tile.harvests ?? []).map((harvest, index) => ({
+        label: `成果 ${index + 1}`,
+        value: `${harvest.subject || "commit"} · ${formatCosts(harvest.resources)}`,
       })),
       ...(tile.harvests ?? []).map((harvest, index) => ({
         label: `收成 ${index + 1}`,
         value: `${harvest.sha ?? "commit"}${harvest.subject ? ` · ${harvest.subject}` : ""} · claim ${(harvest.claims ?? []).slice(0, 2).join(", ") || "已記錄"}${(harvest.claimCount ?? 0) > 2 ? "…" : ""} · 路徑 ${(harvest.paths ?? []).slice(0, 2).join(", ") || `${harvest.pathCount ?? 0} 筆`} · ${formatCosts(harvest.resources)} · 規則 v${harvest.rulesVersion ?? "?"}`,
+        dev: true,
       })),
-      { label: "點數", value: `工作 ${tile.workPoints} · 收成 ${tile.harvestPoints} · 加速 ${tile.boostPoints}` },
-      { label: "用量", value: formatUsage(tile.usage) },
+      { label: "點數", value: `工作 ${tile.workPoints} · 收成 ${tile.harvestPoints} · 加速 ${tile.boostPoints}`, dev: true },
+      { label: "用量", value: formatUsage(tile.usage), dev: true },
       { label: "派系", value: formatFaction(tile.faction) },
       { label: "土地", value: stageLabel },
       ...(tile.building ? [{
         label: "建築",
-        value: `${RECIPES[tile.building.recipe]?.label ?? tile.building.recipe}（實付 ${formatCosts(tile.building.costs)}，規則 v${tile.building.rulesVersion}）`,
+        value: `${RECIPES[tile.building.recipe]?.label ?? tile.building.recipe}（實付 ${formatCosts(tile.building.costs)}）`,
       }] : []),
       ...(tile.scrollsUsed ? [{ label: "加速用量", value: `${tile.scrollsUsed} 張羊皮卷` }] : []),
-      { label: "座標", value: `${tile.x}, ${tile.y}` },
-      { label: "CLI", value: tile.cli ?? "未知" },
-      { label: "session", value: tile.rootSessionId },
-      { label: "checkout", value: tile.repo.checkout ?? tile.repo.commonDir },
+      { label: "座標", value: `${tile.x}, ${tile.y}`, dev: true },
+      { label: "CLI", value: tile.cli ?? "未知", dev: true },
+      { label: "session", value: tile.rootSessionId, dev: true },
+      { label: "checkout", value: tile.repo.checkout ?? tile.repo.commonDir, dev: true },
     ],
   };
 }
@@ -761,13 +776,13 @@ function centerDetail(city, quotas = null) {
     market: marketDetail(city),
     fields: [
       { label: "身份", value: city.center.label },
-      { label: "座標", value: `${city.center.x}, ${city.center.y}` },
+      { label: "座標", value: `${city.center.x}, ${city.center.y}（2×2）`, dev: true },
       { label: "遠征", value: `${city.tiles.length} 支` },
       { label: "來源不明", value: `${city.unharvestedCommits?.length ?? 0} 筆（不發資源，無人工補領）` },
       { label: "主要行會", value: city.guild ? formatFaction(city.guild) : "未知" },
       { label: "研究", value: formatResearch(city.research) },
       { label: "市集", value: formatMarket(city.market) },
-      { label: "城的身份", value: city.cityId },
+      { label: "城的身份", value: city.cityId, dev: true },
     ],
   };
 }
