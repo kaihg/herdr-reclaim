@@ -480,19 +480,16 @@ function newTile(session, city, visit, planned) {
 /** 還沒有任何用量時的加總起點。 */
 export const ZERO_USAGE = { inputNonCache: 0, cacheRead: 0, cacheWrite: 0, output: 0, costKnown: 0, costUnknownEntries: 0 };
 
-/** 依城與遠征區間彙總 provider 投入。 */
+/**
+ * 依城與遠征區間彙總 provider 投入。
+ * 與派系／投資共用同一份聚合（core/provider-stats.js）：正規化留下的 0 佔位與未知欄位
+ * 只算一次，不然「投入」與「派系」會看到兩套不同的未知狀態（§9）。
+ */
 function providerUsage(sources, cityId, startedAt, endedAt) {
-  const byProvider = new Map();
-  for (const session of sources) {
-    for (const [source, usage] of session.usage) {
-      if (usage.cityId !== cityId || usage.at < startedAt || usage.at >= endedAt) continue;
-      const provider = source.slice(source.lastIndexOf("#") + 1);
-      const total = byProvider.get(provider) ?? { ...ZERO_USAGE };
-      for (const field of Object.keys(ZERO_USAGE)) total[field] += Number(usage[field]) || 0;
-      byProvider.set(provider, total);
-    }
-  }
-  return [...byProvider].map(([provider, usage]) => ({ provider, usage }));
+  return investmentsOf(sources, cityId, startedAt, endedAt).providers.map((entry) => {
+    const { provider, measured, unknownFields, ...usage } = entry;
+    return { provider, usage: unknownFields?.length ? { ...usage, unknownFields } : usage };
+  });
 }
 
 /** §10：自然工作、收成與加速點分開保存，再加總判斷開墾。 */
@@ -681,10 +678,8 @@ function expeditionDetail(city, tile) {
       })),
       ...(tile.providerUsage ?? []).map(({ provider, usage }) => ({
         label: `投入 ${provider}`,
-        // 完全未知的用量留下的是 0 佔位，不能當成「投入 0」（§9）：跟派系用同一份資料判斷。
-        value: allTokensUnknown((tile.investment?.providers ?? []).find((entry) => entry.provider === provider))
-          ? "未知（欄位未回報）"
-          : formatUsage(usage),
+        // 每個欄位各自判斷未知（formatUsage）：部分未知時只有那個欄位是「未知」，不是 0。
+        value: formatUsage(usage),
       })),
       ...(tile.harvests ?? []).map((harvest, index) => ({
         label: `收成 ${index + 1}`,
@@ -806,17 +801,22 @@ function formatTimestamp(value) {
   return Number.isFinite(timestamp) && timestamp > 0 ? new Date(timestamp).toLocaleString("zh-TW") : "時間未知";
 }
 
-/** 右側詳情的用量一行：進／出與快取，價格未知時明說，不假裝是 0。 */
+/**
+ * 右側詳情的用量一行：進／出與快取，價格未知時明說，不假裝是 0。
+ * `usage.unknownFields` 裡的欄位是正規化留下的 0 佔位，逐欄顯示「未知」；已知欄位照常。
+ */
 export function formatUsage(usage = ZERO_USAGE) {
   const cost = usage.costKnown > 0 ? ` · 成本 ${usage.costKnown.toFixed(4)}` : "";
   const unknown = usage.costUnknownEntries > 0 ? ` · ${usage.costUnknownEntries} 筆價格未知` : "";
   // 四個 token 欄位都沒有回報時，數字是正規化的 0 佔位，不是「用量 0」（§9）。
   if (allTokensUnknown(usage)) return `未知（欄位未回報）${cost}${unknown}`;
+  const missing = new Set(usage.unknownFields ?? []);
+  const field = (key, label, value) => `${label} ${missing.has(key) ? "未知" : value}`;
   const parts = [
-    `進 ${usage.inputNonCache}`,
-    `出 ${usage.output}`,
-    `快取讀 ${usage.cacheRead}`,
-    `快取寫 ${usage.cacheWrite}`,
+    field("inputNonCache", "進", usage.inputNonCache),
+    field("output", "出", usage.output),
+    field("cacheRead", "快取讀", usage.cacheRead),
+    field("cacheWrite", "快取寫", usage.cacheWrite),
   ];
   return `${parts.join(" · ")}${cost}${unknown}`;
 }

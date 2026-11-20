@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { searchHistory } from "../core/history.js";
+import { historyResultLines, searchHistory } from "../core/history.js";
 import { CityLedger } from "../core/ledger.js";
 import { createFileIo } from "./fs-io.js";
 
@@ -30,6 +30,23 @@ describe("歷程搜尋", () => {
     const result = searchHistory({ unresolvedActivities: [{ sessionId: "lost-session", cwd: "/tmp/lost-repo", at: 123 }], query: "session:lost" });
     expect(result.results).toMatchObject([{ label: "未解析活動", reason: "unresolved", jump: null }]);
     expect(searchHistory({ unresolvedActivities: [{ sessionId: "lost-session", cwd: "/tmp/lost-repo", at: 123 }], query: "lost-repo" }).total).toBe(1);
+  });
+
+  test("來源不明提交的結果列獨立顯示未收成原因，SHA 縮短不會把原因擠掉", () => {
+    const result = searchHistory({
+      records: [{
+        seq: 20, at: 123, kind: "commit", cityId, rootSessionId: null, generation: null,
+        sha: "b".repeat(40), subject: "UI unknown comet", reason: "terminal-only",
+      }],
+      query: "commit:comet",
+    }).results[0];
+    const row = historyResultLines(result);
+
+    expect(result.reason).toBe("terminal-only");
+    expect(row.summary).toBe("UI unknown comet · bbbbbbbb");
+    expect(row.summary.length).toBeLessThanOrEqual(32);
+    expect(row.reasonLine).toBe("未收成原因：只有 terminal ID");
+    expect(row.summary).not.toContain("terminal-only");
   });
 
   test("checkpoint 歷程索引保留 withdrawn generation 與 checkpoint 後尾端", async () => {

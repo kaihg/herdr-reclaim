@@ -3,6 +3,32 @@ const LABELS = {
   landAction: "土地變更", build: "蓋房", boost: "加速", trade: "市集", research: "研究",
 };
 
+const REASON_LABELS = {
+  "no-session-source": "沒有 session 證據",
+  "terminal-only": "只有 terminal ID",
+  "ambiguous-session-source": "session 證據不唯一",
+  "ambiguous-repository": "repo 證據不唯一",
+  "no-hook-repository-evidence": "沒有 repo 證據",
+  "no-matching-expedition": "沒有匹配遠征",
+  "no-matching-adapter-session": "對不到 adapter session",
+  "no-eligible-changes": "沒有可收成變更",
+  "remote-merge": "遠端合併",
+  unresolved: "活動尚未解析",
+};
+
+/** 可見結果列投影：摘要只留短 SHA；未收成原因獨立一欄，避免被摘要截斷。 */
+export function historyResultLines(item) {
+  const sha = typeof item.sha === "string" && item.sha ? item.sha.slice(0, 8) : null;
+  const summary = [item.subject, sha].filter(Boolean).join(" · ") ||
+    (item.paths ?? []).join(", ") || item.sessionId || item.rootSessionId || "";
+  const reasonLine = item.reason && item.reason !== "verified"
+    ? item.reason === "unresolved"
+      ? REASON_LABELS.unresolved
+      : `未收成原因：${REASON_LABELS[item.reason] ?? item.reason}`
+    : null;
+  return { summary, reasonLine };
+}
+
 const isoDate = (at) => Number.isFinite(Number(at)) && Number(at) > 0
   ? new Date(Number(at)).toISOString().slice(0, 10)
   : "";

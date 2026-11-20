@@ -144,12 +144,20 @@ export function basisNote(investments) {
     : "成本未知：改用 non-cache input + output 比較";
 }
 
-/** 一個 provider 的投資值；畫面與派系都用同一個基準。完全未知的沒有數字可以寫。 */
+/**
+ * 一個 provider 的投資值；畫面與派系都用同一個基準。完全未知的沒有數字可以寫；
+ * token 基準下，只有其中一個欄位未知時，那一欄寫「未知」而不是正規化的 0（#11 的
+ * `usage.unknownFields`）。
+ */
 export function formatInvestment(investments, entry) {
   if (!entry.measured) return "未知（欄位未回報）";
-  return investments?.basis === "cost"
-    ? `API 等值 ${Number(entry.costKnown).toFixed(4)}`
-    : `進 ${entry.inputNonCache} + 出 ${entry.output}`;
+  if (investments?.basis !== "cost") {
+    const missing = new Set(entry.unknownFields ?? []);
+    const input = missing.has("inputNonCache") ? "未知" : entry.inputNonCache;
+    const output = missing.has("output") ? "未知" : entry.output;
+    return `進 ${input} + 出 ${output}`;
+  }
+  return `API 等值 ${Number(entry.costKnown).toFixed(4)}`;
 }
 
 /** 這一筆投資占這一組的比例（基準相同才可比）。 */
