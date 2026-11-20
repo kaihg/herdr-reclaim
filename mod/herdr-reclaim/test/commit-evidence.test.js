@@ -5,13 +5,15 @@ import os from "node:os";
 import path from "node:path";
 import { bfsNextTile } from "../core/grid.js";
 import { CityLedger } from "../core/ledger.js";
+import { ingestScenario, processLand, redispatch } from "../core/ingest.js";
 import { ingestCommits, parseRawDiff, parseReflogEvidence, unharvestedCommitReasons } from "../core/commit-evidence.js";
 import { harvestForCommit } from "../core/harvest.js";
 import { readTownFromLedger } from "../core/town.js";
+import { activity, visitStart } from "../scenarios/first-expedition.js";
 import { createFileIo } from "./fs-io.js";
 
 const CITY = "/tmp/reclaim-commit-evidence/.git";
-const base = (rootSessionId, cityId = CITY) => ({ opId: `expedition:${rootSessionId}`, kind: "expedition", cityId, rootSessionId, generation: 1, ...bfsNextTile(() => false), cli: "omp", repo: { commonDir: cityId, checkout: cityId.slice(0, -5) } });
+const base = (rootSessionId, cityId = CITY) => ({ opId: `expedition:${rootSessionId}`, kind: "expedition", at: 0, activatedAt: 0, cityId, rootSessionId, generation: 1, ...bfsNextTile(() => false), cli: "omp", repo: { commonDir: cityId, checkout: cityId.slice(0, -5) } });
 const hook = (sha, env = {}) => ({ schema: 1, sha, hook: "post-commit", commonDir: CITY, toplevel: CITY.slice(0, -5), at: 1, env });
 const docs = (name, blob) => [{ status: "A", path: `docs/${name}.md`, resultBlob: blob }];
 
@@ -66,6 +68,49 @@ describe("commit 證據 replay", () => {
     expect(view.cities[0].unharvestedCommits).toContainEqual({ sha: remoteSha, repo: CITY, reason: "remote-merge" });
     expect(view.cities[0].unharvestedCommits).toContainEqual({ sha: ideSha, repo: CITY, reason: "no-session-source" });
   });
+  test("世代一撤回並重新派遣後才掃描：舊 commit 不得把點數算進世代二", async () => {
+    const dir = `/tmp/reclaim-commit-evidence/${process.pid}-${Math.random().toString(36).slice(2)}`;
+    const ledger = await new CityLedger({ io: createFileIo(), dir, cityId: CITY }).open();
+    const checkout = CITY.slice(0, -5);
+    const sessionId = "late-generation-session";
+    const activatedAt = 1_000;
+    const deactivatedAt = 3_000;
+    const committedAt = 2_000;
+    const record = activity({
+      sessionId,
+      writerEpoch: "late-generation",
+      events: [
+        visitStart("late-generation-visit", activatedAt, { commonDir: CITY, checkout }),
+        { kind: "interval_open", at: activatedAt },
+        { kind: "interval_close", at: deactivatedAt },
+      ],
+    });
+    await ingestScenario(ledger, { activities: [record], repoFacts: { [CITY]: { hadHead: true } } }, CITY);
+    expect((await ledger.state()).tileById.get(`${CITY}@@${sessionId}@@1`).activatedAt).toBe(activatedAt);
+
+    expect((await processLand(ledger, {
+      rootSessionId: sessionId, generation: 1, action: "withdraw", at: deactivatedAt,
+    })).status).toBe("applied");
+    expect((await redispatch(ledger, { rootSessionId: sessionId, at: 4_000 })).status).toBe("applied");
+
+    // Gen 1 的 commit 證據直到 gen 2 已建立後才進入收成掃描；其事件時間仍在 gen 1。
+    const sha = "e".repeat(40);
+    const commitHook = { ...hook(sha, { PI_SESSION_ID: sessionId }), at: committedAt };
+    const sources = [{ schema: 1, sha, cli: "omp", sessionId, at: committedAt }];
+    const results = await ingestCommits({
+      ledger,
+      hooks: [commitHook],
+      sources,
+      activities: [record],
+      diffForCommit: async () => [{ status: "A", path: "src/late.js", resultBlob: "late-blob" }],
+    });
+
+    expect(results).toContainEqual(expect.objectContaining({ status: "applied", opId: `harvest:${sha}` }));
+    const state = await ledger.state();
+    expect(state.tileById.get(`${CITY}@@${sessionId}@@1`).harvestPoints).toBe(20);
+    expect(state.tileById.get(`${CITY}@@${sessionId}@@2`).harvestPoints).toBe(0);
+    expect(state.resources).toEqual({ wood: 10, stone: 0, iron: 0, parchment: 0 });
+  });
   test("真實 git pull reflog 只產生 SHA/repo 原因證據", () => {
     const root = mkdtempSync(path.join(os.tmpdir(), "reclaim-reflog-"));
     const bare = path.join(root, "origin.git");
@@ -113,7 +158,7 @@ describe("commit 證據 replay", () => {
     const spots = [[0, -1], [1, 0], [0, 1], [-1, 0], [1, -1], [-1, -1]];
     const sessions = spots.map((_, index) => `claim-session-${index + 1}`);
     for (const [index, [x, y]] of spots.entries()) {
-      await ledger.submit(() => ({ opId: `expedition:${sessions[index]}`, kind: "expedition", cityId, rootSessionId: sessions[index], generation: 1, x, y, cli: "omp", repo: { commonDir: cityId, checkout: "/tmp/reclaim-deletion-claim" } }));
+      await ledger.submit(() => ({ opId: `expedition:${sessions[index]}`, kind: "expedition", at: 0, activatedAt: 0, cityId, rootSessionId: sessions[index], generation: 1, x, y, cli: "omp", repo: { commonDir: cityId, checkout: "/tmp/reclaim-deletion-claim" } }));
     }
     const plan = {
       c1: { session: 0, changes: [{ status: "A", path: "src/x.ts", resultBlob: "blob-A" }] },

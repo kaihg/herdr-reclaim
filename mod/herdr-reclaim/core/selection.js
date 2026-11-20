@@ -35,8 +35,11 @@ export function selectionOf(ui, cityId) {
 /** 指揮桌一打開右邊就有東西：預設選第一支遠征。 */
 export function defaultSelection(town) {
   const city = town?.cities?.[0] ?? null;
-  const first = city?.tiles?.[0] ?? null;
-  return first ? { kind: "expedition", cityId: city.cityId, rootSessionId: first.rootSessionId } : null;
+  const first = city?.tiles?.reduce((latest, tile) =>
+    !latest || tile.generation > latest.generation ? tile : latest, null) ?? null;
+  return first
+    ? { kind: "expedition", cityId: city.cityId, rootSessionId: first.rootSessionId, generation: first.generation }
+    : null;
 }
 
 /**
@@ -47,8 +50,18 @@ export function resolveSelection(town, saved) {
   if (saved && typeof saved === "object") {
     const city = (town?.cities ?? []).find((candidate) => candidate.cityId === saved.cityId) ?? null;
     if (city) {
-      if (saved.kind === "expedition" && city.tiles.some((tile) => tile.rootSessionId === saved.rootSessionId)) {
-        return { kind: "expedition", cityId: city.cityId, rootSessionId: saved.rootSessionId };
+      if (saved.kind === "expedition") {
+        const candidates = city.tiles.filter((tile) => tile.rootSessionId === saved.rootSessionId);
+        const selected = candidates.find((tile) => tile.generation === saved.generation) ??
+          candidates.reduce((latest, tile) => !latest || tile.generation > latest.generation ? tile : latest, null);
+        if (selected) {
+          return {
+            kind: "expedition",
+            cityId: city.cityId,
+            rootSessionId: saved.rootSessionId,
+            generation: selected.generation,
+          };
+        }
       }
       if (saved.kind === "tile" && Number.isInteger(saved.x) && Number.isInteger(saved.y)) {
         return { kind: "tile", cityId: city.cityId, x: saved.x, y: saved.y };

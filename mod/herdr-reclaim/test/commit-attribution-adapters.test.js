@@ -38,7 +38,7 @@ async function openCity(name) {
   return new CityLedger({ io: createFileIo(), dir, cityId: CITY }).open();
 }
 
-const expeditionOp = (rootSessionId, x, y) => ({ opId: `expedition:${rootSessionId}`, kind: "expedition", cityId: CITY, rootSessionId, generation: 1, x, y, cli: "omp", repo: { commonDir: CITY, checkout: CITY.slice(0, -5) } });
+const expeditionOp = (rootSessionId, x, y) => ({ opId: `expedition:${rootSessionId}`, kind: "expedition", at: 1, activatedAt: 1, cityId: CITY, rootSessionId, generation: 1, x, y, cli: "omp", repo: { commonDir: CITY, checkout: CITY.slice(0, -5) } });
 
 async function ingestOnce(ledger, { hooks = [], sources = [], activities = [], diffForCommit, remoteMerges }) {
   if (activities.length) await ingestActivities(ledger, activities, CITY);

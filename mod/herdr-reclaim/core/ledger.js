@@ -140,7 +140,7 @@ export function emptyState(cityId) {
 export function addTile(state, tile) {
   state.tiles.push(tile);
   state.tileById.set(tileId(tile.cityId, tile.rootSessionId, tile.generation), tile);
-  state.taken.add(tileKey(tile.cityId, tile.x, tile.y));
+  if (tile.landStage !== "withdrawn") state.taken.add(tileKey(tile.cityId, tile.x, tile.y));
   const key = `${tile.cityId}@@${tile.rootSessionId}`;
   const current = state.currentGen.get(key) ?? 0;
   if ((tile.generation ?? 1) > current) state.currentGen.set(key, tile.generation ?? 1);
@@ -151,6 +151,70 @@ export function addTile(state, tile) {
  * 每一種 operation 的套用與前提檢查。之後的票（#5／#6／#7／#8）在這裡加新的 kind，
  * entry 只要帶上自己的欄位即可，格式不用改。
  */
+const MINUTE_MS = 60_000;
+
+/** Intervals clipped to a generation's activation window, then unioned. */
+function naturalWorkPoints(state, tile) {
+  const parentById = new Map([...state.activities.values()].map((record) => [record.sessionId, record.parentSessionId]));
+  const rootOf = (sessionId) => {
+    const seen = new Set();
+    let current = sessionId;
+    while (parentById.get(current) && !seen.has(current)) {
+      seen.add(current);
+      current = parentById.get(current);
+    }
+    return current;
+  };
+  const intervals = [];
+  for (const record of state.activities.values()) {
+    if (rootOf(record.sessionId) !== tile.rootSessionId) continue;
+    let cityId = null;
+    let opened = null;
+    for (const event of record.events ?? []) {
+      if (event.kind === "visit_start") cityId = event.visit?.commonDir ?? null;
+      else if (event.kind === "visit_end") {
+        if (opened !== null && cityId === tile.cityId) intervals.push([opened, event.at]);
+        opened = null;
+        cityId = null;
+      } else if (event.kind === "interval_open") opened = event.at;
+      else if (event.kind === "heartbeat" && opened !== null) {
+        if (cityId === tile.cityId) intervals.push([opened, event.at]);
+        opened = event.at;
+      } else if (event.kind === "interval_close" && opened !== null) {
+        if (cityId === tile.cityId) intervals.push([opened, event.at]);
+        opened = null;
+      }
+    }
+  }
+  const start = Number(tile.activatedAt ?? 0);
+  const end = tile.deactivatedAt == null ? Infinity : Number(tile.deactivatedAt);
+  const clipped = intervals
+    .map(([a, b]) => [Math.max(a, start), Math.min(b, end)])
+    .filter(([a, b]) => b > a)
+    .sort((a, b) => a[0] - b[0]);
+  let total = 0;
+  let from = null;
+  let to = null;
+  for (const [a, b] of clipped) {
+    if (from === null) [from, to] = [a, b];
+    else if (a > to) {
+      total += to - from;
+      [from, to] = [a, b];
+    } else to = Math.max(to, b);
+  }
+  if (from !== null) total += to - from;
+  return Math.floor(total / MINUTE_MS);
+}
+
+export function generationAt(state, rootSessionId, at) {
+  const timestamp = Number(at);
+  return state.tiles.find((tile) =>
+    tile.rootSessionId === rootSessionId &&
+    Number(tile.activatedAt ?? 0) <= timestamp &&
+    (tile.deactivatedAt == null || timestamp < Number(tile.deactivatedAt))
+  ) ?? null;
+}
+
 export const KINDS = {
   /**
    * 遠征取得土地（§4 的自動選地）：座標由呼叫端在 `make` 裡用 BFS 算出來；
@@ -164,22 +228,66 @@ export const KINDS = {
       if (state.taken.has(tileKey(op.cityId, op.x, op.y))) return "tile_taken";
       const current = state.currentGen.get(`${op.cityId}@@${op.rootSessionId}`);
       if (current === undefined ? generation !== 1 : generation !== current + 1) return "bad_generation";
+      if (current !== undefined) {
+        const previous = state.tileById.get(tileId(op.cityId, op.rootSessionId, current));
+        if (!previous || !["withdrawn", "archived"].includes(previous.landStage)) return "generation_not_released";
+      }
       return null;
     },
     apply(state, entry) {
-      addTile(state, {
+      const tile = addTile(state, {
         seq: entry.journalSeq,
         cityId: entry.cityId,
         rootSessionId: entry.rootSessionId,
         generation: entry.generation ?? 1,
         x: entry.x,
         y: entry.y,
+        activatedAt: Number(entry.activatedAt ?? entry.at ?? 0),
+        deactivatedAt: null,
+        landStage: null,
+        workPoints: 0,
+        harvestPoints: 0,
+        boostPoints: 0,
         harvestedPaths: [],
         cli: entry.cli ?? null,
         repo: entry.repo ?? null,
-        harvestPoints: 0,
         harvested: false,
       });
+      tile.workPoints = naturalWorkPoints(state, tile);
+      if (tile.workPoints >= 100) tile.landStage = "cleared";
+    },
+  },
+  landAction: {
+    precheck(state, op) {
+      const generation = op.generation ?? 1;
+      if (state.currentGen.get(`${op.cityId}@@${op.rootSessionId}`) !== generation) return "stale_generation";
+      const tile = state.tileById.get(tileId(op.cityId, op.rootSessionId, generation));
+      if (!tile) return "no_expedition";
+      if (tile.harvested) return "has_commit_harvest";
+      const stage = tile.landStage ?? (tile.workPoints + tile.harvestPoints + tile.boostPoints >= 100 ? "cleared" : "reserved");
+      if (op.action === "withdraw" && stage !== "reserved") return "not_withdrawable";
+      if (op.action === "archive" && stage !== "cleared") return "not_archivable";
+      if (op.action !== "withdraw" && op.action !== "archive") return "invalid_action";
+      return null;
+    },
+    apply(state, entry) {
+      const generation = entry.generation ?? 1;
+      const tile = state.tileById.get(tileId(entry.cityId, entry.rootSessionId, generation));
+      tile.landStage = entry.action === "withdraw" ? "withdrawn" : "archived";
+      tile.deactivatedAt = Number(entry.at);
+      if (entry.action === "withdraw") state.taken.delete(tileKey(entry.cityId, tile.x, tile.y));
+    },
+  },
+  build: {
+    precheck(state, op) {
+      const tile = state.tileById.get(tileId(op.cityId, op.rootSessionId, op.generation));
+      return !tile || state.currentGen.get(`${op.cityId}@@${op.rootSessionId}`) !== op.generation
+        ? "stale_generation"
+        : tile.landStage !== "cleared" ? "not_cleared" : null;
+    },
+    apply(state, entry) {
+      const tile = state.tileById.get(tileId(entry.cityId, entry.rootSessionId, entry.generation));
+      tile.landStage = "built";
     },
   },
   /**
@@ -197,7 +305,12 @@ export const KINDS = {
       const key = activityKey(entry);
       const current = state.activities.get(key);
       const bySeq = new Map((current?.events ?? []).map((event) => [event.eventSeq, event]));
-      for (const event of blobs?.events ?? []) bySeq.set(event.eventSeq, event);
+      for (const event of blobs?.events ?? []) {
+        const prior = bySeq.get(event.eventSeq);
+        const resolvedVisit = prior?.kind === "visit_start" && prior.visit?.commonDir &&
+          event.kind === "visit_start" && !event.visit?.commonDir;
+        bySeq.set(event.eventSeq, resolvedVisit ? { ...event, visit: prior.visit } : event);
+      }
       const events = [...bySeq.values()].sort((a, b) => a.eventSeq - b.eventSeq);
       state.activities.set(key, {
         schema: ACTIVITY_SCHEMA,
@@ -212,19 +325,24 @@ export const KINDS = {
         lastEventSeq: Math.max(current?.lastEventSeq ?? -1, entry.lastEventSeq ?? -1),
         events,
       });
+      for (const tile of state.tiles) {
+        if (tile.landStage) continue;
+        tile.workPoints = naturalWorkPoints(state, tile);
+        if (tile.workPoints + (tile.harvestPoints ?? 0) + (tile.boostPoints ?? 0) >= 100) tile.landStage = "cleared";
+      }
     },
   },
   /**
    * 收成（§7.3）：entry 自己帶 claim（城級去重）、資源向量與開墾點。
-   * **前提包含 generation**：指定的是這支遠征的舊 generation 時整筆拒絕
-   * （S3 spike 的失敗：gen 1 的收成被套進 gen 2）。
+   * **前提包含 generation 時間窗**：即使目前已是新一代，晚到收成仍只能落到事件當時
+   * 啟用的舊 generation；不會把舊 commit 加進新格。
    */
   harvest: {
     precheck(state, op) {
       const generation = op.generation ?? 1;
-      const current = state.currentGen.get(`${op.cityId}@@${op.rootSessionId}`);
-      if (current === undefined) return "no_expedition";
-      if (current !== generation) return "stale_generation";
+      const tile = state.tileById.get(tileId(op.cityId, op.rootSessionId, generation));
+      if (!tile) return "no_expedition";
+      if (generationAt(state, op.rootSessionId, op.at)?.generation !== generation) return "outside_generation";
       const claims = op.claims ?? (op.claim ? [op.claim] : []);
       if (claims.some((claim) => state.claims.has(claimKey(op.cityId, claim)))) return "claim_exists";
       return null;
@@ -234,6 +352,10 @@ export const KINDS = {
       if (!tile) throw new Error(`收成找不到遠征：${entry.rootSessionId}@${entry.generation}`);
       tile.harvestPoints = (tile.harvestPoints ?? 0) + Number(entry.points ?? 0);
       tile.harvestedPaths = [...new Set([...(tile.harvestedPaths ?? []), ...(entry.paths ?? [])])];
+      tile.harvested = tile.harvested || (entry.paths ?? []).length > 0;
+      if ((tile.workPoints ?? 0) + tile.harvestPoints + (tile.boostPoints ?? 0) >= 100 && !tile.landStage) {
+        tile.landStage = "cleared";
+      }
       for (const [name, amount] of Object.entries(entry.resources ?? {})) {
         state.resources[name] = (state.resources[name] ?? 0) + Number(amount);
       }

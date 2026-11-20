@@ -1,5 +1,6 @@
 import { harvestForCommit } from "./harvest.js";
 import { unverifiedReason } from "./session-evidence.js";
+import { generationAt } from "./ledger.js";
 
 export const COMMIT_DIR = "commits";
 export const SOURCE_DIR = "sources";
@@ -116,17 +117,18 @@ export async function ingestCommits({ ledger, hooks, sources, activities, diffFo
     const attribution = attributionFor(sha, hooks, sources, activities);
     const isRemoteMerge = remoteMerges.has(sha);
     const rootId = !isRemoteMerge && attribution.identity ? rootSession(attribution.identity.sessionId, activities) : null;
-    const generation = rootId ? state.currentGen.get(`${ledger.cityId}@@${rootId}`) ?? 1 : 1;
-    const tile = rootId ? state.tileById.get(`${ledger.cityId}@@${rootId}@@${generation}`) : null;
-    const reason = isRemoteMerge ? "remote-merge" : attribution.reason ?? (!tile ? "no-matching-expedition" : null);
     const records = [...hooks, ...sources].filter((record) => record.sha === sha);
+    const commitAt = Math.min(...records.map((record) => Number(record.at) || Date.now()));
+    const tile = rootId ? generationAt(state, rootId, commitAt) : null;
+    const generation = tile?.generation ?? null;
+    const reason = isRemoteMerge ? "remote-merge" : attribution.reason ?? (!tile ? "no-matching-expedition" : null);
     const commitOp = {
       opId: `commit:${sha}:${reason ?? "verified"}:${isRemoteMerge ? "unknown" : attribution.identity?.sessionId ?? "unknown"}`,
       kind: "commit",
       cityId: ledger.cityId,
       sha,
       repo: attribution.cityId,
-      at: Math.min(...records.map((record) => Number(record.at) || Date.now())),
+      at: commitAt,
       reason: reason ?? "verified",
       ...(reason ? {} : {
         sessionId: attribution.identity?.sessionId ?? null,
