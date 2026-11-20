@@ -30,7 +30,10 @@ import { defaultSelection, parseUi, resolveSelection, selectionOf, serializeUi, 
 import { readQuotas } from "./core/provider-stats.js";
 import { CLEAR_POINTS, formatResearch, readTown, readTownFromLedger, selectionDetail } from "./core/town.js";
 import { firstExpedition } from "./scenarios/first-expedition.js";
-import { searchHistory } from "./core/history.js";
+import {
+  historyChanged, historyJumped, historyLoadFailed, historyLoaded, historyOpened, historySubmitted,
+  isSubmitKeystroke,
+} from "./core/history-search.js";
 import { historyPanel } from "./ui/history.js";
 import { factionTag, guildBlock, investmentSection, quotaSection } from "./ui/standing.js";
 
@@ -326,11 +329,12 @@ export default class Town extends View {
     this.hookNotice = null;
     // `herdr-app check` 會真的跑 init：不要動使用者的檔案，只渲染固定情境。
     this.historyOpen = false;
-    this.historyData = { records: [], tiles: [], unresolvedActivities: [], cityNames: {} };
-    this.historyState = { query: "", results: [], total: 0 };
+    this.historyState = historyOpened();
     this.historyInput = InputState.new({ placeholder: "搜尋日期、城、session、commit 或成果路徑" });
-    this.historyInput.on("change", () => { this.historyState.query = this.historyInput.value(); });
-    this.historyInput.on("submit", (_event, cx2) => this.runHistorySearch(cx2));
+    // 三條送出查詢的路都走同一個狀態機：輸入框的 submit 事件、Enter／Return 的 keydown，
+    // 以及面板上的「搜尋」按鈕（見 ui/history.js）。鍵名依平台而異，不再只認一種。
+    this.historyInput.on("change", () => { this.historyState = historyChanged(this.historyState, this.historyInput.value()); });
+    this.historyInput.on("submit", (_event, cx2) => this.submitHistoryQuery(cx2));
     if (checking()) {
       this.town = readTown(firstExpedition);
       this.selection = defaultSelection(this.town);
@@ -381,7 +385,7 @@ export default class Town extends View {
   }
   openHistory(cx) {
     this.historyOpen = true;
-    this.historyState = { query: "", results: [], total: 0, loading: true };
+    this.historyState = historyOpened();
     this.historyInput.set_value("");
     cx.notify();
     cx.spawn(async (cx2) => {
@@ -400,25 +404,28 @@ export default class Town extends View {
           records.push(...await ledger.historyRecords());
           tiles.push(...state.tiles);
         }
-        this.historyData = { records, tiles, cityNames, unresolvedActivities: this.town?.unresolvedActivities ?? [] };
-        this.historyState = { query: "", results: [], total: 0, loading: false };
+        // 已經打好的查詢會在這裡立刻重跑：先打字、後載入不會停在 0 筆。
+        this.historyState = historyLoaded(this.historyState, {
+          records, tiles, cityNames, unresolvedActivities: this.town?.unresolvedActivities ?? [],
+        });
       } catch (error) {
-        this.historyState = { query: "", results: [], total: 0, error: `歷程讀取失敗：${error}` };
+        this.historyState = historyLoadFailed(this.historyState, error);
       }
       cx2.notify();
     });
   }
 
-  runHistorySearch(cx) {
-    this.historyState.query = this.historyInput.value();
-    const found = searchHistory({ ...this.historyData, query: this.historyState.query });
-    this.historyState = { ...this.historyState, ...found };
+  /** Enter／Return 的 keydown 與「搜尋」按鈕；沒有資料時也只回一個看得見的狀態。 */
+  submitHistoryQuery(cx) {
+    this.historyState = historySubmitted(this.historyState, this.historyInput.value());
     cx.notify();
   }
+
 
   jumpHistory(item, cx) {
     if (item.jump) {
       this.select(item.jump, cx);
+      this.historyState = historyJumped(this.historyState);
       this.historyOpen = false;
       return;
     }
@@ -430,6 +437,7 @@ export default class Town extends View {
     this.historyOpen = false;
     cx.notify();
   }
+
 
   operateLand(detail, action, cx) {
     if (!detail?.cityId || !detail.rootSessionId) return;
@@ -808,7 +816,7 @@ export default class Town extends View {
         input: this.historyInput,
         theme: t,
         onClose: (cx2) => this.closeHistory(cx2),
-        onQuery: (cx2) => this.runHistorySearch(cx2),
+        onKeyDown: (cx2) => this.submitHistoryQuery(cx2),
         onJump: (item, cx2) => this.jumpHistory(item, cx2),
       }).w(width).flex_none().min_h(0).overflow_y_scrollbar().bg(t.chrome).border_l(1).border_color(t.border);
     }

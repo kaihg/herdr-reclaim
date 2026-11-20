@@ -29,15 +29,34 @@ export function historyResultLines(item) {
   return { summary, reasonLine };
 }
 
-const isoDate = (at) => Number.isFinite(Number(at)) && Number(at) > 0
-  ? new Date(Number(at)).toISOString().slice(0, 10)
-  : "";
+/**
+ * 時間戳記的安全讀法。舊的 hook 證據檔出現過 20 位數的 `at`（1.8e19，超出 Date 的可表示
+ * 範圍），`new Date(1.8e19).toISOString()` 會直接丟 RangeError，把整個歷程搜尋打斷——UI 上
+ * 看起來就是「每一種查詢都 0 筆」。這裡只接受合理的毫秒 epoch，其餘一律當成時間未知。
+ */
+const MAX_EPOCH_MS = 8_640_000_000_000_000;
+
+export function usableTime(at) {
+  const value = Number(at);
+  return Number.isFinite(value) && value > 0 && value <= MAX_EPOCH_MS ? value : null;
+}
+
+const isoDate = (at) => {
+  const value = usableTime(at);
+  return value === null ? "" : new Date(value).toISOString().slice(0, 10);
+};
+
+/** 結果列的時間；壞掉的時間戳記顯示「時間未知」，不讓 render 丟例外。 */
+export function formatHistoryTime(at) {
+  const value = usableTime(at);
+  return value === null ? "時間未知" : new Date(value).toLocaleString("zh-TW");
+}
 
 /** Compact journal projection stored in the rebuildable checkpoint search index. */
 export function historyRecordOf(entry) {
   return {
     seq: entry.journalSeq,
-    at: Number(entry.at ?? 0),
+    at: usableTime(entry.at) ?? 0,
     kind: entry.kind,
     cityId: entry.cityId ?? null,
     rootSessionId: entry.rootSessionId ?? null,

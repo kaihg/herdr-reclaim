@@ -2,10 +2,11 @@ import { Input } from "gpui-base";
 import { h_flex, v_flex } from "gpui-base";
 import { div } from "gpui-kit";
 
-import { historyResultLines } from "../core/history.js";
+import { formatHistoryTime, historyResultLines } from "../core/history.js";
+import { historyStatusLine, isSubmitKeystroke } from "../core/history-search.js";
 
 /** Search panel mounted only when opened from the selected expedition/tile details. */
-export function historyPanel({ state, input, theme, onClose, onQuery, onJump }) {
+export function historyPanel({ state, input, theme, onClose, onQuery, onJump, onKeyDown }) {
   const results = state.results ?? [];
   return v_flex().id("history-panel").size_full().gap(8).p(14).bg(theme.chrome)
     .border(1).border_color(theme.border)
@@ -14,15 +15,21 @@ export function historyPanel({ state, input, theme, onClose, onQuery, onJump }) 
       .child(action("返回詳情", theme, onClose)))
     .child(div().text_size(10).text_color(theme.dim)
       .child("可輸入 date:、city:、session:、commit:、path:；未解析活動也會列出。"))
-    .child(Input.new(input))
-    .child(div().text_size(10).text_color(theme.muted).child(`${state.total ?? results.length} 筆符合 · 輸入後按 Enter 搜尋`))
+    .child(h_flex().gap(6).items_center()
+      .child(div().flex_1().min_w(0).child(Input.new(input).on_key_down((event, cx) => {
+        // 平台的鍵名不一致（macOS 主 Enter 常寫成 Return）：認得的就送出搜尋。
+        if (isSubmitKeystroke(event)) onKeyDown(cx);
+      })))
+      .child(action("搜尋", theme, onKeyDown)))
+    // 狀態放在結果上方：載入中、讀取失敗與查詢筆數都不會被結果區捲掉。
+    .child(div().text_size(10).text_color(state.error ? theme.ansi1 : theme.muted)
+      .child(historyStatusLine(state)))
     .child(v_flex().id("history-results").flex_1().min_h(0).gap(4).overflow_y_scrollbar()
-      .children(results.map((item, index) => resultRow(item, index, theme, (cx) => onJump(item, cx)))))
-    .when(Boolean(state.error), (element) => element.child(div().text_size(10).text_color(theme.ansi1).child(state.error)));
+      .children(results.map((item, index) => resultRow(item, index, theme, (cx) => onJump(item, cx)))));
 }
 
 function resultRow(item, index, theme, onClick) {
-  const date = Number(item.at) > 0 ? new Date(Number(item.at)).toLocaleString("zh-TW") : "時間未知";
+  const date = formatHistoryTime(item.at);
   const { summary, reasonLine } = historyResultLines(item);
   const target = item.jump
     ? `${item.cityName} · ${item.rootSessionId} · 第 ${item.generation ?? 1} 代`
