@@ -48,6 +48,7 @@ const COMMIT_REASON_LABELS = {
   "ambiguous-repository": "repo 證據不唯一",
   "no-hook-repository-evidence": "沒有 repo 證據",
   "no-matching-expedition": "沒有匹配遠征",
+  "no-matching-adapter-session": "對不到 adapter session",
   "no-eligible-changes": "沒有可收成變更",
 };
 

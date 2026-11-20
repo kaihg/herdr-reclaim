@@ -16,14 +16,14 @@ export function hookScript({ hook, appHome }) {
 `facts=$(git rev-parse --path-format=absolute --git-common-dir --show-toplevel HEAD 2>/dev/null) || exit 0\n` +
 `{ IFS= read -r common; IFS= read -r top; IFS= read -r sha; } <<HERDR_RECLAIM_FACTS\n$facts\nHERDR_RECLAIM_FACTS\n` +
 `at=0\n` +
-`if [ -n "$PI_SESSION_ID$CODEX_THREAD_ID$CLAUDE_SESSION_ID" ]; then reason=; elif [ -n "$HC_TERMINAL_ID" ]; then reason=terminal-only; else reason=no-session-source; fi\n` +
+`if [ -n "$PI_SESSION_ID$CODEX_THREAD_ID$CLAUDE_CODE_SESSION_ID" ]; then reason=; elif [ -n "$HC_TERMINAL_ID" ]; then reason=terminal-only; else reason=no-session-source; fi\n` +
 `mkdir -p "$ROOT" 2>/dev/null || exit 0\n` +
 `tmp="$ROOT/.$sha.$HOOK.$$"\n` +
 `repo_key=$(printf '%s\\n' "$sha" "$HOOK" "$common" "$top" "$at" | LC_ALL=C TMPFILE="$tmp" REWRITE="$input" REASON="$reason" awk '\n` +
 `function esc(s) { gsub(/\\\\/, "\\\\\\\\", s); gsub(/\\\"/, "\\\\\\\"", s); gsub(/\\t/, "\\\\t", s); gsub(/\\r/, "\\\\r", s); gsub(/\\n/, "\\\\n", s); return s }\n` +
 `function byte(s, j) { for (j=1; j<256; j++) if (sprintf("%c", j) == s) return j; return 0 }\n` +
 `NR==1 { sha=$0 } NR==2 { hook=$0 } NR==3 { common=$0; repo_key=1; for (i=1; i<=length(common); i++) repo_key=(repo_key*65599+byte(substr(common,i,1)))%2147483647 } NR==4 { top=$0 } NR==5 { at=$0 } END {\n` +
-`  printf "{\\\"schema\\\":1,\\\"sha\\\":\\\"%s\\\",\\\"hook\\\":\\\"%s\\\",\\\"commonDir\\\":\\\"%s\\\",\\\"toplevel\\\":\\\"%s\\\",\\\"at\\\":%s,\\\"reason\\\":\\\"%s\\\",\\\"rewrite\\\":\\\"%s\\\",\\\"env\\\":{\\\"PI_SESSION_ID\\\":\\\"%s\\\",\\\"PI_TOOL_CALL_ID\\\":\\\"%s\\\",\\\"CODEX_THREAD_ID\\\":\\\"%s\\\",\\\"CLAUDE_SESSION_ID\\\":\\\"%s\\\"}}\\n", sha, esc(hook), esc(common), esc(top), at, esc(ENVIRON["REASON"]), esc(ENVIRON["REWRITE"]), esc(ENVIRON["PI_SESSION_ID"]), esc(ENVIRON["PI_TOOL_CALL_ID"]), esc(ENVIRON["CODEX_THREAD_ID"]), esc(ENVIRON["CLAUDE_SESSION_ID"]) > ENVIRON["TMPFILE"]\n` +
+`  printf "{\\\"schema\\\":1,\\\"sha\\\":\\\"%s\\\",\\\"hook\\\":\\\"%s\\\",\\\"commonDir\\\":\\\"%s\\\",\\\"toplevel\\\":\\\"%s\\\",\\\"at\\\":%s,\\\"reason\\\":\\\"%s\\\",\\\"rewrite\\\":\\\"%s\\\",\\\"env\\\":{\\\"PI_SESSION_ID\\\":\\\"%s\\\",\\\"PI_TOOL_CALL_ID\\\":\\\"%s\\\",\\\"CODEX_THREAD_ID\\\":\\\"%s\\\",\\\"CODEX_TOOL_CALL_ID\\\":\\\"%s\\\",\\\"CLAUDE_CODE_SESSION_ID\\\":\\\"%s\\\"}}\\n", sha, esc(hook), esc(common), esc(top), at, esc(ENVIRON["REASON"]), esc(ENVIRON["REWRITE"]), esc(ENVIRON["PI_SESSION_ID"]), esc(ENVIRON["PI_TOOL_CALL_ID"]), esc(ENVIRON["CODEX_THREAD_ID"]), esc(ENVIRON["CODEX_TOOL_CALL_ID"]), esc(ENVIRON["CLAUDE_CODE_SESSION_ID"]) > ENVIRON["TMPFILE"]\n` +
 `  close(ENVIRON["TMPFILE"]); printf "%.0f", repo_key\n` +
 `}\n' )\n` +
 `if [ -n "$repo_key" ] && [ -s "$tmp" ]; then mv -f "$tmp" "$ROOT/$sha.$HOOK.$repo_key.json" 2>/dev/null; else rm -f "$tmp"; fi\n` +
