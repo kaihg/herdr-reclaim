@@ -14,8 +14,9 @@ import { describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import { CityLedger, byteLen } from "../core/ledger.js";
 import { readTownFromLedger } from "../core/town.js";
-import { processLand, redispatch } from "../core/ingest.js";
-import { AT } from "../scenarios/first-expedition.js";
+import { ingestScenario, processLand, redispatch } from "../core/ingest.js";
+import { AT, activity, visitStart } from "../scenarios/first-expedition.js";
+import { CLEAR_POINTS } from "../core/rules.js";
 import { createFileIo } from "./fs-io.js";
 
 const CITY_ID = "/reclaim/capacity-city";
@@ -255,6 +256,55 @@ describe("⑥ 封段要預留封段行的空間（原 §15.3 根因）", () => {
     const reopened = await open(dir, { segmentLimit: limit });
     expect(entriesOf(await segmentsOf(reopened))).toHaveLength(total);
     expect((await reopened.state()).opSeqs.size).toBe(total);
+  });
+});
+
+describe("fork 是獨立 root：只把 child 併進它的 parent", () => {
+  test("互動 fork 超過門檻可以封存，來源格不會被加上 fork 的工時", async () => {
+    const minutes = (count) => count * 60_000;
+    const repo = { commonDir: CITY_ID, checkout: "/reclaim/capacity-city" };
+    const root = "sess-root-fork";
+    const fork = "sess-fork";
+    const records = [
+      // 來源遠征只工作 10 分鐘（未滿 100 點）。
+      activity({
+        sessionId: root,
+        role: "root",
+        interactive: true,
+        writerEpoch: "root-1",
+        events: [
+          visitStart("v-root", AT, repo),
+          { kind: "interval_open", at: AT },
+          { kind: "interval_close", at: AT + minutes(10) },
+        ],
+      }),
+      // 互動 fork 是獨立的 root：工作 110 分鐘，自己滿 100 點。
+      activity({
+        sessionId: fork,
+        role: "fork",
+        interactive: true,
+        parentSessionId: root,
+        writerEpoch: "fork-1",
+        events: [
+          visitStart("v-fork", AT + 1, repo),
+          { kind: "interval_open", at: AT + 1 },
+          { kind: "interval_close", at: AT + minutes(110) },
+        ],
+      }),
+    ];
+    const ledger = await open(dirOf("fork"));
+    await ingestScenario(ledger, { activities: records, repoFacts: { [CITY_ID]: { hadHead: true } } }, CITY_ID);
+
+    const state = await ledger.state();
+    expect(state.tileById.get(`${CITY_ID}@@${fork}@@1`).workPoints).toBeGreaterThanOrEqual(CLEAR_POINTS);
+    expect(state.tileById.get(`${CITY_ID}@@${root}@@1`).workPoints).toBe(10);
+    // 帳本與畫面說同一件事：fork 已開墾，來源格還在預留。
+    expect((await tileOf(ledger, fork)).landStage).toBe("cleared");
+    expect((await ledger.submit(() => ({
+      opId: `archive:${CITY_ID}:${fork}:1`, kind: "landAction", at: AT + minutes(200),
+      cityId: CITY_ID, rootSessionId: fork, generation: 1, action: "archive",
+    }))).status).toBe("applied");
+    expect((await ledger.state()).tileById.get(`${CITY_ID}@@${root}@@1`).landStage).toBeFalsy();
   });
 });
 

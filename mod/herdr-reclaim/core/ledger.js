@@ -83,6 +83,15 @@ export class CrashAfterJournal extends Error {
   }
 }
 
+/** 故障注入用：封段行已附加、下一段還沒建立時中斷（§13.1 的恢復情境）。 */
+export class CrashAfterSeal extends Error {
+  constructor(opId) {
+    super(`封段已寫、下一段未建立：${opId}`);
+    this.name = "CrashAfterSeal";
+    this.opId = opId;
+  }
+}
+
 /** 城的目錄名：cityId 是絕對路徑，不能直接當檔名。 */
 export function cityDir(baseDir, cityId) {
   return `${baseDir}/cities/${hashText(cityId)}`;
@@ -193,18 +202,37 @@ export function addTile(state, tile) {
  */
 const MINUTE_MS = 60_000;
 
+/**
+ * §6.1：只有 role=child 的 session 併進它的 parent；互動 fork 是**獨立的 root**，
+ * 保留自己的格。這裡跟 `core/town.js` 的歸戶規則用同一套（每個 session 取 writerEpoch
+ * 最小的那一筆 epoch 當身份），否則帳本說「沒開墾」而畫面說「已開墾」。
+ */
+function rootLookup(activities) {
+  const byId = new Map();
+  const ordered = [...activities].sort((a, b) => a.sessionId === b.sessionId
+    ? String(a.writerEpoch ?? "").localeCompare(String(b.writerEpoch ?? ""))
+    : a.sessionId.localeCompare(b.sessionId));
+  for (const record of ordered) {
+    if (byId.has(record.sessionId)) continue;
+    byId.set(record.sessionId, { role: record.role ?? "root", parentSessionId: record.parentSessionId ?? null });
+  }
+  return (sessionId) => {
+    const seen = new Set();
+    let current = byId.get(sessionId);
+    let root = sessionId;
+    while (current?.role === "child" && current.parentSessionId && !seen.has(sessionId)) {
+      seen.add(sessionId);
+      sessionId = current.parentSessionId;
+      root = sessionId;
+      current = byId.get(sessionId);
+    }
+    return root;
+  };
+}
+
 /** Intervals clipped to a generation's activation window, then unioned. */
 function naturalWorkPoints(state, tile) {
-  const parentById = new Map([...state.activities.values()].map((record) => [record.sessionId, record.parentSessionId]));
-  const rootOf = (sessionId) => {
-    const seen = new Set();
-    let current = sessionId;
-    while (parentById.get(current) && !seen.has(current)) {
-      seen.add(current);
-      current = parentById.get(current);
-    }
-    return current;
-  };
+  const rootOf = rootLookup(state.activities.values());
   const intervals = [];
   for (const record of state.activities.values()) {
     if (rootOf(record.sessionId) !== tile.rootSessionId) continue;
@@ -598,32 +626,41 @@ export class CityLedger {
     return { text, head: JSON.parse(text) };
   }
 
-  /** head 指到的尾段；head 落後時跟著封段標記往前。 */
-  async tailView() {
-    const { text: headText, head } = await this.head();
-    let index = head.segment;
-    let text = await this.io.read(this.segmentPath(index));
-    let parsed = parseSegment(text ?? "");
-    let guard = 0;
-    while (parsed.sealed) {
-      if (guard++ > 4096) throw new Error("封段鏈太長");
-      index = parsed.sealNext;
-      text = await this.io.read(this.segmentPath(index));
-      parsed = parseSegment(text ?? "");
-    }
-    return { head, headText, index, text, entries: parsed.entries };
-  }
-
-  /** 第 `from` 段起連續存在的所有段（讀取與 checkpoint 重播都走這裡）。 */
+  /**
+   * 第 `from` 段起沿著封段標記走出來的段（讀取、重播與 checkpoint 都走這裡）。
+   *
+   * 讀到封段標記、它指的下一段還不存在時（封段 CAS 成功、建立下一段之前中斷），
+   * 由讀到 seal 的寫入者補上（§13.1）。不是接在 seal 後面的缺口一律當損壞，不猜。
+   */
   async scanSegments(from = 0) {
     const segments = [];
-    for (let index = from; ; index++) {
-      const text = await this.io.read(this.segmentPath(index));
-      if (text === null) break;
+    let index = from;
+    for (let guard = 0; ; guard++) {
+      if (guard > 8192) throw new Error("封段鏈太長");
+      let text = await this.io.read(this.segmentPath(index));
+      if (text === null) {
+        const previous = segments[segments.length - 1];
+        if (!previous?.sealed || previous.sealNext !== index) break;
+        await this.create(this.segmentPath(index), "");
+        text = await this.io.read(this.segmentPath(index));
+        if (text === null) throw new Error(`封段後的下一段建立不起來：${index}`);
+      }
       if (byteLen(text) > this.limit) throw new Error(`第 ${index} 段超過上限`);
-      segments.push({ index, text, ...parseSegment(text) });
+      const parsed = parseSegment(text);
+      segments.push({ index, text, ...parsed });
+      // 尾段之後還讀一段：正常情況下它是 null（就是「到這裡為止」的證明），
+      // 也讓「掃描完成的讀取」跟「尾段是哪一段」由同一條讀取鏈決定。
+      index = parsed.sealed && Number.isInteger(parsed.sealNext) ? parsed.sealNext : index + 1;
     }
     return segments;
+  }
+
+  /** 掃描結果的尾段：下一筆 entry 要附加的那一段。 */
+  tailOf(segments, fallback) {
+    const last = segments[segments.length - 1];
+    return last
+      ? { index: last.index, text: last.text, entries: last.entries.length }
+      : { index: fallback, text: "", entries: 0 };
   }
 
   /** checkpoint + 之後的 journal → 狀態，並把讀取快取一起準備好。 */
@@ -640,24 +677,19 @@ export class CityLedger {
     if (from > 0 && (await this.io.read(this.segmentPath(from))) === null) {
       throw new Error(`checkpoint 指到的第 ${from} 段不見了`);
     }
-    let segment = from;
-    for (const part of await this.scanSegments(from)) {
+    // 重播與 CAS 前提必須來自**同一份掃描結果**：尾段直接取這份結果，不再另外重讀
+    // 一次。否則別的寫入者在兩次讀取之間附加的 entry 會讓 state 停在 N−1、CAS 前提
+    // 卻已經含著它，下一個 submit 就會對最新尾段寫出重複的序號（§13.1）。
+    const parts = await this.scanSegments(from);
+    for (const part of parts) {
       for (const entry of part.entries) {
         if (entry.journalSeq <= state.lastSeq) continue;
         applyTo(state, entry, await this.contentOf(entry));
-        segment = part.index;
       }
     }
-    const view = await this.tailView();
-    this.cache = {
-      state,
-      head,
-      headText,
-      segment,
-      tail: { index: view.index, text: view.text ?? "", entries: view.entries.length },
-      stale: false,
-    };
-    return { state, segment };
+    const tail = this.tailOf(parts, from);
+    this.cache = { state, head, headText, segment: tail.index, tail, stale: false };
+    return { state, segment: tail.index };
   }
 
   /** entry 引用的內容檔（沒有就回 null）。 */
@@ -668,6 +700,7 @@ export class CityLedger {
   /**
    * 讀取快取同步：`state()` 一律重讀尾段（別人的寫入才看得到）；`submit()` 平常只信快取，
    * CAS 失敗時才標成 stale 強制重讀——所以一百萬筆操作的路徑上不是每筆都掃整個 journal。
+   * 重讀的尾段同樣取自這份掃描結果（跟 rebuild 一樣的理由）。
    */
   async refresh({ force = false } = {}) {
     if (!this.cache) {
@@ -675,18 +708,19 @@ export class CityLedger {
       return;
     }
     if (!force && !this.cache.stale) return;
-    const view = await this.tailView();
-    const from = Math.min(this.cache.segment, view.index);
-    for (const part of await this.scanSegments(from)) {
+    const { text: headText, head } = await this.head();
+    const parts = await this.scanSegments(this.cache.segment);
+    for (const part of parts) {
       for (const entry of part.entries) {
         if (entry.journalSeq <= this.cache.state.lastSeq) continue;
         applyTo(this.cache.state, entry, await this.contentOf(entry));
-        this.cache.segment = part.index;
       }
     }
-    this.cache.head = view.head;
-    this.cache.headText = view.headText;
-    this.cache.tail = { index: view.index, text: view.text ?? "", entries: view.entries.length };
+    const tail = this.tailOf(parts, this.cache.segment);
+    this.cache.head = head;
+    this.cache.headText = headText;
+    this.cache.segment = tail.index;
+    this.cache.tail = tail;
     this.cache.stale = false;
   }
 
@@ -747,6 +781,7 @@ export class CityLedger {
           last = { status: "rotated" };
           continue;
         }
+        if (options.crash === "after-seal") throw new CrashAfterSeal(op.opId);
         await this.create(this.segmentPath(tail.index + 1), "");
         this.cache.head = { ...this.cache.head, segment: tail.index + 1 };
         this.cache.tail = { index: tail.index + 1, text: "", entries: 0 };
