@@ -4,9 +4,10 @@
 // 這兩個模組是純 JS（io 由呼叫端給），mod runtime 用的是同一支程式。
 import { describe, expect, test } from "bun:test";
 import fs from "node:fs";
-import { BlobStore } from "../core/blobs.js";
+import { BlobStore, splitToLeaves } from "../core/blobs.js";
 import { PrefixIndex } from "../core/pages.js";
 import { byteLen } from "../core/bytes.js";
+import { CasConflict } from "../core/cas.js";
 import { createFileIo } from "./fs-io.js";
 
 const LIMIT = 256 * 1024;
@@ -102,6 +103,66 @@ describe("內容檔：切塊與多層 manifest", () => {
 
     expect(again.hash).toBe(first.hash);
     expect(sizesUnder(dir)).toHaveLength(1);
+  });
+
+  test("emoji 落在片段邊界時仍完整讀回：切點不會落在代理對中間", async () => {
+    const dir = dirOf("surrogate");
+    const store = new BlobStore({ io: createFileIo(), dir, limit: 1024 });
+    // 999 個 ASCII ＋ 一個 emoji ＋ 100 個 ASCII：emoji 剛好跨過 1 KiB 的片段邊界
+    // （舊版的 takeEscaped 先 index++ 才檢查預算，切點就落在高低代理之間）。
+    const text = `${"a".repeat(999)}😀${"b".repeat(100)}`;
+    const written = await store.putText(text);
+    expect(written.chunked).toBe(true);
+    expect(await store.getText(written.hash)).toBe(text);
+    expectBounded(dir, 1024);
+
+    // 每一個邊界位置都成立：emoji 在片段裡的任何位置，切點都不切開它。
+    const limit = 64;
+    const budget = limit - 24;
+    for (let offset = 0; offset <= 40; offset++) {
+      const sample = `${"a".repeat(offset)}😀${"z".repeat(60 - offset)}`;
+      const pieces = splitToLeaves(sample, limit);
+      expect(pieces.join("")).toBe(sample);
+      for (const piece of pieces) {
+        expect(byteLen(piece)).toBeLessThanOrEqual(budget);
+        // 片段結尾不會留著代理對的前半，開頭也不會是後半。
+        const last = piece.charCodeAt(piece.length - 1);
+        expect(last >= 0xd800 && last <= 0xdbff).toBe(false);
+        const first = piece.charCodeAt(0);
+        expect(first >= 0xdc00 && first <= 0xdfff).toBe(false);
+      }
+    }
+  });
+
+  test("byteLen 不會讓不成對的代理吃掉下一個字元", () => {
+    expect(byteLen("😀")).toBe(4);
+    expect(byteLen("\ud800a")).toBe(4); // 不成對的高代理 3 + "a" 1
+    expect(byteLen("\udc00a")).toBe(4);
+    expect(byteLen("a\ud800")).toBe(4);
+  });
+
+  test("兩個 pane 同時建立同一份內容：輸家沿用贏家的檔案，不會讓讀城失敗", async () => {
+    const dir = dirOf("create-race");
+    const base = createFileIo();
+    let raced = false;
+    const io = {
+      read: (file) => base.read(file),
+      // 模擬另一個 pane 搶先在 expected=null 建立同一個內容檔：真的寫入，再回報「已經存在」。
+      async write(file, text, expected) {
+        if (!raced && expected === null) {
+          raced = true;
+          await base.write(file, text, null);
+          throw new CasConflict(file, "exists");
+        }
+        return base.write(file, text, expected);
+      },
+    };
+    const store = new BlobStore({ io, dir, limit: LIMIT });
+    const value = { events: [{ eventSeq: 1, kind: "interval_open" }] };
+
+    const written = await store.putValue(value);
+    expect(raced).toBe(true);
+    expect(await store.getValue(written.hash)).toEqual(value);
   });
 });
 
