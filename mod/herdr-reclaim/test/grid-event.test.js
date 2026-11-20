@@ -5,7 +5,7 @@
 // (B) 地圖的平移（滾輪／觸控板）改由相機負責：往下捲＝內容往上，並夾在畫得出來的範圍。
 import { describe, expect, test } from "bun:test";
 
-import { TILE, cameraFor, cellAtEvent, cellAtOffset, contentSize, eventPoint, panCamera } from "../core/grid.js";
+import { TILE, cameraFor, cellAtEvent, cellAtOffset, clampCamera, contentSize, ensureVisible, eventPoint, originInContent, panCamera } from "../core/grid.js";
 
 const tile = { w: 84, h: 44 };
 const zoom = 1.2; // 真視窗的預設縮放（settings.zoom）
@@ -99,5 +99,72 @@ describe("平移（panCamera）", () => {
     const small = { width: 100, height: 80 };
     const next = panCamera({ x: 0, y: 0 }, { x: 50, y: 50 }, small, viewport);
     expect(next).toEqual({ x: 0, y: 0 });
+  });
+});
+
+// QA4 的失敗：600 UI px 窄 pane 選了圖書館（建築）卻沒有入畫。
+// 這一組要求：任何視窗寬高 × 任何選取格（含靠邊的格）→ 那一格的菱形完整落在視窗內。
+describe("選取入畫（cameraFor + clampCamera + ensureVisible）", () => {
+  // main.js 的欄寬規則：左 clamp(96, 19%, 240)、右 clamp(108, 26%, 292)，其餘給地圖。
+  const mapAreaOf = (paneWidthUi, paneHeightUi = 700) => {
+    const clamp = (min, value, max) => Math.max(min, Math.min(max, value));
+    const leftW = Math.round(clamp(96, paneWidthUi * 0.19, 240));
+    const rightW = Math.round(clamp(108, paneWidthUi * 0.26, 292));
+    return { width: Math.max(80, paneWidthUi - leftW - rightW), height: paneHeightUi - 104 };
+  };
+  const viewports = {
+    "600 UI px": mapAreaOf(599),
+    "820 UI px": mapAreaOf(819),
+    "寬版 1200 UI px": mapAreaOf(1200),
+    "極窄（比一格還小）": { width: 40, height: 24 },
+  };
+  const cells = [
+    { x: 0, y: 0 }, { x: 1, y: -1 }, { x: -1, y: 0 },
+    { x: 9, y: -9 }, { x: -9, y: 9 }, { x: 9, y: 9 }, { x: 0, y: -9 }, { x: -9, y: 0 },
+  ];
+  const radius = 9;
+  // main.js 的格子大小：寬度除以 5.4、夾在 56–84；600 UI px 的 pane 約 60 px 一格。
+  const tileOf = (viewport) => {
+    const w = Math.max(56, Math.min(84, Math.floor(viewport.width / 5.4)));
+    return { w, h: Math.round(w / 1.909) };
+  };
+
+  /** 相機定好之後，某一格的方框（視窗內的版面 px）。 */
+  const boxOf = (cell, camera, tile) => {
+    const origin = originInContent(radius, tile);
+    const spot = { left: ((cell.x - cell.y) * tile.w) / 2, top: ((cell.x + cell.y) * tile.h) / 2 };
+    return { left: camera.x + origin.left + spot.left, top: camera.y + origin.top + spot.top, width: tile.w, height: tile.h };
+  };
+
+  for (const [name, viewport] of Object.entries(viewports)) {
+    test(`${name}：任何選取格都完整落在視窗內`, () => {
+      const tile = tileOf(viewport);
+      const size = contentSize(radius, tile);
+      for (const cell of cells) {
+        const centred = cameraFor(cell, viewport, radius, tile);
+        const camera = ensureVisible(cell, clampCamera(centred, size, viewport), viewport, radius, tile);
+        const box = boxOf(cell, camera, tile);
+        if (box.width >= viewport.width || box.height >= viewport.height) {
+          // 視窗比一格還小：做不到「整格入畫」，至少把它擺在視窗中央。
+          expect(Math.abs(box.left + box.width / 2 - viewport.width / 2)).toBeLessThanOrEqual(0.5);
+          expect(Math.abs(box.top + box.height / 2 - viewport.height / 2)).toBeLessThanOrEqual(0.5);
+          continue;
+        }
+        expect(box.left).toBeGreaterThanOrEqual(-0.5);
+        expect(box.top).toBeGreaterThanOrEqual(-0.5);
+        expect(box.left + box.width).toBeLessThanOrEqual(viewport.width + 0.5);
+        expect(box.top + box.height).toBeLessThanOrEqual(viewport.height + 0.5);
+      }
+    });
+  }
+
+  test("視窗比一格大時，置中就是把那一格擺在正中央", () => {
+    const viewport = { width: 323, height: 596 };
+    const tile = tileOf(viewport);
+    const camera = cameraFor({ x: 1, y: -1 }, viewport, radius, tile);
+    const box = boxOf({ x: 1, y: -1 }, camera, tile);
+    // cameraFor 會把相機取整（版面像素），所以允許 0.5 px 內的差。
+    expect(Math.abs(box.left + box.width / 2 - viewport.width / 2)).toBeLessThanOrEqual(0.5);
+    expect(Math.abs(box.top + box.height / 2 - viewport.height / 2)).toBeLessThanOrEqual(0.5);
   });
 });

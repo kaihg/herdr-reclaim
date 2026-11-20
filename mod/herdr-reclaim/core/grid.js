@@ -113,18 +113,41 @@ export function cellAtEvent(event, tile = TILE) {
   return point ? cellAtOffset(point, tile) : null;
 }
 
-/**
- * 捲動／平移：把相機往 delta 的反方向移（往下捲＝內容往上），並夾在畫得出來的範圍內
- * （`[viewport - size, 0]`，內容比視窗小的那一軸固定在 0）。
- */
-export function panCamera(camera, delta, size, viewport) {
-  const axis = (value, deltaValue, sizeValue, viewportValue) => {
+/** 把相機夾在畫得出來的範圍內（`[viewport - size, 0]`；內容比視窗小的那一軸固定在 0）。 */
+export function clampCamera(camera, size, viewport) {
+  const axis = (value, sizeValue, viewportValue) => {
     const limit = Math.min(0, viewportValue - sizeValue);
-    return Math.max(limit, Math.min(0, value - deltaValue));
+    return Math.max(limit, Math.min(0, value));
   };
   return {
-    x: axis(camera.x, delta.x, size.width, viewport.width),
-    y: axis(camera.y, delta.y, size.height, viewport.height),
+    x: axis(camera.x, size.width, viewport.width),
+    y: axis(camera.y, size.height, viewport.height),
+  };
+}
+
+/**
+ * 捲動／平移：把相機往 delta 的反方向移（往下捲＝內容往上），再夾範圍。
+ */
+export function panCamera(camera, delta, size, viewport) {
+  return clampCamera({ x: camera.x - delta.x, y: camera.y - delta.y }, size, viewport);
+}
+
+/**
+ * 選取／跳轉的保證：那一格的**整個菱形**要落在視窗內。在相機上做最小位移；
+ * 視窗比一格還小的時候（極窄 pane）就把它置中（至少整格看得到）。
+ */
+export function ensureVisible(cell, camera, viewport, radius = MAP_RADIUS, tile = TILE) {
+  const origin = originInContent(radius, tile);
+  const spot = projectTile(cell, tile);
+  const axis = (start, size, limit) => {
+    if (size >= limit) return limit / 2 - (start + size / 2);
+    if (start < 0) return -start;
+    if (start + size > limit) return limit - (start + size);
+    return 0;
+  };
+  return {
+    x: camera.x + axis(camera.x + origin.left + spot.left, tile.w, viewport.width),
+    y: camera.y + axis(camera.y + origin.top + spot.top, tile.h, viewport.height),
   };
 }
 
