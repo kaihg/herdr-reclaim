@@ -19,7 +19,7 @@ import { InputState, h_flex, v_flex } from "gpui-base";
 import { appHome, checking, exec, readTextFile, settings, theme, watchFolder, writeTextFile } from "herdr";
 import { ADAPTER_DIR, activityDir, adapterRoot, citiesOf, loadActivities, repoFactsOf } from "./core/adapter.js";
 import { commitContexts, ingestCommits, loadCommitEvidence, parseRawDiff, parseReflogEvidence, unharvestedCommitReasons } from "./core/commit-evidence.js";
-import { MAP_RADIUS, cameraFor, clampCamera, contentSize, ensureVisible, keyOf, panCamera } from "./core/grid.js";
+import { MAP_RADIUS, cameraFor, clampCamera, contentSize, ensureVisible, keyOf, panCamera, visibleRect } from "./core/grid.js";
 import { ingestResearch, ingestScenario, processBoost, processBuild, processLand, processTrade, redispatch } from "./core/ingest.js";
 import { hostIo } from "./core/host-io.js";
 import { CasConflict, CityLedger, cityDir } from "./core/ledger.js";
@@ -916,19 +916,27 @@ export default class Town extends View {
     }
     const tile = tileSize(area);
     const size = contentSize(MAP_RADIUS, tile);
-    // 相機（把某一格擺到視窗中央的平移量）：第一次開城對到城的中心，選取或歷程跳轉把那一格
-    // 帶進畫面。**視窗用這一版 render 實際算出來的地圖區域**（含欄寬與 zoom 換算），所以
-    // 窄 pane 也一樣準；拖動邊緣改變 pane 寬度時會用新的視窗重新對位。
+    // **真正可見的地圖區域**＝地圖框扣掉覆蓋層：頂部的圖例（左上角，實測高度）與
+    // 開啟時的量測面板（左下角）。選取入畫用的是這一塊，不是整個地圖框——
+    // 這就是 600 UI px 的四角格「在框內卻被圖例蓋住／被上緣裁掉」的原因。
+    const visible = visibleRect(area, this.legendSize, this.metricsOpen ? this.metricsSize : null);
     const anchor = this.focusCell ?? this.anchorCell ?? { x: city.center.x, y: city.center.y };
-    const resized = !this.viewport || this.viewport.width !== area.width || this.viewport.height !== area.height;
-    if (this.focusCell || resized || !this.camera || this.camera.cityId !== city.cityId) {
+    const moved = this.focusCell
+      || !this.camera
+      || this.camera.cityId !== city.cityId
+      || visible.x !== this.viewport?.x
+      || visible.y !== this.viewport?.y
+      || visible.width !== this.viewport?.width
+      || visible.height !== this.viewport?.height;
+    if (moved) {
       this.anchorCell = anchor;
-      this.camera = { cityId: city.cityId, ...cameraFor(anchor, area, MAP_RADIUS, tile) };
+      this.camera = { cityId: city.cityId, ...cameraFor(anchor, visible, MAP_RADIUS, tile) };
     }
-    this.viewport = { width: area.width, height: area.height };
-    // 先夾在畫得出來的範圍，再保證選取的那一格整個菱形都在視窗內（極窄 pane 會置中）。
+    this.viewport = visible;
+    // 先夾在畫得出來的範圍（用整個地圖框，平移不被圖例限制），再保證選取的那一格
+    // （含最高的 mock 建築外框，它畫在格子方框內）完整落在**可見區**裡。
     this.camera = { ...this.camera, ...clampCamera(this.camera, size, area) };
-    this.camera = { ...this.camera, ...ensureVisible(this.anchorCell, this.camera, area, MAP_RADIUS, tile) };
+    this.camera = { ...this.camera, ...ensureVisible(this.anchorCell, this.camera, visible, MAP_RADIUS, tile) };
     this.focusCell = null;
     return mapView({
       city,
@@ -983,6 +991,7 @@ export default class Town extends View {
       .bg(t.popover)
       .border(1)
       .border_color(t.border)
+      .on_size_change((size) => { this.metricsSize = size; })
       .child(div().text_size(9).text_color(t.dim).child("量測（門檻：點選 150／面板 500／操作 300 ms）"))
       .children(MEASURES.map(([kind, label]) => {
         const list = this.metrics.samples[kind];
@@ -995,7 +1004,7 @@ export default class Town extends View {
       .child(div().text_size(9).text_color(this.metrics.scroll?.events ? t.muted : t.dim)
         .child(`捲動：${this.metrics.scroll?.events ?? 0} 次 · Δx ${Math.round(this.metrics.scroll?.sumX ?? 0)} · Δy ${Math.round(this.metrics.scroll?.sumY ?? 0)} · 相機 ${Math.round(this.camera?.x ?? 0)},${Math.round(this.camera?.y ?? 0)}`))
       .child(div().text_size(9).text_color(t.dim)
-        .child(`地圖視窗 ${Math.round(this.viewport?.width ?? 0)}×${Math.round(this.viewport?.height ?? 0)} · 置中格 ${this.anchorCell?.x ?? "—"},${this.anchorCell?.y ?? "—"}`))
+        .child(`可見區 ${Math.round(this.viewport?.x ?? 0)},${Math.round(this.viewport?.y ?? 0)} ${Math.round(this.viewport?.width ?? 0)}×${Math.round(this.viewport?.height ?? 0)} · 置中格 ${this.anchorCell?.x ?? "—"},${this.anchorCell?.y ?? "—"}`))
   }
 
   // ---- 右側：選取遠征或格子的詳情（§12 的入口）
@@ -1181,3 +1190,4 @@ function fieldRow(field, t) {
     .child(div().w(54).flex_none().text_size(11).text_color(t.dim).child(field.label))
     .child(div().flex_1().min_w(0).text_size(11.5).child(field.value));
 }
+
