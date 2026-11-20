@@ -11,7 +11,7 @@
 import { Background, PathBuilder, div } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
 
-import { MAP_RADIUS, cellAtOffset, contentSize, keyOf, originInContent, projectTile } from "../core/grid.js";
+import { MAP_RADIUS, cellAtEvent, contentSize, keyOf, originInContent, projectTile } from "../core/grid.js";
 import { GROUND_MOCK, PLOT_DIAMOND, buildingOf, buildingPolygons, factionStyle, groundOf, legendGroups } from "./assets.js";
 
 const LOCAL = { left: 0, top: 0 };
@@ -24,8 +24,8 @@ const LOCAL_CELL = { x: 0, y: 0 };
  * （選取或歷程跳轉），由呼叫端設定一次、這裡消費一次。
  */
 export function mapView({
-  city, tiles, revealed, selection, theme: t, tile, scroll, legendOpen, camera,
-  radius = MAP_RADIUS, onToggleLegend, onPick,
+  city, tiles, revealed, selection, theme: t, tile, legendOpen, camera, viewport,
+  radius = MAP_RADIUS, onToggleLegend, onPick, onPan,
 }) {
   const size = contentSize(radius, tile);
   const origin = originInContent(radius, tile);
@@ -39,11 +39,10 @@ export function mapView({
       else if (revealed.has(keyOf({ x, y }))) open.push({ x, y });
     }
   }
-  // 直接子元素就是捲動容器的項目：第 0 個是撐出捲動範圍的尺寸方塊，
-  // 之後是底層路徑、中心格、有遠征的格子 —— scroll_to_item 的索引就是這個順序
-  // （絕對定位的子元素不會撐開父層，但仍然是直接子元素，所以帶得進畫面）。
+  // 地圖自己擁有平移（相機）：滾輪／觸控板的事件直接改相機，重繪時把整張圖平移。
+  // 這比「原生捲動容器 + scroll_to_item」可靠：那個 API 對絕對定位的子元素沒有作用，
+  // 而且容器自己的偏移與相機同時存在時，畫面會看起來完全沒有動。
   const children = [
-    div().id("map-extent").flex_none().w(size.width).h(size.height),
     fullPath(base.fog, Background.pattern_slash(t.dim, 1, 4), size, camera),
     fullPath(stroked(open, tile, origin), t.background, size, camera),
     fullPath(base.outline, t.border, size, camera),
@@ -56,15 +55,9 @@ export function mapView({
     .relative()
     .overflow_hidden()
     .bg(t.background)
-    .child(
-      div()
-        .id("map-scroll")
-        .relative()
-        .size_full()
-        .overflow_scrollbar()
-        .track_scroll(scroll)
-        .children(children),
-    )
+    // 雙軸捲動：滾輪與觸控板的事件都在這裡收（delta 是裝置回報的像素）。
+    .on_scroll_wheel((event, cx) => onPan(event.delta, cx))
+    .child(div().id("map-view").relative().size_full().children(children))
     .child(legendPanel(t, legendOpen, onToggleLegend));
 }
 
@@ -185,11 +178,10 @@ function cellBox(cell, tile, origin, radius, onPick, camera) {
     .w(tile.w)
     .h(tile.h)
     .on_mouse_down("left", (event, cx) => {
-      const local = event.local_position;
-      if (!local) return;
-      const { dx, dy } = cellAtOffset(local, tile);
-      const x = cell.x + dx;
-      const y = cell.y + dy;
+      const offset = cellAtEvent(event, tile);
+      if (!offset) return;
+      const x = cell.x + offset.dx;
+      const y = cell.y + offset.dy;
       if (Math.abs(x) > radius || Math.abs(y) > radius) return;
       onPick({ x, y }, cx);
     });

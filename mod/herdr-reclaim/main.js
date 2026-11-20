@@ -15,11 +15,11 @@
 //
 // 選取狀態不進城的帳本（見 core/selection.js 的說明），存在 mod 資料目錄下的小檔案。
 import { View, div } from "gpui-kit";
-import { InputState, ScrollHandle, h_flex, v_flex } from "gpui-base";
+import { InputState, h_flex, v_flex } from "gpui-base";
 import { appHome, checking, exec, readTextFile, settings, theme, watchFolder, writeTextFile } from "herdr";
 import { ADAPTER_DIR, activityDir, adapterRoot, citiesOf, loadActivities, repoFactsOf } from "./core/adapter.js";
 import { commitContexts, ingestCommits, loadCommitEvidence, parseRawDiff, parseReflogEvidence, unharvestedCommitReasons } from "./core/commit-evidence.js";
-import { MAP_RADIUS, cameraFor, keyOf } from "./core/grid.js";
+import { MAP_RADIUS, cameraFor, contentSize, keyOf, panCamera } from "./core/grid.js";
 import { ingestResearch, ingestScenario, processBoost, processBuild, processLand, processTrade, redispatch } from "./core/ingest.js";
 import { hostIo } from "./core/host-io.js";
 import { CasConflict, CityLedger, cityDir } from "./core/ledger.js";
@@ -385,7 +385,6 @@ export default class Town extends View {
     this.selection = null;
     this.note = "正在讀取城鎮帳本…";
     this.topNotice = null;
-    this.mapScroll = ScrollHandle.new();
     this.legendOpen = true;
     this.metricsOpen = false;
     this.camera = null;
@@ -923,6 +922,7 @@ export default class Town extends View {
       this.camera = { cityId: city.cityId, ...cameraFor(anchor, area) };
     }
     this.focusCell = null;
+    const size = contentSize(MAP_RADIUS, tile);
     return mapView({
       city,
       tiles,
@@ -930,11 +930,23 @@ export default class Town extends View {
       selection: this.selection,
       theme: t,
       tile,
-      scroll: this.mapScroll,
+      viewport: area,
       legendOpen: this.legendOpen,
       camera: this.camera,
       onToggleLegend: (cx2) => {
         this.legendOpen = !this.legendOpen;
+        cx2.notify();
+      },
+      // 雙軸捲動：滾輪／觸控板的 delta 直接改相機（往下捲＝內容往上），並夾在畫得出來的範圍內。
+      onPan: (delta, cx2) => {
+        if (!this.camera) return; // 城還沒載入時沒有相機
+        const next = panCamera(this.camera, delta, size, area);
+        this.metrics.scroll = {
+          events: (this.metrics.scroll?.events ?? 0) + 1,
+          sumX: (this.metrics.scroll?.sumX ?? 0) + delta.x,
+          sumY: (this.metrics.scroll?.sumY ?? 0) + delta.y,
+        };
+        this.camera = { ...this.camera, ...next };
         cx2.notify();
       },
       onPick: ({ x, y }, cx2) => {
@@ -973,8 +985,8 @@ export default class Town extends View {
       }))
       .child(div().text_size(9).text_color(t.muted)
         .child(`建樹：最近 ${this.metrics.build.last} ms · 最大 ${this.metrics.build.max} ms`))
-      .child(div().text_size(9).text_color(t.dim)
-        .child("捲動為原生 retained scroll，不由 mod 重繪；CPU／位移由外部取樣（筆記 §0.1）"))
+      .child(div().text_size(9).text_color(this.metrics.scroll?.events ? t.muted : t.dim)
+        .child(`捲動：${this.metrics.scroll?.events ?? 0} 次 · Δx ${Math.round(this.metrics.scroll?.sumX ?? 0)} · Δy ${Math.round(this.metrics.scroll?.sumY ?? 0)} · 相機 ${Math.round(this.camera?.x ?? 0)},${Math.round(this.camera?.y ?? 0)}`))
   }
 
   // ---- 右側：選取遠征或格子的詳情（§12 的入口）
