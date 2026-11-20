@@ -751,6 +751,10 @@ function centerDetail(city, quotas = null) {
     points: null,
     pointsTarget: null,
     quota: quotaLines(quotas, { providers }),
+    // 中心格也能操作市集（§7.6）：這裡沒有格子，所以沒有加速與蓋房，只有庫存換得起的配對。
+    buildable: [],
+    boost: null,
+    market: marketDetail(city),
     fields: [
       { label: "身份", value: city.center.label },
       { label: "座標", value: `${city.center.x}, ${city.center.y}` },

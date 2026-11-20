@@ -164,6 +164,28 @@ describe("市集（§7.6、§11）", () => {
     const invalid = await processTrade(ledger, { from: "wood", to: "wood", amount: 1, at: T(800_000) });
     expect(invalid).toMatchObject({ status: "rejected", reason: "invalid_trade" });
   });
+
+  test("中心格詳情提供市集操作：庫存換得起的配對才列出，交易後庫存與市集欄位跟著更新", async () => {
+    const ledger = await townWith("market-center", 5);
+    await credit(ledger, { parchment: 3, wood: 1 });
+    const centerOf = (town) => selectionDetail(town, { kind: "tile", cityId: CITY, x: 0, y: 0 });
+    let center = centerOf(await townOf(ledger));
+    expect(center.kind).toBe("center");
+    // 木材 1 換不出（1 // 3 = 0），羊皮卷 3 可以換 1 份到另外三種資源。
+    expect(center.market.map((pair) => `${pair.from}->${pair.to}:${pair.amount}`))
+      .toEqual(["parchment->wood:1", "parchment->stone:1", "parchment->iron:1"]);
+    expect(center.buildable).toEqual([]);
+    expect(center.boost).toBeNull();
+
+    const [pair] = center.market;
+    expect((await processTrade(ledger, { from: pair.from, to: pair.to, amount: pair.amount, at: T(600_000) })).status)
+      .toBe("applied");
+    const town = await townOf(ledger);
+    expect({ ...town.cities[0].resources }).toEqual({ wood: 2, stone: 0, iron: 0, parchment: 0 });
+    center = centerOf(town);
+    expect(center.market).toEqual([]); // 木材 2 也換不出：庫存不足的配對不列
+    expect(center.fields.find((field) => field.label === "市集").value).toBe("轉入 木材 1 · 轉出 羊皮卷 3");
+  });
 });
 
 describe("蓋房（§7.6、§8.1、§17.1 情境 7）", () => {
