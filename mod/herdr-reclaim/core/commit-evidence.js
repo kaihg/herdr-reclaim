@@ -163,6 +163,9 @@ export async function ingestCommits({ ledger, hooks, sources, activities, diffFo
   const state = await ledger.state();
   const results = [];
   for (const context of commitContexts({ hooks, sources, activities, remoteMerges })) {
+    // 這是**這一座城**的帳本：只有證據自己說屬於這座城（repo 身分相符）才落帳。
+    // repo 未確定的證據不複製到每座城，更不能拿 A 城的 commit 去 B 城找格子發資源。
+    if (context.cityId !== ledger.cityId) continue;
     const { sha, rootId, at: commitAt, remoteMerge: isRemoteMerge } = context;
     const evidence = [...hooks, ...sources].find((record) => record.sha === sha);
     const subject = evidence?.subject ?? (evidence?.reflog ? evidence.reflog.replace(/^commit(?: \(amend\))?:\s*/, "") : null) ??

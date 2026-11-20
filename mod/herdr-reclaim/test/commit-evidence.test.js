@@ -246,3 +246,51 @@ describe("commit 證據 replay", () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
+
+describe("commit 證據只落在它真正屬於的那座城", () => {
+  test("同一支 root 在兩座城都有遠征時，A 城的 commit 不會在 B 城再收成一次", async () => {
+    const cityA = "/tmp/reclaim-two-cities-a/.git";
+    const cityB = "/tmp/reclaim-two-cities-b/.git";
+    const stamp = `${process.pid}-${Math.random().toString(36).slice(2)}`;
+    const ledgerA = await new CityLedger({ io: createFileIo(), dir: `/tmp/reclaim-two-cities/a-${stamp}`, cityId: cityA }).open();
+    const ledgerB = await new CityLedger({ io: createFileIo(), dir: `/tmp/reclaim-two-cities/b-${stamp}`, cityId: cityB }).open();
+    const sessionId = "sess-two-cities";
+    const at = (ms) => 1_700_000_000_000 + ms;
+    // 同一支遠征先在 A 城工作、再到 B 城工作：兩邊都有重疊時間窗的格子。
+    const record = (cityId, epoch) => activity({
+      sessionId,
+      writerEpoch: epoch,
+      events: [
+        visitStart(`v-${epoch}`, at(0), { commonDir: cityId, checkout: cityId.slice(0, -5) }),
+        { kind: "interval_open", at: at(0) },
+        { kind: "interval_close", at: at(60_000) },
+      ],
+    });
+    await ingestScenario(ledgerA, { activities: [record(cityA, "a1")], repoFacts: { [cityA]: { hadHead: true } } }, cityA);
+    await ingestScenario(ledgerB, { activities: [record(cityB, "b1")], repoFacts: { [cityB]: { hadHead: true } } }, cityB);
+
+    const sha = "f".repeat(40);
+    const hooks = [{ schema: 1, sha, hook: "post-commit", commonDir: cityA, toplevel: cityA.slice(0, -5), at: at(30_000), env: { PI_SESSION_ID: sessionId } }];
+    const sources = [{ schema: 1, sha, cli: "omp", sessionId, at: at(30_000) }];
+    const diffForCommit = async () => [{ status: "A", path: "src/a.js", resultBlob: "blob-a" }];
+
+    const appliedA = await ingestCommits({
+      ledger: ledgerA, hooks, sources, diffForCommit,
+      activities: [...(await ledgerA.state()).activities.values()],
+    });
+    expect(appliedA.some((result) => result.status === "applied")).toBe(true);
+    expect((await ledgerA.state()).resources.wood).toBe(10);
+
+    const beforeB = await ledgerB.state();
+    const appliedB = await ingestCommits({
+      ledger: ledgerB, hooks, sources, diffForCommit,
+      activities: [...beforeB.activities.values()],
+    });
+    // B 城的庫存、去重與歷程都不動：同一份證據不是它的。
+    expect(appliedB).toEqual([]);
+    const afterB = await ledgerB.state();
+    expect(afterB.resources).toEqual(beforeB.resources);
+    expect(afterB.claims.size).toBe(0);
+    expect((await ledgerB.historyRecords()).filter((record_) => record_.sha === sha)).toEqual([]);
+  });
+});

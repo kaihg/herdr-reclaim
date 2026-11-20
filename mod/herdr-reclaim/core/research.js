@@ -110,7 +110,17 @@ function commitRole(commit, { cityId, rootSessionId, openAt, closeAt }) {
   if (commit.pending) return "pending";
   return "none";
 }
-export function planResearch({ activities = [], commits = [], cityId } = {}) {
+
+/**
+ * §5.3：一段工作要落在這支遠征某一代**現役**的時間窗裡才算成績。判斷方式與
+ * `core/town.js` 計算工時一樣（把區間裁到 generation 的時間窗）：完全落在撤回／封存
+ * 空窗裡的回合不算——研究是城級的計量器，但不能繞過工作資格。
+ */
+function withinGeneration(windows, openAt, closeAt) {
+  return (windows ?? []).some((window) => window.activatedAt <= closeAt && openAt <= window.deactivatedAt);
+}
+
+export function planResearch({ activities = [], commits = [], cityId, generations = null } = {}) {
   const byId = sessionIndex(activities);
   const seenBySession = new Map();
   const settlements = [];
@@ -125,6 +135,8 @@ export function planResearch({ activities = [], commits = [], cityId } = {}) {
     if (!seenBySession.has(record.sessionId)) seenBySession.set(record.sessionId, new Set());
     const seen = seenBySession.get(record.sessionId);
     for (const round of rounds) {
+      // 撤回／封存空窗中的回合不計：連來源 key 都不進 seen（這個回合本來就沒有資格）。
+      if (generations && !withinGeneration(generations.get(root.sessionId), Number(round.openAt), Number(round.closeAt))) continue;
       const { tokens, unknown } = tokenUsage(round, { cityId, seen });
       if (tokens <= 0 || unknown) continue;
       const context = { cityId, rootSessionId: root.sessionId, ...round };
@@ -141,6 +153,7 @@ export function planResearch({ activities = [], commits = [], cityId } = {}) {
         rootSessionId: root.sessionId,
         writerEpoch: record.writerEpoch ?? null,
         round: roundKey(record, round),
+        openAt: round.openAt,
         tokens,
         at: round.closeAt,
       };

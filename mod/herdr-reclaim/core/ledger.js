@@ -446,8 +446,17 @@ export const KINDS = {
    * 重播不會再次發放；已經落帳的進度與已發的羊皮卷不會因為來源晚到而倒扣。
    */
   research: {
-    precheck(_state, op) {
-      return Number.isInteger(Number(op.tokens)) && Number(op.tokens) > 0 ? null : "invalid_research";
+    precheck(state, op) {
+      if (!(Number.isInteger(Number(op.tokens)) && Number(op.tokens) > 0)) return "invalid_research";
+      // §5.3：這個回合要與這支遠征某一代**現役**的時間窗重疊（跟 town.js 的工時一樣把
+      // 區間裁到時間窗）；完全落在撤回／封存空窗裡的回合不算。
+      const to = Number(op.at);
+      const from = Number(op.openAt ?? op.at);
+      const active = state.tiles.some((tile) =>
+        tile.rootSessionId === op.rootSessionId &&
+        Number(tile.activatedAt ?? 0) <= to &&
+        from <= (tile.deactivatedAt == null ? Infinity : Number(tile.deactivatedAt)));
+      return active ? null : "outside_generation";
     },
     apply(state, entry) {
       const tokens = Number(entry.tokens);

@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { CityLedger } from "../core/ledger.js";
 import { commitContexts, ingestCommits } from "../core/commit-evidence.js";
-import { ingestResearch, ingestScenario } from "../core/ingest.js";
+import { ingestActivities, ingestResearch, ingestScenario, processLand, redispatch } from "../core/ingest.js";
 import { readTownFromLedger } from "../core/town.js";
 import { createFileIo } from "./fs-io.js";
 
@@ -331,5 +331,64 @@ describe("研究羊皮卷（§7.4）", () => {
     expect(city.research).toEqual({ tokens: 0 });
     const entries = (await ledger.scanSegments()).flatMap((segment) => segment.entries);
     expect(entries.filter((entry) => entry.kind === "research")).toHaveLength(1);
+  });
+});
+
+describe("研究只算現役 generation 時間窗內的用量（§5.3）", () => {
+  test("撤回／封存空窗中的回合不計；重新派遣後的新回合才計", async () => {
+    const ledger = await ledgerOf("window");
+    const first = activity({
+      sessionId: ROOT,
+      writerEpoch: "root-1",
+      events: [
+        ...round(ROOT, CITY, T(0), T(60_000), [usageEvent(ROOT, "a", T(30_000), { inputNonCache: 100_000 })]),
+        visitEnd(T(60_000)),
+        // 遠征被撤回之後、還沒重新派遣之前：同一支 session 在同城完成一個 100,000 token 的回合。
+        ...round(ROOT, CITY, T(120_000), T(180_000), [usageEvent(ROOT, "b", T(150_000), { inputNonCache: 100_000 })]),
+        visitEnd(T(180_000)),
+      ],
+    });
+    await ingestScenario(ledger, { activities: [first] }, CITY);
+    expect((await processLand(ledger, {
+      rootSessionId: ROOT, generation: 1, action: "withdraw", at: T(90_000),
+    })).status).toBe("applied");
+
+    await ingestResearch(ledger, { activities: await activitiesOf(ledger), commits: [] });
+    let city = await cityOf(ledger);
+    // 空窗之前的那個回合才算：空窗中的 100,000 沒有換成羊皮卷，也沒有進計量器。
+    expect(city.resources.parchment).toBe(1);
+    expect(city.research).toEqual({ tokens: 0 });
+
+    // 直接送一筆落在空窗裡的 research（別的路徑或舊資料）：提交前資格檢查要擋下來。
+    const manual = await ledger.submit(() => ({
+      opId: "research:manual-gap",
+      kind: "research",
+      at: T(150_000),
+      cityId: CITY,
+      rootSessionId: ROOT,
+      sessionId: ROOT,
+      writerEpoch: "root-1",
+      round: "manual-gap",
+      tokens: 100_000,
+    }));
+    expect(manual).toMatchObject({ status: "rejected", reason: "outside_generation" });
+
+    // 重新派遣之後，空窗中的那個回合仍然不計（它落在兩代之間，不是新一代的成績）。
+    expect((await redispatch(ledger, { rootSessionId: ROOT, at: T(200_000) })).status).toBe("applied");
+    await ingestResearch(ledger, { activities: await activitiesOf(ledger), commits: [] });
+    city = await cityOf(ledger);
+    expect(city.resources.parchment).toBe(1);
+
+    // 新一代裡的新回合（新 writer epoch）：計。
+    const later = activity({
+      sessionId: ROOT,
+      writerEpoch: "root-2",
+      events: round(ROOT, CITY, T(210_000), T(270_000), [usageEvent(ROOT, "c", T(240_000), { inputNonCache: 100_000 })]),
+    });
+    await ingestActivities(ledger, [later], CITY);
+    await ingestResearch(ledger, { activities: await activitiesOf(ledger), commits: [] });
+    city = await cityOf(ledger);
+    expect(city.resources.parchment).toBe(2);
+    expect(city.research).toEqual({ tokens: 0 });
   });
 });
