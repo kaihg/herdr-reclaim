@@ -17,6 +17,7 @@ function context({
   parentSession,
   cwd = isolatedHome,
   entries = [],
+  artifactsDir = path.join(isolatedHome, "artifacts", sessionId),
 } = {}) {
   const timers = [];
   return {
@@ -29,6 +30,7 @@ function context({
     sessionManager: {
       getSessionId: () => sessionId,
       getSessionFile: () => undefined,
+      getArtifactsDir: () => artifactsDir,
       getCwd: () => cwd,
       getHeader: () => parentSession ? { parentSession } : null,
       getEntries: () => entries,
@@ -110,5 +112,21 @@ describe("OMP extension 寫入遠征活動檔", () => {
     fire("session_switch", { reason: "resume" }, root);
     expect(readActivity("root-id")).toHaveLength(2);
     expect(readActivity("root-id").map((record) => record.writerEpoch).sort()).toHaveLength(2);
+  });
+  test("selective commit 的 artifacts 只寫入同一個精確 SHA 的來源憑證", () => {
+    const handlers = new Map();
+    install({ on: (name, handler) => handlers.set(name, handler) });
+    const artifactsDir = path.join(isolatedHome, "artifacts", "selective-session");
+    fs.mkdirSync(artifactsDir, { recursive: true });
+    fs.writeFileSync(path.join(artifactsDir, "changes.jsonl"), [
+      JSON.stringify({ type: "commit", sha: "0123456789abcdef0123456789abcdef01234567", paths: ["src/app.js"] }),
+      JSON.stringify({ type: "commit", sha: "89abcdef0123456789abcdef0123456789abcdef", paths: ["test/app.test.js"] }),
+    ].join("\n"));
+    handlers.get("turn_end")({}, context({ sessionId: "selective-session", cwd: "/tmp/selective-repo", artifactsDir }));
+    const evidenceDir = path.join(isolatedHome, "data", "herdr-reclaim", "sources");
+    const evidence = JSON.parse(fs.readFileSync(path.join(evidenceDir, "0123456789abcdef0123456789abcdef01234567.omp.selective-session.json"), "utf8"));
+    expect(evidence).toMatchObject({ sha: "0123456789abcdef0123456789abcdef01234567", sessionId: "selective-session", cli: "omp" });
+    expect(evidence.paths).toEqual(["src/app.js"]);
+    expect(fs.existsSync(path.join(evidenceDir, "89abcdef0123456789abcdef0123456789abcdef.omp.selective-session.json"))).toBe(true);
   });
 });

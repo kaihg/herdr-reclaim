@@ -236,6 +236,7 @@ export function readTownFromLedger(replay = {}) {
         resources: { wood: 0, stone: 0, iron: 0, parchment: 0 },
         guild: null,
         tiles: [],
+        unharvestedCommits: replay.unharvestedCommits?.[entry.cityId] ?? [],
       };
       town.cities.push(city);
     }
@@ -257,6 +258,10 @@ export function readTownFromLedger(replay = {}) {
         harvestPoints: entry.harvestPoints ?? 0,
       }),
     );
+  }
+  for (const city of town.cities) {
+    city.resources = replay.resources?.[city.cityId] ?? city.resources;
+    city.unharvestedCommits = replay.unharvestedCommits?.[city.cityId] ?? [];
   }
   return town;
 }
@@ -342,6 +347,7 @@ function replayTown(replay, place) {
   for (const city of cities.values()) {
     city.tiles = city.tiles.map(finishTile);
     city.name = cityNameOf(city.cityId, city.checkout);
+    city.unharvestedCommits = replay.unharvestedCommits?.[city.cityId] ?? [];
   }
 
   return {
@@ -353,6 +359,7 @@ function replayTown(replay, place) {
       // 收成（#4／#5）之前，庫存是空的；行會沒有額度來源時顯示未知（§9）。
       resources: { wood: 0, stone: 0, iron: 0, parchment: 0 },
       guild: null,
+      unharvestedCommits: city.unharvestedCommits,
       tiles: city.tiles,
     })),
   };

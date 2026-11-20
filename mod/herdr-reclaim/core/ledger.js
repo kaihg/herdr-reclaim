@@ -174,6 +174,7 @@ export const KINDS = {
         generation: entry.generation ?? 1,
         x: entry.x,
         y: entry.y,
+        harvestedPaths: [],
         cli: entry.cli ?? null,
         repo: entry.repo ?? null,
         harvestPoints: 0,
@@ -224,19 +225,29 @@ export const KINDS = {
       const current = state.currentGen.get(`${op.cityId}@@${op.rootSessionId}`);
       if (current === undefined) return "no_expedition";
       if (current !== generation) return "stale_generation";
-      if (op.claim && state.claims.has(claimKey(op.cityId, op.claim))) return "claim_exists";
+      const claims = op.claims ?? (op.claim ? [op.claim] : []);
+      if (claims.some((claim) => state.claims.has(claimKey(op.cityId, claim)))) return "claim_exists";
       return null;
     },
     apply(state, entry) {
       const tile = state.tileById.get(tileId(entry.cityId, entry.rootSessionId, entry.generation));
       if (!tile) throw new Error(`收成找不到遠征：${entry.rootSessionId}@${entry.generation}`);
-      tile.harvested = true;
-      tile.harvestPoints += Number(entry.points ?? 0);
+      tile.harvestPoints = (tile.harvestPoints ?? 0) + Number(entry.points ?? 0);
+      tile.harvestedPaths = [...new Set([...(tile.harvestedPaths ?? []), ...(entry.paths ?? [])])];
       for (const [name, amount] of Object.entries(entry.resources ?? {})) {
         state.resources[name] = (state.resources[name] ?? 0) + Number(amount);
       }
-      if (entry.claim) state.claims.set(claimKey(entry.cityId, entry.claim), entry.journalSeq);
+      for (const claim of entry.claims ?? (entry.claim ? [entry.claim] : [])) {
+        state.claims.set(claimKey(entry.cityId, claim), entry.journalSeq);
+      }
     },
+  },
+  /** Commit evidence is journaled even when no trustworthy session source is available. */
+  commit: {
+    precheck(_state, op) {
+      return op.sha && typeof op.reason === "string" ? null : "invalid_commit_record";
+    },
+    apply() {},
   },
 };
 
