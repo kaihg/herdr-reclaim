@@ -16,6 +16,7 @@
 // 選取狀態不進城的帳本（見 core/selection.js 的說明），存在 mod 資料目錄下的小檔案。
 import { Background, PathBuilder, View, div } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
+import { InputState } from "gpui-base";
 import { appHome, checking, exec, readTextFile, settings, theme, watchFolder, writeTextFile } from "herdr";
 import { ADAPTER_DIR, activityDir, adapterRoot, citiesOf, loadActivities, repoFactsOf } from "./core/adapter.js";
 import { commitContexts, ingestCommits, loadCommitEvidence, parseRawDiff, parseReflogEvidence, unharvestedCommitReasons } from "./core/commit-evidence.js";
@@ -28,6 +29,8 @@ import { RESEARCH_TOKENS_PER_PARCHMENT, RESOURCE_LABELS, RULES_VERSION } from ".
 import { defaultSelection, parseUi, resolveSelection, selectionOf, serializeUi, withSelection } from "./core/selection.js";
 import { CLEAR_POINTS, formatResearch, readTown, readTownFromLedger, selectionDetail } from "./core/town.js";
 import { firstExpedition } from "./scenarios/first-expedition.js";
+import { searchHistory } from "./core/history.js";
+import { historyPanel } from "./ui/history.js";
 
 const MIN_LEFT_W = 96;
 const MAX_LEFT_W = 240;
@@ -206,6 +209,11 @@ async function loadTown(io) {
         if (result.code !== 0) result = await exec("git", ["-C", hook.toplevel, "diff-tree", "--root", "-r", "-M", "--raw", "-z", sha]);
         return result.code === 0 ? parseRawDiff(result.stdout) : [];
       },
+      subjectForCommit: async (sha, hook) => {
+        if (!hook?.toplevel) return null;
+        const result = await exec("git", ["-C", hook.toplevel, "show", "-s", "--format=%s", sha]);
+        return result.code === 0 ? result.stdout.trim() : null;
+      },
     });
     // 研究羊皮卷（§7.4）排在收成之後：這個回合有沒有歸屬確定的 commit 要用同一份來源核對。
     const state = await ledger.state();
@@ -299,6 +307,12 @@ export default class Town extends View {
     this.note = "正在讀取城鎮帳本…";
     this.hookNotice = null;
     // `herdr-app check` 會真的跑 init：不要動使用者的檔案，只渲染固定情境。
+    this.historyOpen = false;
+    this.historyData = { records: [], tiles: [], unresolvedActivities: [], cityNames: {} };
+    this.historyState = { query: "", results: [], total: 0 };
+    this.historyInput = InputState.new({ placeholder: "搜尋日期、城、session、commit 或成果路徑" });
+    this.historyInput.on("change", () => { this.historyState.query = this.historyInput.value(); });
+    this.historyInput.on("submit", (_event, cx2) => this.runHistorySearch(cx2));
     if (checking()) {
       this.town = readTown(firstExpedition);
       this.selection = defaultSelection(this.town);
@@ -345,6 +359,57 @@ export default class Town extends View {
   select(selection, cx) {
     this.selection = selection;
     if (this.io) saveSelection(this.io, selection).catch(() => {});
+    cx.notify();
+  }
+  openHistory(cx) {
+    this.historyOpen = true;
+    this.historyState = { query: "", results: [], total: 0, loading: true };
+    this.historyInput.set_value("");
+    cx.notify();
+    cx.spawn(async (cx2) => {
+      try {
+        const records = [];
+        const tiles = [];
+        const cityNames = {};
+        for (const city of this.town?.cities ?? []) {
+          cityNames[city.cityId] = city.name;
+          const ledger = await new CityLedger({
+            io: this.io,
+            dir: cityDir(adapterRoot(appHome()), city.cityId),
+            cityId: city.cityId,
+          }).open();
+          const state = await ledger.state();
+          records.push(...await ledger.historyRecords());
+          tiles.push(...state.tiles);
+        }
+        this.historyData = { records, tiles, cityNames, unresolvedActivities: this.town?.unresolvedActivities ?? [] };
+        this.historyState = { query: "", results: [], total: 0, loading: false };
+      } catch (error) {
+        this.historyState = { query: "", results: [], total: 0, error: `歷程讀取失敗：${error}` };
+      }
+      cx2.notify();
+    });
+  }
+
+  runHistorySearch(cx) {
+    this.historyState.query = this.historyInput.value();
+    const found = searchHistory({ ...this.historyData, query: this.historyState.query });
+    this.historyState = { ...this.historyState, ...found };
+    cx.notify();
+  }
+
+  jumpHistory(item, cx) {
+    if (item.jump) {
+      this.select(item.jump, cx);
+      this.historyOpen = false;
+      return;
+    }
+    this.historyState = { ...this.historyState, error: "這筆歷程沒有對應的地格。" };
+    cx.notify();
+  }
+
+  closeHistory(cx) {
+    this.historyOpen = false;
     cx.notify();
   }
 
@@ -707,6 +772,16 @@ export default class Town extends View {
   // ---- 右側：選取遠征或格子的詳情（§12 的入口）
 
   detailPanel(detail, t, width, cx) {
+    if (this.historyOpen) {
+      return historyPanel({
+        state: this.historyState,
+        input: this.historyInput,
+        theme: t,
+        onClose: (cx2) => this.closeHistory(cx2),
+        onQuery: (cx2) => this.runHistorySearch(cx2),
+        onJump: (item, cx2) => this.jumpHistory(item, cx2),
+      }).w(width).flex_none().min_h(0).overflow_y_scrollbar().bg(t.chrome).border_l(1).border_color(t.border);
+    }
     const actionLabels = { withdraw: "撤回", archive: "封存", redispatch: "重新派遣" };
     return v_flex()
       .id("detail")
@@ -725,6 +800,9 @@ export default class Town extends View {
           div().text_size(14).font_semibold().child(detail.title),
           detail.statusLabel ? statusBadge(detail.statusLabel, t) : null,
           detail.pointsTarget ? progress(detail, t) : null,
+          ["expedition", "tile"].includes(detail.kind)
+            ? hookButton("歷程搜尋", t, (cx2) => this.openHistory(cx2))
+            : null,
           ...detail.fields.map((field) => fieldRow(field, t)),
           ...(detail.actions ?? []).map((action) =>
             hookButton(actionLabels[action], t, (cx2) => this.operateLand(detail, action, cx2))),
@@ -779,7 +857,7 @@ function costsLabel(costs = {}) {
 }
 
 function hookButton(label, t, action) {
-  return div()
+  return div().role("button").tab_index(0)
     .px(6)
     .py(3)
     .rounded(4)

@@ -33,6 +33,7 @@ import { byteLen, canonicalJson, hashText } from "./bytes.js";
 import { casWrite, rejectUnlessConflict } from "./cas.js";
 import { PrefixIndex } from "./pages.js";
 import { BOOST_POINTS_PER_PARCHMENT, CLEAR_POINTS, RECIPES, RESEARCH_TOKENS_PER_PARCHMENT, RESOURCES, RULES_VERSION, TRADE_RATE, affordable } from "./rules.js";
+import { historyRecordOf } from "./history.js";
 
 export { byteLen, hashText };
 
@@ -288,6 +289,7 @@ export const KINDS = {
         harvestPoints: 0,
         boostPoints: 0,
         harvestedPaths: [],
+        harvests: [],
         cli: entry.cli ?? null,
         repo: entry.repo ?? null,
         harvested: false,
@@ -467,23 +469,37 @@ export const KINDS = {
       const tile = state.tileById.get(tileId(op.cityId, op.rootSessionId, generation));
       if (!tile) return "no_expedition";
       if (generationAt(state, op.rootSessionId, op.at)?.generation !== generation) return "outside_generation";
-      const claims = op.claims ?? (op.claim ? [op.claim] : []);
+      const claims = op.claims ?? (op.claim ? [op.claim] : (op.blobs?.paths ?? []).map((unit) => unit.claim).filter(Boolean));
       if (claims.some((claim) => state.claims.has(claimKey(op.cityId, claim)))) return "claim_exists";
       return null;
     },
-    apply(state, entry) {
+    apply(state, entry, content) {
       const tile = state.tileById.get(tileId(entry.cityId, entry.rootSessionId, entry.generation));
       if (!tile) throw new Error(`收成找不到遠征：${entry.rootSessionId}@${entry.generation}`);
+      const units = content?.paths ?? [];
+      const paths = entry.paths ?? units.map((unit) => unit.path).filter(Boolean);
       tile.harvestPoints = (tile.harvestPoints ?? 0) + Number(entry.points ?? 0);
-      tile.harvestedPaths = [...new Set([...(tile.harvestedPaths ?? []), ...(entry.paths ?? [])])];
-      tile.harvested = tile.harvested || (entry.paths ?? []).length > 0;
+      tile.harvestedPaths = [...new Set([...(tile.harvestedPaths ?? []), ...paths])];
+      tile.harvested = tile.harvested || paths.length > 0;
       settleStage(tile);
       for (const [name, amount] of Object.entries(entry.resources ?? {})) {
         state.resources[name] = (state.resources[name] ?? 0) + Number(amount);
       }
-      for (const claim of entry.claims ?? (entry.claim ? [entry.claim] : [])) {
-        state.claims.set(claimKey(entry.cityId, claim), entry.journalSeq);
-      }
+      const claims = entry.claims ?? (entry.claim ? [entry.claim] : units.map((unit) => unit.claim).filter(Boolean));
+      for (const claim of claims) state.claims.set(claimKey(entry.cityId, claim), entry.journalSeq);
+      tile.harvests ??= [];
+      tile.harvests.push({
+        sha: content?.sha ?? entry.sha ?? null,
+        subject: entry.subject ?? content?.subject ?? null,
+        at: entry.at,
+        claims: claims.slice(0, 64),
+        claimCount: claims.length,
+        paths: paths.length <= 64 ? paths : paths.slice(0, 64),
+        pathCount: paths.length,
+        resources: { ...(entry.resources ?? {}) },
+        points: Number(entry.points ?? 0),
+        rulesVersion: entry.rulesVersion ?? null,
+      });
     },
   },
   /** Commit evidence is journaled even when no trustworthy session source is available. */
@@ -795,12 +811,22 @@ export class CityLedger {
     // 「checkpoint 重播 == 完整 journal 重播」不會因為少抄一個欄位而失效。
     const expeditions = index("expeditions");
     await expeditions.build(
-      state.tiles.map((tile) => [tileId(tile.cityId, tile.rootSessionId, tile.generation), canonicalJson(tile)]),
+      await Promise.all(state.tiles.map(async (tile) => [
+        tileId(tile.cityId, tile.rootSessionId, tile.generation),
+        await this.packRecord(tile),
+      ])),
     );
     const activities = index("activities");
     await activities.build(
       await Promise.all([...state.activities].map(async ([key, record]) => [key, await this.packRecord(record)])),
     );
+    const historyEntries = [];
+    for (const part of await this.scanSegments()) {
+      for (const entry of part.entries) {
+        historyEntries.push([String(entry.journalSeq).padStart(12, "0"), historyRecordOf(entry)]);
+      }
+    }
+    await index("history").build(historyEntries);
 
     // 座標分塊：每塊 32×32 格，只記格子鍵（遠征資料在 expeditions 索引）。
     const chunks = new Map();
@@ -861,6 +887,10 @@ export class CityLedger {
     return packed?.inline ?? null;
   }
 
+  async unpackExpeditionRecord(record) {
+    return typeof record === "string" ? JSON.parse(record) : this.unpackRecord(record);
+  }
+
   /** checkpoint → 狀態（不含 checkpoint 之後的 journal）。 */
   async loadCheckpoint(seq) {
     const dir = this.checkpointDir(seq);
@@ -870,7 +900,7 @@ export class CityLedger {
     const index = (part) => new PrefixIndex({ io: this.io, dir: `${dir}/${part}`, limit: this.pageLimit });
     const state = emptyState(this.cityId);
     state.lastSeq = manifest.seq ?? seq;
-    for (const [, record] of await index("expeditions").all()) addTile(state, JSON.parse(record));
+    for (const [, record] of await index("expeditions").all()) addTile(state, await this.unpackExpeditionRecord(record));
     state.tiles.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
     for (const [key, value] of await index("ops").all()) state.opSeqs.set(key, value);
     for (const [key, value] of await index("claims").all()) state.claims.set(key, value);
@@ -926,7 +956,7 @@ export class CityLedger {
     if (info) {
       const hit = await this.expeditionIndex(info.dir).get(id);
       if (hit !== null) {
-        const tile = JSON.parse(hit);
+        const tile = await this.unpackExpeditionRecord(hit);
         return { tile, seq: tile.seq, source: "checkpoint" };
       }
     }
@@ -945,7 +975,7 @@ export class CityLedger {
       for (const key of text === null ? [] : JSON.parse(text).tiles) {
         const [rootSessionId, generation] = key.split("@@");
         const hit = await index.get(tileId(this.cityId, rootSessionId, Number(generation)));
-        if (hit !== null) tiles.push(JSON.parse(hit));
+        if (hit !== null) tiles.push(await this.unpackExpeditionRecord(hit));
       }
     }
     // checkpoint 之後才落帳的格子也要在：查詢接點讀的是「checkpoint + 後續 journal」。
@@ -964,20 +994,35 @@ export class CityLedger {
     return new PrefixIndex({ io: this.io, dir: `${dir}/expeditions`, limit: this.pageLimit });
   }
 
-  /**
-   * 歷程查詢（§12）：一支遠征的一個 generation 的格子與它的每一筆操作。
-   * journal 段不會被刪，所以 checkpoint 之前寫入的 entry 也查得到。
-   */
-  async historyOf(rootSessionId, generation = 1) {
-    const located = await this.lookupExpedition(rootSessionId, generation);
-    const entries = [];
-    for (const segment of await this.scanSegments()) {
-      for (const entry of segment.entries) {
-        if (entry.rootSessionId !== rootSessionId) continue;
-        if ((entry.generation ?? 1) !== generation) continue;
-        entries.push({ journalSeq: entry.journalSeq, kind: entry.kind, at: entry.at, content: entry.content ?? null });
+  /** Read compact checkpoint records plus the bounded journal tail. */
+  async historyRecords() {
+    const info = await this.checkpointInfo();
+    const records = [];
+    let lastSeq = -1;
+    let from = 0;
+    if (info) {
+      const indexed = await new PrefixIndex({ io: this.io, dir: `${info.dir}/history`, limit: this.pageLimit }).all();
+      for (const record of indexed.values()) {
+        records.push(record);
+        lastSeq = Math.max(lastSeq, Number(record.seq));
+      }
+      from = Number(info.manifest.segment ?? 0);
+    }
+    for (const part of await this.scanSegments(from)) {
+      for (const entry of part.entries) {
+        if (entry.journalSeq > lastSeq) records.push(historyRecordOf(entry));
       }
     }
+    records.sort((a, b) => a.seq - b.seq);
+    return records;
+  }
+
+  /** Expedition history is indexed at checkpoint, not found by scanning the whole journal. */
+  async historyOf(rootSessionId, generation = 1) {
+    const located = await this.lookupExpedition(rootSessionId, generation);
+    const entries = (await this.historyRecords())
+      .filter((entry) => entry.rootSessionId === rootSessionId && (entry.generation ?? 1) === generation)
+      .map(({ seq, kind, at, content }) => ({ journalSeq: seq, kind, at, content }));
     return { expedition: located?.tile ?? null, journalSeq: located?.seq ?? null, entries };
   }
 

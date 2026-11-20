@@ -13,6 +13,7 @@ import { CityLedger } from "../core/ledger.js";
 import { PrefixIndex } from "../core/pages.js";
 import { readTownFromLedger } from "../core/town.js";
 import { AT } from "../scenarios/first-expedition.js";
+import { searchHistory } from "../core/history.js";
 import { createFileIo } from "./fs-io.js";
 
 const CITY_ID = "/reclaim/capacity-city";
@@ -168,6 +169,18 @@ describe("長期城鎮的容量：一萬支遠征、十萬筆操作", () => {
       const history = await ledger.historyOf("sess-777", 1);
       expect(history.expedition).toMatchObject({ seq: 777, ...coordOf(777) });
       expect(history.entries.filter((entry) => entry.kind === "harvest")).toHaveLength(9);
+      const indexedRecords = await ledger.historyRecords();
+      expect(indexedRecords).toHaveLength(EXPEDITIONS + HARVESTS);
+      const search = searchHistory({
+        records: indexedRecords,
+        tiles: withCheckpoint.tiles,
+        cityNames: { [CITY_ID]: "capacity-city" },
+        query: "path:路徑-19999.ts",
+      });
+      expect(search.total).toBe(1);
+      expect(search.results[0].jump).toEqual({
+        kind: "expedition", cityId: CITY_ID, rootSessionId: "sess-0", generation: 1,
+      });
 
       const finished = performance.now();
       const sizes = filesOf(dir);

@@ -10,6 +10,8 @@ herdr 的開墾城鎮 mod。這個資料夾是 mod 本體：一個「遠征指�
 | `core/adapter.js` | 讀活動檔、分城及取得 repo facts（活動格式見 §6.1） |
 | `core/ledger.js` | 城帳本：append-only journal、CAS、內容檔、checkpoint、ack（§13.1，純 JS） |
 | `core/town.js` | 城鎮讀取模型：活動紀錄 → 城市、格子、遠征、工作時間、用量與詳情；帳本模式由 journal 決定格子位置 |
+| `core/history.js` | 從可重建的 checkpoint 索引與 journal 尾段搜尋提交、收成、活動及格子路徑；結果保留世代跳轉目標 |
+| `ui/history.js` | 只從選取遠征／格子的詳情開啟歷程搜尋，不在中央地圖常駐時間軸 |
 | `core/ingest.js` | 把 §6.1 的活動紀錄與「遠征取得土地」寫進帳本（順序與 `planExpeditions` 相同） |
 | `core/grid.js` | 邏輯座標、BFS 選地與 3/4 投影（投影與規則分開） |
 | `core/host-io.js` | 儲存介面的 host 適配層：herdr 的原生 CAS 衝突 → `CasConflict`（見下） |
@@ -18,6 +20,7 @@ herdr 的開墾城鎮 mod。這個資料夾是 mod 本體：一個「遠征指�
 | `test/town.test.js` | 固定情境測試：只斷言可觀察的城鎮狀態 |
 | `test/restore.test.js` | 帳本重建的城 ＝ 直接重播的城；重開、重播、checkpoint 都一樣 |
 | `test/omp-adapter.test.js` | OMP 固定活動事件 → journal → 公開城鎮讀取模型；驗證用量來源去重與 root/child 歸戶 |
+| `test/history.test.js` | 歷程篩選、撤回／封存世代跳轉、未解析活動與可重建索引 |
 | `../omp-extension/herdr-reclaim.test.ts` | 驅動 extension 生命週期事件，驗證互動／child／fork／resume 與 ack compact |
 | `test/ledger.test.js` | 儲存層：完成依據、故障重試、CAS 競爭、換段、ack |
 | `test/host-seam.test.js` | host 接縫：用假 host 丟真實 host 的錯誤形狀，驗證衝突被正規化、其他錯誤不被吞 |
