@@ -16,7 +16,8 @@
 // 選取狀態不進城的帳本（見 core/selection.js 的說明），存在 mod 資料目錄下的小檔案。
 import { Background, PathBuilder, View, div } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
-import { appHome, checking, readTextFile, settings, theme, writeTextFile } from "herdr";
+import { appHome, checking, exec, readTextFile, settings, theme, watchFolder, writeTextFile } from "herdr";
+import { ADAPTER_DIR, activityDir, adapterRoot, citiesOf, loadActivities, repoFactsOf } from "./core/adapter.js";
 import { MAP_RADIUS, keyOf, projectTile } from "./core/grid.js";
 import { ingestScenario } from "./core/ingest.js";
 import { hostIo } from "./core/host-io.js";
@@ -50,8 +51,8 @@ function shortId(sessionId) {
   return String(sessionId).slice(0, 8);
 }
 
-/** mod 的資料目錄（在 herdr 的 appHome 底下）。 */
-const DATA_DIR = "data/herdr-reclaim";
+/** mod 的資料目錄（在 herdr 的 appHome 底下）；adapter 也寫在同一個根目錄（§6.1）。 */
+const DATA_DIR = ADAPTER_DIR;
 
 /**
  * mod 端的儲存層：herdr 的 readTextFile 與 writeTextFile，經過 host 適配層，
@@ -61,29 +62,75 @@ function storageIo() {
   return hostIo({ readTextFile, writeTextFile });
 }
 
-/** 情境碰到的城：一個帳本只管一座城（§13）。 */
-function cityIdsOf(scenario) {
+/**
+ * 列活動檔：mod 沒有列目錄的 API，用 herdr 的 exec 直接跑 find（不經 shell，
+ * 路徑不會被拆開）。目錄還不存在時 find 會失敗，就當成還沒有活動。
+ */
+async function listActivityFiles(dir) {
+  try {
+    const { stdout } = await exec("find", [dir, "-type", "f", "-name", "*.json", "-print"]);
+    return stdout.split("\n").filter((line) => line !== "");
+  } catch {
+    return [];
+  }
+}
+
+/** compact 後活動檔可能只剩尾巴；從已存在的 head 找回沒有出現在尾巴裡的舊城。 */
+async function cityIdsFromLedgers(io) {
+  const root = `${adapterRoot(appHome())}/cities`;
+  let stdout = "";
+  try {
+    ({ stdout } = await exec("find", [root, "-type", "f", "-name", "head.json", "-print"]));
+  } catch {
+    return [];
+  }
   const ids = new Set();
-  for (const record of scenario.activities ?? []) {
-    for (const event of record.events ?? []) {
-      if (event.visit?.commonDir) ids.add(event.visit.commonDir);
-    }
+  for (const file of stdout.split("\n").filter(Boolean)) {
+    const text = await io.read(file);
+    if (text === null) continue;
+    const head = JSON.parse(text);
+    if (typeof head.cityId === \"string\") ids.add(head.cityId);
   }
   return [...ids];
 }
 
-/** 寫進帳本（journal 是唯一完成依據），再從帳本重建城鎮。 */
+/** adapter 的讀取面（read 與 mod 自己的帳本共用同一個儲存層）。 */
+function adapterIo() {
+  return { ...storageIo(), list: listActivityFiles };
+}
+
+/**
+ * 讓活動目錄存在（watchFolder 需要）：adapter 還沒跑過時也看得到它之後寫的檔案。
+ * 已經在了就不是錯（CAS 建立既有檔案）。
+ */
+async function ensureActivityDir(io) {
+  const file = `${activityDir(appHome())}/.keep`;
+  try {
+    if ((await io.read(file)) === null) await io.write(file, "herdr-reclaim\n", null);
+  } catch (error) {
+    if (!(error instanceof CasConflict)) throw error;
+  }
+}
+
+/**
+ * adapter 的活動檔 → 城帳本 → 城鎮（journal 是唯一完成依據，§13）。
+ * 每個城有自己的帳本，所以活動先按 visit 的 commonDir 分城再寫入（§13.1）。
+ */
 async function loadTown(io) {
-  const activities = [];
+  const activities = await loadActivities(io, activityDir(appHome()));
+  const cityIds = [...new Set([...citiesOf(activities), ...(await cityIdsFromLedgers(io))])].sort();
+  const repoFacts = await repoFactsOf(io, cityIds);
+  const replay = { activities, repoFacts };
+  const stored = [];
   const expeditions = [];
-  for (const cityId of cityIdsOf(firstExpedition)) {
-    const ledger = await new CityLedger({ io, dir: cityDir(`${appHome()}/${DATA_DIR}`, cityId), cityId }).open();
-    await ingestScenario(ledger, firstExpedition, cityId);
+  for (const cityId of cityIds) {
+    const ledger = await new CityLedger({ io, dir: cityDir(adapterRoot(appHome()), cityId), cityId }).open();
+    await ingestScenario(ledger, replay, cityId);
     const state = await ledger.state();
-    activities.push(...state.activities.values());
+    stored.push(...state.activities.values());
     expeditions.push(...state.tiles);
   }
-  return readTownFromLedger({ activities, expeditions, repoFacts: firstExpedition.repoFacts });
+  return readTownFromLedger({ activities: stored, expeditions, repoFacts });
 }
 
 /** 選取狀態的檔案（不是城的帳本）：選取不產生資源，也不改變土地。 */
@@ -146,20 +193,34 @@ export default class Town extends View {
       this.note = null;
       return;
     }
-    this.io = storageIo();
+    this.io = adapterIo();
     cx.spawn(async (cx) => {
       try {
-        this.town = await loadTown(this.io);
-        const loaded = await loadSelection(this.io, this.town);
-        this.selection = loaded.selection;
-        // 第一次開這座城：把當下顯示的選取記下來，重開後回到同一個位置。
-        if (!loaded.saved && this.selection) await saveSelection(this.io, this.selection);
-        this.note = null;
+        await ensureActivityDir(this.io);
       } catch (error) {
-        this.town = null;
-        this.note = `城鎮帳本讀取失敗：${error}`;
+        this.note = `活動目錄建立失敗：${error}`;
       }
-      cx.notify();
+      let first = true;
+      for (;;) {
+        try {
+          this.town = await loadTown(this.io);
+          const loaded = await loadSelection(this.io, this.town);
+          this.selection = loaded.selection;
+          // 第一次開這座城：把當下顯示的選取記下來，重開後回到同一個位置。
+          if (first && !loaded.saved && this.selection) await saveSelection(this.io, this.selection);
+          this.note = null;
+        } catch (error) {
+          this.town = null;
+          this.note = `城鎮帳本讀取失敗：${error}`;
+        }
+        cx.notify();
+        first = false;
+        try {
+          await watchFolder(activityDir(appHome()));
+        } catch {
+          return; // host 不支援這條 watch 時保留最後一次重播結果
+        }
+      }
     });
   }
 

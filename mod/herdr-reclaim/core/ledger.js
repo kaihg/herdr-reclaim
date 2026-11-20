@@ -210,8 +210,8 @@ export const KINDS = {
     },
   },
   /**
-   * 活動合併（§6.2）：以 (sessionId, writerEpoch) 為鍵，晚到的 entry 取代舊的
-   * （同一個 epoch 的事件是累積的，lastEventSeq 只前進）。
+   * 活動合併（§6.2）：以 (sessionId, writerEpoch) 為鍵。adapter 收到 ack 後會 compact
+   * 磁碟快照，後續 entry 只含未 ack 的尾巴；帳本重播時必須把事件併回舊快照，不能覆蓋它。
    */
   activity: {
     precheck(state, op, blobs) {
@@ -221,17 +221,22 @@ export const KINDS = {
       return null;
     },
     apply(state, entry, blobs) {
-      state.activities.set(activityKey(entry), {
+      const key = activityKey(entry);
+      const current = state.activities.get(key);
+      const bySeq = new Map((current?.events ?? []).map((event) => [event.eventSeq, event]));
+      for (const event of blobs?.events ?? []) bySeq.set(event.eventSeq, event);
+      const events = [...bySeq.values()].sort((a, b) => a.eventSeq - b.eventSeq);
+      state.activities.set(key, {
         schema: SCHEMA,
         sessionId: entry.sessionId,
         writerEpoch: entry.writerEpoch,
-        role: entry.role ?? "root",
-        interactive: entry.interactive === true,
-        parentSessionId: entry.parentSessionId ?? null,
-        cli: entry.cli ?? null,
-        updatedAt: entry.updatedAt ?? entry.at ?? 0,
-        lastEventSeq: entry.lastEventSeq ?? -1,
-        events: blobs?.events ?? [],
+        role: entry.role ?? current?.role ?? "root",
+        interactive: entry.interactive === true || current?.interactive === true,
+        parentSessionId: entry.parentSessionId ?? current?.parentSessionId ?? null,
+        cli: entry.cli ?? current?.cli ?? null,
+        updatedAt: Math.max(current?.updatedAt ?? 0, entry.updatedAt ?? entry.at ?? 0),
+        lastEventSeq: Math.max(current?.lastEventSeq ?? -1, entry.lastEventSeq ?? -1),
+        events,
       });
     },
   },

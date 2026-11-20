@@ -5,16 +5,20 @@ herdr 的開墾城鎮 mod。這個資料夾是 mod 本體：一個「遠征指�
 
 | 檔案 | 內容 |
 |---|---|
-| `main.js` | 畫面：開機時把活動寫進帳本、再從帳本重建城鎮；負責四個區塊與點擊 |
+| `main.js` | 畫面：讀 OMP adapter 活動檔、寫入城帳本、從 journal 重建城鎮；監看新活動 |
+| `../omp-extension/herdr-reclaim.ts` | OMP extension：按 session/writer epoch 寫活動事件、heartbeat、usage source key，讀 journal ack 後 compact |
+| `core/adapter.js` | 讀活動檔、分城及取得 repo facts（活動格式見 §6.1） |
 | `core/ledger.js` | 城帳本：append-only journal、CAS、內容檔、checkpoint、ack（§13.1，純 JS） |
-| `core/town.js` | 城鎮讀取模型：活動紀錄 → 城市、格子、遠征、右側詳情；帳本模式由 journal 決定格子位置 |
+| `core/town.js` | 城鎮讀取模型：活動紀錄 → 城市、格子、遠征、工作時間、用量與詳情；帳本模式由 journal 決定格子位置 |
 | `core/ingest.js` | 把 §6.1 的活動紀錄與「遠征取得土地」寫進帳本（順序與 `planExpeditions` 相同） |
 | `core/grid.js` | 邏輯座標、BFS 選地與 3/4 投影（投影與規則分開） |
 | `core/host-io.js` | 儲存介面的 host 適配層：herdr 的原生 CAS 衝突 → `CasConflict`（見下） |
 | `core/selection.js` | 選取狀態的保存（不是城的帳本；見下） |
-| `scenarios/first-expedition.js` | 固定事件情境（§6.1 的最小欄位）；這一票的活動來源 |
+| `scenarios/first-expedition.js` | `herdr-app check` 與固定情境測試用資料；正式 runtime 不拿它入帳 |
 | `test/town.test.js` | 固定情境測試：只斷言可觀察的城鎮狀態 |
 | `test/restore.test.js` | 帳本重建的城 ＝ 直接重播的城；重開、重播、checkpoint 都一樣 |
+| `test/omp-adapter.test.js` | OMP 固定活動事件 → journal → 公開城鎮讀取模型；驗證用量來源去重與 root/child 歸戶 |
+| `../omp-extension/herdr-reclaim.test.ts` | 驅動 extension 生命週期事件，驗證互動／child／fork／resume 與 ack compact |
 | `test/ledger.test.js` | 儲存層：完成依據、故障重試、CAS 競爭、換段、ack |
 | `test/host-seam.test.js` | host 接縫：用假 host 丟真實 host 的錯誤形狀，驗證衝突被正規化、其他錯誤不被吞 |
 | `test/fs-io.js` | bun 測試用的 fs 後端（說同一種 CAS 語言）；mod 不會載入它 |
@@ -40,9 +44,15 @@ mod 端由 `core/host-io.js` 把 herdr 的原生錯誤轉成 `CasConflict`（真
 - 每段有大小上限（預設 256 KiB）；放不下先 CAS 附加封段行，再寫下一段。內容格式保留
   #4 的切塊與分頁空間（entry 只引用最上層雜湊）。
 - **ack**（§6.2）：`acks/<sessionId>/<epoch>.json`，在 journal 提交成功之後才寫；帳本重播
-  不讀 ack，所以 ack 延遲或重播不改變最終狀態。adapter 端的實際消費在 #5。
+  不讀 ack，所以 ack 延遲或重播不改變最終狀態。OMP adapter 只在讀到這個 epoch 的 ack 後
+  才 compact 已確認的事件。
 
-資料在 `appHome()/data/herdr-reclaim/cities/<cityId 的雜湊>/`（一座城一個目錄，§13）。
+資料在 `appHome()/data/herdr-reclaim/`：`activity/<sessionId>/<writerEpoch>.json` 是 OMP extension 寫入的活動檔；`cities/<cityId 的雜湊>/` 是每座城的帳本（§13）。
+
+OMP extension 是獨立檔 `omp-extension/herdr-reclaim.ts`，日常互動 session 自動寫活動檔；
+mod 以 `find` 列活動檔，成功寫 journal 後按 epoch 寫 ack，並用 `watchFolder` 監看新活動。
+`NormalizedUsage.sourceKey` 固定為 `cli + sessionId + source entry id`，城鎮讀取模型用它
+跨 epoch 去重；child 的用量併入 root，fork 的繼承歷史由 extension 的 session 起點排除。
 
 ## 選取狀態（決策）
 

@@ -1,23 +1,25 @@
 // 把 adapter 的活動紀錄（§6.1）與「遠征取得土地」寫進城帳本（ticket #3）。
 //
-// 一個帳本只管一座城（§13：每個城有自己的目錄），所以呼叫端要給 cityId：
-// 只寫「visit 碰到這座城」的活動紀錄，以及屬於這座城的取得土地操作。
-// 這一票的來源是固定事件情境（scenarios/first-expedition.js）；#5 之後改成 adapter
-// 寫的活動檔，接點不變。寫入順序與 readTown 建格的順序相同，重播結果才會一致。
+// 每城各有一份帳本（§13），所以呼叫端給 cityId，只寫碰到這座城的活動與取得土地操作。
+// adapter 的快照會依 ack compact；同一 writer 的新尾巴要接回 journal 已保存的 visit。
 import { bfsNextTile, keyOf } from "./grid.js";
 import { planExpeditions } from "./town.js";
+import { activityKey } from "./ledger.js";
 
-/** 這支 session 的紀錄有沒有碰到這座城（附錄 §6.1 的 visit 帶 commonDir）。 */
+/** 這支 session 的紀錄有沒有碰到這座城（含 compact 前已在帳本保存的 visit）。 */
 function touchesCity(record, cityId) {
-  return (record.events ?? []).some((event) => event.visit?.commonDir === cityId);
+  return (record?.events ?? []).some((event) => event.visit?.commonDir === cityId);
 }
 
 /** 一個 writer epoch 的紀錄寫成一筆 activity entry（內容是事件陣列）。 */
 export async function ingestActivities(ledger, activities, cityId) {
   const results = [];
+  const previous = await ledger.state();
   for (const record of activities ?? []) {
-    if (cityId && !touchesCity(record, cityId)) continue;
     const events = record.events ?? [];
+    if (events.length === 0) continue; // 已全部 ack 的 compacted 快照沒有新操作
+    const existing = previous.activities.get(activityKey(record));
+    if (cityId && !touchesCity(record, cityId) && !touchesCity(existing, cityId)) continue;
     const lastEventSeq = events.reduce((latest, event) => Math.max(latest, event.eventSeq ?? 0), 0);
     const result = await ledger.submit(() => ({
       opId: `activity:${record.sessionId}:${record.writerEpoch}:${lastEventSeq}`,
