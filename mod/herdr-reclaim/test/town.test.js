@@ -188,7 +188,7 @@ describe("C 版遠征指揮桌要用的資料", () => {
     expect(byExpedition.fields).toContainEqual({ label: "工作時間", value: "1 小時 14 分" });
 
     const fork = selectionDetail(town, { kind: "tile", cityId: CITY.commonDir, x: 1, y: 0 });
-    expect(fork.title).toBe(`遠征 ${FORK_SESSION_ID.slice(0, 8)}`);
+    expect(fork.title).toBe(`遠征 ${FORK_SESSION_ID.slice(0, 8)} · 第 1 代`);
     expect(fork.statusLabel).toBe("駐紮");
   });
 

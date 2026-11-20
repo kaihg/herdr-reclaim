@@ -11,6 +11,7 @@
 import { describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import { CityLedger, byteLen } from "../core/ledger.js";
+import { readTownFromLedger } from "../core/town.js";
 import { processLand, redispatch } from "../core/ingest.js";
 import { AT } from "../scenarios/first-expedition.js";
 import { createFileIo } from "./fs-io.js";

@@ -335,7 +335,7 @@ function autoPlace(_session, visit, cities) {
   const city = cityFor(cities, visit.commonDir, visit.checkout);
   const spot = bfsNextTile((candidate) => city.taken.has(keyOf(candidate)));
   city.taken.add(keyOf(spot));
-  return { x: spot.x, y: spot.y, generation: 1 };
+  return { x: spot.x, y: spot.y, generation: 1, activatedAt: visit.startedAt ?? 0 };
 }
 
 /**

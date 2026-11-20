@@ -178,7 +178,7 @@ function naturalWorkPoints(state, tile) {
         cityId = null;
       } else if (event.kind === "interval_open") opened = event.at;
       else if (event.kind === "heartbeat" && opened !== null) {
-        intervals.push([opened, event.at]);
+        if (cityId === tile.cityId) intervals.push([opened, event.at]);
         opened = event.at;
       } else if (event.kind === "interval_close" && opened !== null) {
         if (cityId === tile.cityId) intervals.push([opened, event.at]);

@@ -11,7 +11,7 @@ import { readTownFromLedger } from "../core/town.js";
 import { createFileIo } from "./fs-io.js";
 
 const CITY = "/tmp/reclaim-commit-evidence/.git";
-const base = (rootSessionId, cityId = CITY) => ({ opId: `expedition:${rootSessionId}`, kind: "expedition", cityId, rootSessionId, generation: 1, ...bfsNextTile(() => false), cli: "omp", repo: { commonDir: cityId, checkout: cityId.slice(0, -5) } });
+const base = (rootSessionId, cityId = CITY) => ({ opId: `expedition:${rootSessionId}`, kind: "expedition", at: 0, activatedAt: 0, cityId, rootSessionId, generation: 1, ...bfsNextTile(() => false), cli: "omp", repo: { commonDir: cityId, checkout: cityId.slice(0, -5) } });
 const hook = (sha, env = {}) => ({ schema: 1, sha, hook: "post-commit", commonDir: CITY, toplevel: CITY.slice(0, -5), at: 1, env });
 const docs = (name, blob) => [{ status: "A", path: `docs/${name}.md`, resultBlob: blob }];
 
@@ -113,7 +113,7 @@ describe("commit 證據 replay", () => {
     const spots = [[0, -1], [1, 0], [0, 1], [-1, 0], [1, -1], [-1, -1]];
     const sessions = spots.map((_, index) => `claim-session-${index + 1}`);
     for (const [index, [x, y]] of spots.entries()) {
-      await ledger.submit(() => ({ opId: `expedition:${sessions[index]}`, kind: "expedition", cityId, rootSessionId: sessions[index], generation: 1, x, y, cli: "omp", repo: { commonDir: cityId, checkout: "/tmp/reclaim-deletion-claim" } }));
+      await ledger.submit(() => ({ opId: `expedition:${sessions[index]}`, kind: "expedition", at: 0, activatedAt: 0, cityId, rootSessionId: sessions[index], generation: 1, x, y, cli: "omp", repo: { commonDir: cityId, checkout: "/tmp/reclaim-deletion-claim" } }));
     }
     const plan = {
       c1: { session: 0, changes: [{ status: "A", path: "src/x.ts", resultBlob: "blob-A" }] },
