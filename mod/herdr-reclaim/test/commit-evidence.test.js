@@ -5,7 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { bfsNextTile } from "../core/grid.js";
 import { CityLedger } from "../core/ledger.js";
-import { ingestCommits, parseReflogEvidence, unharvestedCommitReasons } from "../core/commit-evidence.js";
+import { ingestCommits, parseRawDiff, parseReflogEvidence, unharvestedCommitReasons } from "../core/commit-evidence.js";
+import { harvestForCommit } from "../core/harvest.js";
 import { readTownFromLedger } from "../core/town.js";
 import { createFileIo } from "./fs-io.js";
 
@@ -103,6 +104,89 @@ describe("commit 證據 replay", () => {
       expect(parsed.records.find((record) => record.sha === sha)).toMatchObject({
         hook: "reflog", commonDir: "/tmp/city/.git", toplevel: local, env: {},
       });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  test("新增→刪除→同內容新增→再刪除：每種 claim 只發一次，first-parent blob 不同的刪除不互相去重", async () => {
+    const cityId = "/tmp/reclaim-deletion-claim/.git";
+    const dir = `/tmp/reclaim-deletion-claim/${process.pid}-${Math.random().toString(36).slice(2)}`;
+    const ledger = await new CityLedger({ io: createFileIo(), dir, cityId }).open();
+    const spots = [[0, -1], [1, 0], [0, 1], [-1, 0], [1, -1], [-1, -1]];
+    const sessions = spots.map((_, index) => `claim-session-${index + 1}`);
+    for (const [index, [x, y]] of spots.entries()) {
+      await ledger.submit(() => ({ opId: `expedition:${sessions[index]}`, kind: "expedition", cityId, rootSessionId: sessions[index], generation: 1, x, y, cli: "omp", repo: { commonDir: cityId, checkout: "/tmp/reclaim-deletion-claim" } }));
+    }
+    const plan = {
+      c1: { session: 0, changes: [{ status: "A", path: "src/x.ts", resultBlob: "blob-A" }] },
+      c2: { session: 1, changes: [{ status: "D", path: "src/x.ts", resultBlob: null, oldBlob: "blob-A" }] },
+      c3: { session: 2, changes: [{ status: "A", path: "src/x.ts", resultBlob: "blob-A" }] },
+      c4: { session: 3, changes: [{ status: "D", path: "src/x.ts", resultBlob: null, oldBlob: "blob-A" }] },
+      c5: { session: 4, changes: [{ status: "M", path: "src/x.ts", resultBlob: "blob-B" }] },
+      c6: { session: 5, changes: [{ status: "D", path: "src/x.ts", resultBlob: null, oldBlob: "blob-B" }] },
+    };
+    const diffForCommit = async (sha) => plan[sha].changes;
+    const ingest = async (sha) => {
+      const state = await ledger.state();
+      await ingestCommits({
+        ledger,
+        // repo 身分來自 Git hook；session 身分來自精確 SHA 的 OMP artifact（hook env 不帶 session）。
+        hooks: [{ schema: 1, sha, hook: "post-commit", commonDir: cityId, toplevel: "/tmp/reclaim-deletion-claim", at: 1, env: {} }],
+        sources: [{ schema: 1, sha, cli: "omp", sessionId: sessions[plan[sha].session], at: 2 }],
+        activities: [...state.activities.values()],
+        diffForCommit,
+      });
+      return (await ledger.state()).resources.wood;
+    };
+    const woodPerCommit = {};
+    for (const sha of Object.keys(plan)) woodPerCommit[sha] = await ingest(sha);
+    // 新增 blob-A 與刪除 blob-A 是兩份不同的成果；同內容重複新增、同 first-parent blob 重複刪除都不再發。
+    expect(woodPerCommit).toEqual({ c1: 10, c2: 20, c3: 20, c4: 20, c5: 30, c6: 40 });
+
+    const state = await ledger.state();
+    const town = readTownFromLedger({ expeditions: state.tiles, resources: { [cityId]: state.resources } });
+    expect(town.cities[0].resources).toEqual({ wood: 40, stone: 0, iron: 0, parchment: 0 });
+    expect(state.claims.has(`${cityId}@@src/x.ts|blob-A`)).toBe(true);
+    expect(state.claims.has(`${cityId}@@src/x.ts|deleted|blob-A`)).toBe(true);
+    expect(state.claims.has(`${cityId}@@src/x.ts|blob-B`)).toBe(true);
+    expect(state.claims.has(`${cityId}@@src/x.ts|deleted|blob-B`)).toBe(true);
+    expect(await ledger.lookupClaim("src/x.ts|deleted|blob-B")).not.toBeNull();
+
+    // 重播整份證據不得再發任何資源。
+    for (const sha of Object.keys(plan)) await ingest(sha);
+    const replayed = await ledger.state();
+    expect(replayed.resources.wood).toBe(40);
+    expect(readTownFromLedger({ expeditions: replayed.tiles, resources: { [cityId]: replayed.resources } }).cities[0].resources.wood).toBe(40);
+  });
+  test("真實 Git 的新增／刪除 blob 走 parseRawDiff 後，刪除仍算新單位", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "reclaim-deletion-git-"));
+    const repo = path.join(root, "repo");
+    const run = (args) => {
+      const result = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" });
+      if (result.status !== 0) throw new Error(result.stderr);
+      return result.stdout.trim();
+    };
+    try {
+      mkdirSync(repo);
+      run(["init", "-q"]);
+      run(["config", "user.email", "deletion@example.invalid"]);
+      run(["config", "user.name", "Deletion"]);
+      writeFileSync(path.join(repo, "x.ts"), "content A\n");
+      run(["add", "x.ts"]);
+      run(["commit", "-qm", "add A"]);
+      const addSha = run(["rev-parse", "HEAD"]);
+      const blobA = run(["rev-parse", `HEAD:x.ts`]);
+      run(["rm", "-q", "x.ts"]);
+      run(["commit", "-qm", "delete A"]);
+      const deleteSha = run(["rev-parse", "HEAD"]);
+      const addBlob = spawnSync("git", ["-C", repo, "diff-tree", "--root", "-r", "-M", "--raw", "-z", addSha], { encoding: "utf8" }).stdout;
+      const deleteBlob = spawnSync("git", ["-C", repo, "diff-tree", "-r", "-M", "--raw", "-z", `${deleteSha}^1`, deleteSha], { encoding: "utf8" }).stdout;
+      // 真實 diff-tree：新增帶 resultBlob、刪除帶 first-parent blob 且 resultBlob 為 null。
+      expect(parseRawDiff(addBlob)).toEqual([{ status: "A", path: "x.ts", oldBlob: null, resultBlob: blobA }]);
+      expect(parseRawDiff(deleteBlob)).toEqual([{ status: "D", path: "x.ts", oldBlob: blobA, resultBlob: null }]);
+      const addHarvest = harvestForCommit({ cityId: "/tmp/city/.git", rootSessionId: "s1", generation: 1, sha: addSha, changes: parseRawDiff(addBlob), state: { claims: new Map() }, tile: { harvestedPaths: [] } });
+      const deleteHarvest = harvestForCommit({ cityId: "/tmp/city/.git", rootSessionId: "s2", generation: 1, sha: deleteSha, changes: parseRawDiff(deleteBlob), state: { claims: new Map() }, tile: { harvestedPaths: [] } });
+      expect(addHarvest.claims).toEqual([`x.ts|${blobA}`]);
+      expect(deleteHarvest.claims).toEqual([`x.ts|deleted|${blobA}`]);
+      expect(addHarvest.resources.wood + deleteHarvest.resources.wood).toBe(20);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
