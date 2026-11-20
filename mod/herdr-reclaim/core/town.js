@@ -476,8 +476,7 @@ function newTile(session, city, visit, planned) {
 /** 還沒有任何用量時的加總起點。 */
 export const ZERO_USAGE = { inputNonCache: 0, cacheRead: 0, cacheWrite: 0, output: 0, costKnown: 0, costUnknownEntries: 0 };
 
-/**
-
+/** 依城與遠征區間彙總 provider 投入。 */
 function providerUsage(sources, cityId, startedAt, endedAt) {
   const byProvider = new Map();
   for (const session of sources) {
