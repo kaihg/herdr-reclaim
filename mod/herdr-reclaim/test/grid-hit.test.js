@@ -4,7 +4,7 @@
 // 外接矩形互相重疊的那塊角落**不**屬於相鄰格（舊行為會點錯）。
 import { describe, expect, test } from "bun:test";
 
-import { MAP_RADIUS, TILE, cellAtPoint, cellIndex, contentSize, originInContent, projectTile } from "../core/grid.js";
+import { MAP_RADIUS, TILE, cellAtOffset, cellAtPoint, contentSize, originInContent, projectTile } from "../core/grid.js";
 
 const radius = 3; // 固定情境用小的地圖；真實畫面是 MAP_RADIUS（19×19＝361 格）
 const tile = { w: 84, h: 44 };
@@ -127,9 +127,24 @@ describe("投影與內容區", () => {
     expect(TILE.w).toBeGreaterThan(TILE.h); // 2:1 的斜俯視菱形
   });
 
-  test("cellIndex 與畫格子的順序一致（x 外層、y 內層）", () => {
-    expect(cellIndex({ x: -radius, y: -radius }, radius)).toBe(0);
-    expect(cellIndex({ x: radius, y: radius }, radius)).toBe((2 * radius + 1) ** 2 - 1);
-    expect(cellIndex({ x: 0, y: 1 }, radius)).toBe(cellIndex({ x: 0, y: 0 }, radius) + 1);
+  test("cellAtOffset：每一格自己的座標系，與內容座標的 cellAtPoint 完全一致", () => {
+    const origin = originInContent(radius, tile);
+    for (let px = 0; px < tile.w; px += 7) {
+      for (let py = 0; py < tile.h; py += 5) {
+        const offset = cellAtOffset({ x: px, y: py }, tile);
+        // 把「這一格方框內的點」搬到內容座標，兩條路徑必須得到同一格。
+        expect(cellAtPoint({ x: origin.left + px, y: origin.top + py }, radius, tile))
+          .toEqual({ x: offset.dx, y: offset.dy });
+      }
+    }
+  });
+
+  test("cellAtOffset：方框的角屬於隔壁那一格（相鄰格不因外接矩形重疊點錯）", () => {
+    // 右上角的點：仍在這一格的方框內，但菱形屬於 (x, y-1)（畫面上的右上鄰格）。
+    expect(cellAtOffset({ x: tile.w - 2, y: 2 }, tile)).toEqual({ dx: 0, dy: -1 });
+    expect(cellAtOffset({ x: 2, y: tile.h - 2 }, tile)).toEqual({ dx: 0, dy: 1 });
+    expect(cellAtOffset({ x: tile.w - 2, y: tile.h - 2 }, tile)).toEqual({ dx: 1, dy: 0 });
+    expect(cellAtOffset({ x: 2, y: 2 }, tile)).toEqual({ dx: -1, dy: 0 });
+    expect(cellAtOffset({ x: tile.w / 2, y: tile.h / 2 }, tile)).toEqual({ dx: 0, dy: 0 });
   });
 });

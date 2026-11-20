@@ -19,13 +19,13 @@ import { InputState, ScrollHandle, h_flex, v_flex } from "gpui-base";
 import { appHome, checking, exec, readTextFile, settings, theme, watchFolder, writeTextFile } from "herdr";
 import { ADAPTER_DIR, activityDir, adapterRoot, citiesOf, loadActivities, repoFactsOf } from "./core/adapter.js";
 import { commitContexts, ingestCommits, loadCommitEvidence, parseRawDiff, parseReflogEvidence, unharvestedCommitReasons } from "./core/commit-evidence.js";
-import { MAP_RADIUS, cellIndex, keyOf } from "./core/grid.js";
+import { MAP_RADIUS, cameraFor, keyOf } from "./core/grid.js";
 import { ingestResearch, ingestScenario, processBoost, processBuild, processLand, processTrade, redispatch } from "./core/ingest.js";
 import { hostIo } from "./core/host-io.js";
 import { CasConflict, CityLedger, cityDir } from "./core/ledger.js";
 import { installHooks, removeHooks } from "./core/hooks.js";
 import { RESEARCH_TOKENS_PER_PARCHMENT, RESOURCE_LABELS, RULES_VERSION } from "./core/rules.js";
-import { defaultSelection, parseUi, resolveSelection, selectionOf, serializeUi, withSelection } from "./core/selection.js";
+import { defaultSelection, parseUi, resolveSelection, savedSelection, selectionOf, serializeUi, withSelection } from "./core/selection.js";
 import { QUOTA_SOURCE, parseQuotaReport } from "./core/quota-source.js";
 import { readQuotas } from "./core/provider-stats.js";
 import { CLEAR_POINTS, formatResearch, readTown, readTownFromLedger, selectionDetail } from "./core/town.js";
@@ -259,7 +259,47 @@ async function loadTown(io) {
     quotas: await loadQuotas(io),
   });
 }
-
+/**
+ * 操作之後的最小重讀（門檻 4 的關鍵）：只把各城的帳本狀態重讀一次，不重跑
+ * 活動檔掃描、commit 證據、reflog 或 `git diff-tree`（那些是開機與 watch 變更才需要的）。
+ * 城鎮模型的其他欄位（未解析活動、未收成提交、額度）沿用上一份，不再問 git。
+ */
+async function refreshTown(io, previous) {
+  const stored = [];
+  const expeditions = [];
+  const resources = {};
+  const research = {};
+  const market = {};
+  const repoFacts = {};
+  const unharvestedCommits = {};
+  for (const city of previous?.cities ?? []) {
+    const ledger = await new CityLedger({
+      io,
+      dir: cityDir(adapterRoot(appHome()), city.cityId),
+      cityId: city.cityId,
+    }).open();
+    const state = await ledger.state();
+    stored.push(...state.activities.values());
+    expeditions.push(...state.tiles);
+    resources[city.cityId] = state.resources;
+    research[city.cityId] = state.research;
+    market[city.cityId] = state.market;
+    // 中心格的標籤（新村／舊城區）只依「開城時有沒有 HEAD」，上一份已經算過，不再開 git。
+    repoFacts[city.cityId] = { hadHead: city.center?.kind === "oldtown" ? true : city.center?.kind === "founded" ? false : undefined };
+    unharvestedCommits[city.cityId] = city.unharvestedCommits ?? [];
+  }
+  return readTownFromLedger({
+    activities: stored,
+    expeditions,
+    repoFacts,
+    resources,
+    research,
+    market,
+    unresolvedActivities: previous?.unresolvedActivities ?? [],
+    unharvestedCommits,
+    ...(previous?.quotas ? { quotas: previous.quotas } : {}),
+  });
+}
 /**
  * 額度回報（§9、§15.2）：provider 明確回報的額度，形狀是 S5 的
  * `omp usage --json --redact --no-extensions` 輸出（spikes/s5/observed.json）。
@@ -284,10 +324,9 @@ async function loadQuotas(io) {
 /** 選取狀態的檔案（不是城的帳本）：選取不產生資源，也不改變土地。 */
 const uiPath = () => `${appHome()}/${DATA_DIR}/ui.json`;
 
-/** 讀回上一次的選取；沒有記過就回預設。 */
+/** 讀回上一次的選取（多座城時以「存過選取」的那一座為準）；沒有記過就回預設。 */
 async function loadSelection(io, town) {
-  const cityId = town.cities[0]?.cityId ?? null;
-  const saved = cityId ? selectionOf(parseUi(await io.read(uiPath())), cityId) : null;
+  const saved = savedSelection(town, parseUi(await io.read(uiPath())));
   return { selection: resolveSelection(town, saved), saved: Boolean(saved) };
 }
 
@@ -325,18 +364,22 @@ function emptyMetrics() {
   return { pending: null, samples: { pick: [], panel: [], action: [] }, build: { last: 0, max: 0 } };
 }
 
+/** 只留最近 20 次：面板顯示中位數與 p95，驗收要看的是分佈不是單一樣本。 */
 function recordSample(list, value) {
   const next = [...list, value];
-  return next.length > 12 ? next.slice(next.length - 12) : next;
+  return next.length > 20 ? next.slice(next.length - 20) : next;
 }
 
-function lastOf(list) {
-  return list.length ? list[list.length - 1] : null;
+function percentile(list, ratio) {
+  if (!list.length) return null;
+  const sorted = [...list].sort((a, b) => a - b);
+  return sorted[Math.min(sorted.length - 1, Math.floor(ratio * sorted.length))];
 }
 
-function maxOf(list) {
-  return list.length ? Math.max(...list) : null;
-}
+const lastOf = (list) => (list.length ? list[list.length - 1] : null);
+const medianOf = (list) => percentile(list, 0.5);
+const p95Of = (list) => percentile(list, 0.95);
+const maxOf = (list) => (list.length ? Math.max(...list) : null);
 
 export default class Town extends View {
   init(_props, cx) {
@@ -347,6 +390,7 @@ export default class Town extends View {
     this.mapScroll = ScrollHandle.new();
     this.legendOpen = true;
     this.metricsOpen = false;
+    this.camera = null;
     this.metrics = emptyMetrics();
     // `herdr-app check` 會真的跑 init：不要動使用者的檔案，只渲染固定情境。
     this.historyOpen = false;
@@ -377,7 +421,10 @@ export default class Town extends View {
           this.town = await loadTown(this.io);
           const loaded = await loadSelection(this.io, this.town);
           this.selection = loaded.selection;
-          // 第一次開這座城：把當下顯示的選取記下來，重開後回到同一個位置。
+          // 第一次開這座城：把當下顯示的選取記下來，並把地圖開在它身上
+          // （選到已撤回／已封存時退回城的中心，不要留在內容區的角落）。
+          if (first) this.requestFocus(this.selection);
+          if (first && !this.focusCell && this.city()) this.focusCell = { x: this.city().center.x, y: this.city().center.y };
           if (first && !loaded.saved && this.selection) await saveSelection(this.io, this.selection);
           this.note = null;
         } catch (error) {
@@ -406,20 +453,23 @@ export default class Town extends View {
     this.mark("pick");
     this.selection = selection;
     if (this.io) saveSelection(this.io, selection).catch(() => {});
-    this.reveal(selection);
+    this.requestFocus(selection);
     cx.notify();
   }
 
-  /** 這一格在圖上才捲到它：已撤回與已封存依 §7.1 不畫在地圖上。 */
-  reveal(selection) {
+  /**
+   * 要把哪一格帶進畫面（地圖在 render 時消費一次就清掉）：已撤回與已封存依 §7.1
+   * 不畫在圖上，所以它們只更新右側詳情、不動地圖。
+   */
+  requestFocus(selection) {
     const city = this.city();
-    if (!city || !this.mapScroll) return;
+    if (!city) return;
     const tile = selection?.kind === "expedition"
       ? city.tiles.find((entry) => entry.rootSessionId === selection.rootSessionId && entry.generation === selection.generation)
       : selection?.kind === "tile" ? { x: selection.x, y: selection.y, landStage: null } : null;
     if (!tile || tile.landStage === "archived" || tile.landStage === "withdrawn") return;
     if (Math.abs(tile.x) > MAP_RADIUS || Math.abs(tile.y) > MAP_RADIUS) return;
-    this.mapScroll.scroll_to_item(cellIndex({ x: tile.x, y: tile.y }));
+    this.focusCell = { x: tile.x, y: tile.y };
   }
 
   openHistory(cx) {
@@ -501,7 +551,7 @@ export default class Town extends View {
         if (result.status !== "applied" && result.status !== "duplicate") {
           this.note = `土地操作未完成：${result.reason ?? result.status}`;
         } else {
-          this.town = await loadTown(this.io);
+          this.town = await refreshTown(this.io, this.town);
           const latest = this.town.cities.find((city) => city.cityId === detail.cityId)?.tiles
             .filter((tile) => tile.rootSessionId === detail.rootSessionId)
             .reduce((current, tile) => !current || tile.generation > current.generation ? tile : current, null);
@@ -545,7 +595,7 @@ export default class Town extends View {
         if (result.status !== "applied" && result.status !== "duplicate") {
           this.note = `${ECONOMY_LABELS[kind]}未完成：${result.reason ?? result.status}`;
         } else {
-          this.town = await loadTown(this.io);
+          this.town = await refreshTown(this.io, this.town);
           this.note = null;
         }
       } catch (error) {
@@ -862,15 +912,24 @@ export default class Town extends View {
         revealed.add(keyOf({ x: tileEntry.x + dx, y: tileEntry.y + dy }));
       }
     }
+    const tile = tileSize(area);
+    // 相機（把某一格擺到視窗中央的平移量）：第一次開城對到城的中心，選取或歷程跳轉
+    // 把那一格帶進畫面；之後重繪沿用同一個相機，捲動仍然由原生捲動容器負責。
+    if (this.focusCell || !this.camera || this.camera.cityId !== city.cityId) {
+      const anchor = this.focusCell ?? { x: city.center.x, y: city.center.y };
+      this.camera = { cityId: city.cityId, ...cameraFor(anchor, area) };
+    }
+    this.focusCell = null;
     return mapView({
       city,
       tiles,
       revealed,
       selection: this.selection,
       theme: t,
-      tile: tileSize(area),
+      tile,
       scroll: this.mapScroll,
       legendOpen: this.legendOpen,
+      camera: this.camera,
       onToggleLegend: (cx2) => {
         this.legendOpen = !this.legendOpen;
         cx2.notify();
@@ -906,13 +965,13 @@ export default class Town extends View {
       .children(MEASURES.map(([kind, label]) => {
         const list = this.metrics.samples[kind];
         return div().text_size(9).text_color(list.length ? t.muted : t.dim).child(
-          `${label}：最近 ${lastOf(list) ?? "—"} ms · 最大 ${maxOf(list) ?? "—"} ms · ${list.length} 次`,
+          `${label}：最近 ${lastOf(list) ?? "—"} · 中位 ${medianOf(list) ?? "—"} · p95 ${p95Of(list) ?? "—"} · 最大 ${maxOf(list) ?? "—"} ms · ${list.length} 次`,
         );
       }))
       .child(div().text_size(9).text_color(t.muted)
         .child(`建樹：最近 ${this.metrics.build.last} ms · 最大 ${this.metrics.build.max} ms`))
       .child(div().text_size(9).text_color(t.dim)
-        .child("捲動為原生 retained scroll，不由 mod 重繪（量測見筆記 §0.3）"));
+        .child("捲動為原生 retained scroll，不由 mod 重繪；CPU／位移由外部取樣（筆記 §0.1）"))
   }
 
   // ---- 右側：選取遠征或格子的詳情（§12 的入口）
@@ -943,6 +1002,10 @@ export default class Town extends View {
       .children(
         [
           div().text_size(10).text_color(t.dim).child("遠征詳情"),
+          // §12：歷程搜尋的入口（遠征／格子／中心格的詳情都有；面板只在按下去時佔右欄）。
+          detail.historyEntry
+            ? hookButton("歷程搜尋", t, (cx2) => this.openHistory(cx2))
+            : null,
           div().text_size(14).font_semibold().child(detail.title),
           detail.statusLabel || detail.tile?.landStage
             ? h_flex().gap(6).items_center().flex_wrap().children([
