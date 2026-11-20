@@ -8,7 +8,7 @@ import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { activityDir, loadActivities } from "../core/adapter.js";
+import { activityDir, adapterRoot, loadActivities } from "../core/adapter.js";
 import { ingestScenario } from "../core/ingest.js";
 import { CityLedger, cityDir } from "../core/ledger.js";
 import { readTown, readTownFromLedger } from "../core/town.js";
@@ -315,4 +315,123 @@ describe("Codex 活動重播到城鎮模型", () => {
       cleanup();
     }
   });
+});
+
+describe("ack 之後的 compact 不會讓 Codex adapter 遺失狀態", () => {
+  /** 讀目前的活動檔（adapter 每次 hook 都寫同一條 epoch 的檔案）。 */
+  const recordOf = (appHome, sessionId, epoch) => readRecord(path.join(activityDir(appHome), sessionId, `${epoch}.json`));
+
+  const activitiesOf = (appHome) => loadActivities(
+    { read: async (file) => (fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null), list: listActivityFiles },
+    activityDir(appHome),
+  );
+
+  /** 真帳本：ingest 成功會寫 ack，adapter 下一次就把已入帳的事件 compact 掉。 */
+  const ledgerOf = (appHome, cityId) =>
+    new CityLedger({ io: createFileIo(), dir: cityDir(adapterRoot(appHome), cityId), cityId }).open();
+
+  test("已入帳的事件被 compact 之後：visit 與區間狀態留著，序號接著遞增、Stop 不漏", async () => {
+    const { home, appHome, cleanup } = makeHome("codex-ack");
+    try {
+      const repo = makeRepo(path.join(home, "repo"));
+      const session = "01a1f69b-0000-7000-0000-00000000000d";
+      const rollout = makeRollout(home, session, {});
+      const base = { session_id: session, transcript_path: rollout, cwd: repo };
+      const cityId = commonDirOf(repo);
+
+      // 第一個回合：SessionStart → Prompt → usage → Stop。
+      hook(appHome, "k1", 0, { ...base, hook_event_name: "SessionStart", source: "startup" });
+      hook(appHome, "k1", 1_000, { ...base, hook_event_name: "UserPromptSubmit", turn_id: "t1" });
+      appendUsage(rollout, "resp_a", { input_tokens: 1_000, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 10 });
+      hook(appHome, "k1", 2_000, { ...base, hook_event_name: "Stop", turn_id: "t1" });
+      const firstRound = recordOf(appHome, session, "k1");
+      const ackedUpTo = Math.max(...firstRound.events.map((event) => event.eventSeq));
+
+      const ledger = await ledgerOf(appHome, cityId);
+      await ingestScenario(ledger, { activities: await activitiesOf(appHome), repoFacts: {} }, cityId);
+      // 帳本寫了 ack：下一次 hook 會把所有已入帳的事件砍掉。
+      const acked = await ledger.readAck(session, "k1");
+      expect(acked.ackedEventSeq).toBe(ackedUpTo);
+
+      // 第二個回合：Prompt（要開區間）→ PreToolUse（要 heartbeat）→ Stop。
+      hook(appHome, "k1", 10_000, { ...base, hook_event_name: "UserPromptSubmit", turn_id: "t2" });
+      const afterCompact = recordOf(appHome, session, "k1");
+      // visit 還開著：不能因為事件被砍掉就重開一個新的 visit（那會多一段 visit_end/visit_start）。
+      expect(afterCompact.control.visit).not.toBeNull();
+      expect(afterCompact.events.filter((event) => event.kind === "visit_start")).toHaveLength(0);
+
+      hook(appHome, "k1", 11_000, { ...base, hook_event_name: "PreToolUse", turn_id: "t2", tool_name: "Bash" });
+      hook(appHome, "k1", 12_000, { ...base, hook_event_name: "Stop", turn_id: "t2" });
+      const secondRound = recordOf(appHome, session, "k1");
+      // 舊碼：ack 掉 interval_open 之後 openNow=false → PreToolUse 不發 heartbeat、Stop 不關區間。
+      expect(secondRound.events.filter((event) => event.kind === "heartbeat")).toHaveLength(1);
+      expect(secondRound.events.filter((event) => event.kind === "interval_close")).toHaveLength(1);
+      // 序號嚴格遞增，而且都大於已 ack 的（舊碼從 1 重編 → 帳本 stale_activity 拒絕）。
+      const seqs = secondRound.events.map((event) => event.eventSeq);
+      expect(new Set(seqs).size).toBe(seqs.length);
+      expect(Math.min(...seqs)).toBeGreaterThan(acked.ackedEventSeq);
+      expect(secondRound.control.lastEventSeq).toBe(Math.max(...seqs));
+      expect(secondRound.control.intervalOpen).toBe(false);
+
+      // 第二次 ingest 必須被帳本接受；重開帳本也得到同一座城。
+      await ingestScenario(ledger, { activities: await activitiesOf(appHome), repoFacts: {} }, cityId);
+      const state = await ledger.state();
+      const replayed = readTownFromLedger({ activities: [...state.activities.values()], expeditions: state.tiles, repoFacts: {} });
+      const tile = replayed.cities[0].tiles.find((candidate) => candidate.rootSessionId === session);
+      // 兩段工作都算到：[1000, 2000] ∪ [10000, 12000]。
+      expect(tile.workMs).toBe(3_000);
+      const reopened = await openLedgerAgain(appHome, cityId);
+      expect(readTownFromLedger({ activities: [...(await reopened.state()).activities.values()], expeditions: (await reopened.state()).tiles, repoFacts: {} })).toEqual(replayed);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("compact 之後重掃同一份 rollout：舊用量不會以現在的 visit／時間重發", async () => {
+    const { home, appHome, cleanup } = makeHome("codex-usage-compact");
+    try {
+      const repoA = makeRepo(path.join(home, "repo-a"));
+      const repoB = makeRepo(path.join(home, "repo-b"));
+      const session = "01a1f69b-0000-7000-0000-00000000000e";
+      const rollout = makeRollout(home, session, {});
+      const cityA = commonDirOf(repoA);
+
+      hook(appHome, "m1", 0, { session_id: session, transcript_path: rollout, cwd: repoA, hook_event_name: "SessionStart", source: "startup" });
+      hook(appHome, "m1", 1_000, { session_id: session, transcript_path: rollout, cwd: repoA, hook_event_name: "UserPromptSubmit", turn_id: "t1" });
+      appendUsage(rollout, "resp_a", { input_tokens: 1_000, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 10 });
+      hook(appHome, "m1", 3_000, { session_id: session, transcript_path: rollout, cwd: repoA, hook_event_name: "Stop", turn_id: "t1" });
+
+      const ledger = await ledgerOf(appHome, cityA);
+      await ingestScenario(ledger, { activities: await activitiesOf(appHome), repoFacts: {} }, cityA);
+
+      // 換到另一座城（/move 或切到另一個 repo）再工作：同一份 rollout 會被重掃。
+      hook(appHome, "m1", 10_000, { session_id: session, transcript_path: rollout, cwd: repoB, hook_event_name: "SessionStart", source: "resume" });
+      hook(appHome, "m1", 11_000, { session_id: session, transcript_path: rollout, cwd: repoB, hook_event_name: "UserPromptSubmit", turn_id: "t2" });
+      appendUsage(rollout, "resp_b", { input_tokens: 500, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 7 });
+      hook(appHome, "m1", 12_000, { session_id: session, transcript_path: rollout, cwd: repoB, hook_event_name: "PostToolUse", turn_id: "t2", tool_name: "Bash" });
+      const moved = recordOf(appHome, session, "m1");
+      // 舊碼把已 ack 的 resp_a 從 usageSeen 扣掉，這裡會再發一次（時間變成 12000、visit 是 B 城）。
+      expect(moved.events.filter((event) => event.kind === "usage").map((event) => event.sourceEntryId)).toEqual(["resp_b"]);
+      expect(moved.usageSeen).toEqual(expect.arrayContaining(["resp_a", "resp_b"]));
+
+      // 帳本裡 resp_a 只有原本那一筆，時間與 visit 都還是第一座城的。
+      await ingestScenario(ledger, { activities: await activitiesOf(appHome), repoFacts: {} }, cityA);
+      const state = await ledger.state();
+      const stored = [...state.activities.values()].find((record) => record.sessionId === session);
+      const original = stored.events.filter((event) => event.kind === "usage" && event.sourceEntryId === "resp_a");
+      expect(original).toHaveLength(1);
+      expect(original[0].at).toBe(3_000);
+      const visitBefore = [...stored.events.slice(0, stored.events.indexOf(original[0]))]
+        .reverse().find((event) => event.kind === "visit_start" || event.kind === "visit_end");
+      expect(visitBefore.kind).toBe("visit_start");
+      expect(visitBefore.visit.commonDir).toBe(cityA);
+    } finally {
+      cleanup();
+    }
+  });
+
+  /** 重新開一份帳本實例（模擬 herdr 關掉之後再開）。 */
+  async function openLedgerAgain(appHome, cityId) {
+    return new CityLedger({ io: createFileIo(), dir: cityDir(adapterRoot(appHome), cityId), cityId }).open();
+  }
 });

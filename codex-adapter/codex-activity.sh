@@ -29,8 +29,9 @@
 #   $HERDR_APP_HOME/data/herdr-reclaim/activity/<sessionId>/identity.state
 #     （`.state` 不是 `.json`：mod 列活動檔時用的是 `find -name '*.json'`）
 # mod 在帳本提交成功之後寫 `cities/<city>/acks/<sessionId>/<epoch>.json`；
-# 這一支只讀自己的 ack，砍掉 `eventSeq ≤ ackedEventSeq` 的事件（§6.2），
-# 並把被砍掉的用量 id 從 usageSeen 移除，讓狀態不會無限長大。
+# 這一支只讀自己的 ack，砍掉 `eventSeq ≤ ackedEventSeq` 的事件（§6.2）。已處理的用量來源
+# 身份與 writer 控制狀態（visit／區間是否開著、序號上限）**不隨 compact 遺忘**：
+# 從被砍過的 events 推導會讓序號歸零、區間與 visit 狀態遺失（見 read_state 的說明）。
 #
 # 只依賴 POSIX sh 與 `jq`（原生執行檔）；不啟動 Node／Python 直譯器。
 # 這一支只寫檔、絕不讓例外跑進 agent：所有錯誤都寫進 errors.log 並 exit 0。
@@ -172,15 +173,26 @@ scan_usage() { # $1 transcript, $2 已看過的 id（JSON 陣列）, $3 是否�
 }
 
 # 記錄的狀態：eventSeq 起點、區間是否開著、visit 是否開著與它的 cwd、已看過的用量 id。
+#
+# 控制狀態（control）**不隨 ack compact 刪除**：ack 只砍掉已入帳的事件，visit 是否還開著、
+# 下一個序號要從哪裡接、目前 interval 開不開，都只能從 control 讀——從被砍過的 events 推導
+# 會得到「visit 沒開、區間沒開、序號歸零」，於是新事件從 1 重編（帳本 stale_activity 拒絕，
+# 整個城鎮載入失敗），PreToolUse 不再發 heartbeat、Stop 也不再關區間。
 read_state() { # $1 現有紀錄
   printf '%s' "$1" | jq -r '
-    (.events // []) as $e
-    | [ ([$e[].eventSeq] | max // 0),
-        (([$e[] | select(.kind == "interval_open" or .kind == "interval_close")][-1].kind // "") == "interval_open"),
-        (([$e[] | select(.kind == "visit_start" or .kind == "visit_end")][-1].kind // "") == "visit_start"),
-        ([$e[] | select(.kind == "visit_start")][-1].visit.cwd // ""),
-        ([$e[] | select(.kind == "visit_start")][-1].visit.checkout // ""),
-        ([$e[] | select(.kind == "visit_start")][-1].visit.visitId // "") ]
+    (.control // {}) as $c
+    | (.events // []) as $e
+    | (if ($c | has("intervalOpen")) then $c.intervalOpen
+       else (([$e[] | select(.kind == "interval_open" or .kind == "interval_close")][-1].kind // "") == "interval_open") end) as $open
+    | (if ($c | has("visit")) then ($c.visit != null)
+       else (([$e[] | select(.kind == "visit_start" or .kind == "visit_end")][-1].kind // "") == "visit_start") end) as $visitOpen
+    | ([$e[] | select(.kind == "visit_start")][-1].visit // {}) as $lastVisit
+    | [ ([$c.lastEventSeq // 0, ([$e[].eventSeq] | max // 0)] | max),
+        $open,
+        $visitOpen,
+        (if $visitOpen and ($c.visit // null) != null then ($c.visit.cwd // "") else ($lastVisit.cwd // "") end),
+        (if $visitOpen and ($c.visit // null) != null then ($c.visit.checkout // "") else ($lastVisit.checkout // "") end),
+        (if $visitOpen and ($c.visit // null) != null then ($c.visit.visitId // "") else ($lastVisit.visitId // "") end) ]
     | .[]' 2>/dev/null || printf '0\nfalse\nfalse\n\n\n\n'
 }
 
@@ -316,12 +328,13 @@ EOF
       --argjson acked "$ACKED" --argjson at "$AT" --arg sessionId "$SESSION_ID" --arg epoch "$EPOCH" \
       --arg cli "$CLI" --arg turnId "$TURN_ID" '
       ($old // {}) as $o
+      | (if ($o.control | type) == "object" then $o.control else {} end) as $c
       | ([($o.events // [])[] | select(.eventSeq > $acked)]) as $kept
-      | ([($o.events // [])[] | select(.eventSeq <= $acked) | .sourceEntryId // empty]) as $dropped
-      | ([$kept[] | select(.kind == "interval_open" or .kind == "interval_close")][-1].kind // "") as $lastInt
-      | ([$kept[] | select(.kind == "visit_start" or .kind == "visit_end")][-1].kind // "") as $lastVis
-      | ($lastInt == "interval_open") as $openNow
-      | ($lastVis == "visit_start") as $visitNow
+      # 控制狀態優先：這些欄位不隨 ack compact 消失（事件被砍光時仍要知道 visit／區間開著）。
+      | (if ($c | has("intervalOpen")) then $c.intervalOpen
+         else (([$kept[] | select(.kind == "interval_open" or .kind == "interval_close")][-1].kind // "") == "interval_open") end) as $openNow
+      | (if ($c | has("visit")) then ($c.visit != null)
+         else (([$kept[] | select(.kind == "visit_start" or .kind == "visit_end")][-1].kind // "") == "visit_start") end) as $visitNow
       | ([ (if $visitNew then
              [ (if $openNow then [{kind: "interval_close"}] else [] end),
                (if $visitNow then [{kind: "visit_end"}] else [] end),
@@ -334,10 +347,16 @@ EOF
            (if ($turn and ($turnId != "")) then [{kind: "turn_end", turnId: $turnId}] else [] end),
            (if ($endVisit and $visitNow and (($visitNew | not))) then [{kind: "visit_end"}] else [] end)
          ] | add) as $closers
-      | ([$kept[].eventSeq] | max // 0) as $base
+      # 新序號的下限：還留著的事件、control 記下的最大序號、已 ack 的序號——帳本以
+      # (sessionId, writerEpoch) 鍵保存的事件序號只能往前，撞號會被當成 stale_activity。
+      | ([ ([$kept[].eventSeq] | max // 0), ($c.lastEventSeq // 0), $acked ] | max) as $base
       | ([ ($openers + $newEvents + $closers)[] | . + {at: $at} ]) as $made
       | ([$made[]] | to_entries | map(.value + {eventSeq: ($base + .key + 1)})) as $numbered
       | ($kept + $numbered) as $all
+      | ([$openers[] | select(.kind == "visit_start")] | length) as $newVisits
+      | ([$closers[] | select(.kind == "visit_end")] | length) as $endVisits
+      | ([$openers[] | select(.kind == "interval_open")] | length) as $newOpens
+      | ([$closers[] | select(.kind == "interval_close")] | length) as $newCloses
       | { schema: 1, cli: $cli,
           cliVersion: (($ident.cliVersion // $o.cliVersion) // "unknown"),
           capabilities: {usage: true, parent: true, heartbeat: true, commitEnv: true},
@@ -347,8 +366,14 @@ EOF
           interactive: (($ident.interactive // $o.interactive) // false),
           writerEpoch: $epoch,
           events: $all,
+          control: {
+            lastEventSeq: ([$base, ([$all[].eventSeq] | max // 0)] | max),
+            intervalOpen: (if $newOpens > 0 then true elif $newCloses > 0 then false else $openNow end),
+            visit: (if $newVisits > 0 then $visit elif $endVisits > 0 then null else ($c.visit // null) end) },
           updatedAt: ([($o.updatedAt // 0), $at] | max),
-          usageSeen: (((($o.usageSeen // []) - $dropped) + $seenAdd) | unique) }
+          # 已處理來源的身份不隨 compact 遺忘：舊碼把已 ack 事件的 id 從 usageSeen 扣掉，
+          # 下一次重掃同一份 rollout 就會把舊 response 當成新用量、以現在的時間重發。
+          usageSeen: ((($o.usageSeen // []) + $seenAdd) | unique) }
     ' >"$tmp" 2>>"$ROOT/errors.log"; then
     mv -f "$tmp" "$FILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null
   else
