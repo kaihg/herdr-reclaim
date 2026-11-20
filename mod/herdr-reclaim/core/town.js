@@ -258,6 +258,9 @@ export function readTownFromLedger(replay = {}) {
       }),
     );
   }
+  for (const city of town.cities) {
+    city.resources = replay.resources?.[city.cityId] ?? city.resources;
+  }
   return town;
 }
 

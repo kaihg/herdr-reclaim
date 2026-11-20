@@ -18,10 +18,12 @@ import { Background, PathBuilder, View, div } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
 import { appHome, checking, exec, readTextFile, settings, theme, watchFolder, writeTextFile } from "herdr";
 import { ADAPTER_DIR, activityDir, adapterRoot, citiesOf, loadActivities, repoFactsOf } from "./core/adapter.js";
+import { loadCommitEvidence, parseRawDiff, ingestCommits } from "./core/commit-evidence.js";
 import { MAP_RADIUS, keyOf, projectTile } from "./core/grid.js";
 import { ingestScenario } from "./core/ingest.js";
 import { hostIo } from "./core/host-io.js";
 import { CasConflict, CityLedger, cityDir } from "./core/ledger.js";
+import { installHooks, removeHooks } from "./core/hooks.js";
 import { defaultSelection, parseUi, resolveSelection, selectionOf, serializeUi, withSelection } from "./core/selection.js";
 import { CLEAR_POINTS, readTown, readTownFromLedger, selectionDetail } from "./core/town.js";
 import { firstExpedition } from "./scenarios/first-expedition.js";
@@ -122,17 +124,32 @@ async function loadTown(io) {
   const cityIds = [...new Set([...citiesOf(activities), ...(await cityIdsFromLedgers(io))])].sort();
   const repoFacts = await repoFactsOf(io, cityIds);
   const replay = { activities, repoFacts };
+  const evidence = await loadCommitEvidence(io, adapterRoot(appHome()), listActivityFiles);
   const stored = [];
   const expeditions = [];
+  const resources = {};
   for (const cityId of cityIds) {
     const ledger = await new CityLedger({ io, dir: cityDir(adapterRoot(appHome()), cityId), cityId }).open();
     await ingestScenario(ledger, replay, cityId);
     await ledger.maybeCheckpoint();
+    const before = await ledger.state();
+    await ingestCommits({
+      ledger,
+      ...evidence,
+      activities: [...before.activities.values()],
+      diffForCommit: async (sha, hook) => {
+        if (!hook?.toplevel) return [];
+        let result = await exec("git", ["-C", hook.toplevel, "diff-tree", "-r", "-M", "--raw", "-z", `${sha}^1`, sha]);
+        if (result.code !== 0) result = await exec("git", ["-C", hook.toplevel, "diff-tree", "--root", "-r", "-M", "--raw", "-z", sha]);
+        return result.code === 0 ? parseRawDiff(result.stdout) : [];
+      },
+    });
     const state = await ledger.state();
+    resources[cityId] = state.resources;
     stored.push(...state.activities.values());
     expeditions.push(...state.tiles);
   }
-  return readTownFromLedger({ activities: stored, expeditions, repoFacts });
+  return readTownFromLedger({ activities: stored, expeditions, repoFacts, resources });
 }
 
 /** 選取狀態的檔案（不是城的帳本）：選取不產生資源，也不改變土地。 */
@@ -188,6 +205,7 @@ export default class Town extends View {
     this.rootSize = { width: 0, height: 0 };
     this.selection = null;
     this.note = "正在讀取城鎮帳本…";
+    this.hookNotice = null;
     // `herdr-app check` 會真的跑 init：不要動使用者的檔案，只渲染固定情境。
     if (checking()) {
       this.town = readTown(firstExpedition);
@@ -218,7 +236,7 @@ export default class Town extends View {
         cx.notify();
         first = false;
         try {
-          await watchFolder(activityDir(appHome()));
+          await watchFolder(adapterRoot(appHome()));
         } catch {
           return; // host 不支援這條 watch 時保留最後一次重播結果
         }
@@ -283,6 +301,30 @@ export default class Town extends View {
 
   // ---- 上方：城鎮庫存與主要行會（§9、§14.1）
 
+  manageHooks(city, remove, cx) {
+    const repo = city.tiles.find((tile) => tile.repo?.checkout)?.repo.checkout;
+    if (!repo) {
+      this.hookNotice = "沒有可用的 checkout";
+      cx.notify();
+      return;
+    }
+    cx.spawn(async (cx2) => {
+      try {
+        const result = remove
+          ? await removeHooks({ repo, exec })
+          : await installHooks({ repo, exec, io: storageIo(), appHome: appHome() });
+        this.hookNotice = result.status === "needs-confirmation"
+          ? `需先確認：${result.reason}`
+          : result.status === "installed" ? "收成 hook 已安裝"
+          : result.status === "removed" ? "收成 hook 已移除"
+          : result.status === "not-installed" ? "目前沒有已安裝的 hook"
+          : `操作未完成：${result.reason ?? result.status}`;
+      } catch (error) {
+        this.hookNotice = `hook 操作失敗：${error}`;
+      }
+      cx2.notify();
+    });
+  }
   topBar(city, t, leftW) {
     return h_flex()
       .id("top")
@@ -309,11 +351,17 @@ export default class Town extends View {
           .child(div().text_size(10).text_color(t.dim).child("庫存"))
           .children(RESOURCES.map((resource) => resourceChip(resource, city.resources[resource.key], t))),
         v_flex()
-          .w(120)
+          .w(176)
           .flex_none()
           .items_end()
+          .gap(4)
           .child(div().text_size(10).text_color(t.dim).child("主要行會"))
-          .child(div().text_size(12.5).child(city.guild ? city.guild.name : "未知")),
+          .child(div().text_size(12.5).child(city.guild ? city.guild.name : "未知"))
+          .child(h_flex().gap(5).children([
+            hookButton("安裝收成", t, (cx2) => this.manageHooks(city, false, cx2)),
+            hookButton("移除", t, (cx2) => this.manageHooks(city, true, cx2)),
+          ]))
+          .child(this.hookNotice ? div().text_size(9).text_color(t.muted).truncate().child(this.hookNotice) : div()),
       ]);
   }
 
@@ -463,6 +511,18 @@ export default class Town extends View {
         ].filter(Boolean),
       );
   }
+}
+
+function hookButton(label, t, action) {
+  return div()
+    .px(6)
+    .py(3)
+    .rounded(4)
+    .cursor_pointer()
+    .bg(t.surface)
+    .hover((style) => style.bg(t.hover))
+    .on_click((_event, cx) => action(cx))
+    .child(div().text_size(9).child(label));
 }
 
 function painted(path, color, tile) {
