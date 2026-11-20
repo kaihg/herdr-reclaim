@@ -796,9 +796,14 @@ export function formatDuration(ms) {
   return rest ? `${hours} 小時 ${rest} 分` : `${hours} 小時`;
 }
 
+/** Date 的可表示上限：超出範圍的 `at`（壞掉的證據檔）顯示未知，不讓 render 丟例外。 */
+const MAX_EPOCH_MS = 8_640_000_000_000_000;
+
 function formatTimestamp(value) {
   const timestamp = Number(value);
-  return Number.isFinite(timestamp) && timestamp > 0 ? new Date(timestamp).toLocaleString("zh-TW") : "時間未知";
+  return Number.isFinite(timestamp) && timestamp > 0 && timestamp <= MAX_EPOCH_MS
+    ? new Date(timestamp).toLocaleString("zh-TW")
+    : "時間未知";
 }
 
 /**

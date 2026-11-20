@@ -121,6 +121,17 @@ export const PENDING_REASONS = new Set(["no-session-source", "no-hook-repository
  * 每一條 commit 證據的判定結果（收成與研究共用同一個來源核對）。
  * `attributed` 代表歸屬確定（`rootId` 是往上追到的 root）；`pending` 代表來源可能晚到。
  */
+
+/**
+ * 合理的毫秒 epoch。舊的 recorder 版本留下過 20 位數的 `at`（1.8e19）：那不是可以顯示或
+ * 比較的時間，寧可當成沒有時間（用讀取當下）也不寫進帳本、也不讓歷程搜尋因此丟例外。
+ */
+const MAX_EPOCH_MS = 8_640_000_000_000_000;
+
+function plausibleAt(value) {
+  const at = Number(value);
+  return Number.isFinite(at) && at > 0 && at <= MAX_EPOCH_MS ? at : null;
+}
 export function commitContexts({ hooks = [], sources = [], activities = [], remoteMerges = new Set() }) {
   const contexts = [];
   const shas = new Set([...hooks, ...sources].map((record) => record.sha));
@@ -128,7 +139,7 @@ export function commitContexts({ hooks = [], sources = [], activities = [], remo
     const attribution = attributionFor(sha, hooks, sources, activities);
     const remoteMerge = remoteMerges.has(sha);
     const records = [...hooks, ...sources].filter((record) => record.sha === sha);
-    const at = Math.min(...records.map((record) => Number(record.at) || Date.now()));
+    const at = records.map((record) => plausibleAt(record.at)).filter((value) => value !== null).sort((a, b) => a - b)[0] ?? Date.now();
     const rootId = !remoteMerge && attribution.identity ? rootSession(attribution.identity.sessionId, activities) : null;
     const reason = remoteMerge ? "remote-merge" : attribution.reason;
     contexts.push({
