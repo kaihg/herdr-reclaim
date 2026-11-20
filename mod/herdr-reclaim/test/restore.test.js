@@ -321,4 +321,77 @@ describe("帳本重建城鎮", () => {
     expect(attributed.unresolvedActivities).toEqual([]);
   });
 
+  test("已收成的格子經公開讀取模型就不再提供撤回或封存", async () => {
+    const reservedSession = "reserved-operation-session";
+    const clearedSession = "cleared-operation-session";
+    const scenario = {
+      repoFacts: firstExpedition.repoFacts,
+      activities: [
+        activity({
+          sessionId: reservedSession,
+          writerEpoch: "reserved-epoch",
+          events: [visitStart("reserved-visit", AT, CITY), intervalOpen(AT), intervalClose(AT + 60_000)],
+        }),
+        activity({
+          sessionId: clearedSession,
+          writerEpoch: "cleared-epoch",
+          events: [visitStart("cleared-visit", AT + 1, CITY), intervalOpen(AT + 1), intervalClose(AT + 1 + 120 * 60_000)],
+        }),
+      ],
+    };
+    const ledger = await open(newDir());
+    await ingestScenario(ledger, scenario, CITY.commonDir);
+
+    // 未收成的兩格：未開墾可撤回、已開墾可封存。
+    const before = await townOfLedger(ledger);
+    const reserved = selectionDetail(before, { kind: "expedition", cityId: CITY.commonDir, rootSessionId: reservedSession });
+    expect(reserved.fields.find((field) => field.label === "土地").value).toBe("預留");
+    expect(reserved.actions).toEqual(["withdraw"]);
+    expect(reserved.actionUnavailableReason).toBeNull();
+    const cleared = selectionDetail(before, { kind: "expedition", cityId: CITY.commonDir, rootSessionId: clearedSession });
+    expect(cleared.fields.find((field) => field.label === "土地").value).toBe("已開墾");
+    expect(cleared.actions).toEqual(["archive"]);
+    expect(cleared.actionUnavailableReason).toBeNull();
+
+    // 兩格都收成過一次 commit：撤回與封存都不再可用，而且帶上原因。
+    expect((await ledger.submit(() => ({
+      opId: "harvest:restore-cleared",
+      kind: "harvest",
+      at: AT + 1_000,
+      cityId: CITY.commonDir,
+      rootSessionId: clearedSession,
+      generation: 1,
+      claims: ["docs/cleared.md|blob-cleared"],
+      paths: ["docs/cleared.md"],
+      points: 20,
+      resources: { parchment: 1 },
+    }))).status).toBe("applied");
+    expect((await ledger.submit(() => ({
+      opId: "harvest:restore-reserved",
+      kind: "harvest",
+      at: AT + 1_000,
+      cityId: CITY.commonDir,
+      rootSessionId: reservedSession,
+      generation: 1,
+      claims: ["src/reserved.ts|blob-reserved"],
+      paths: ["src/reserved.ts"],
+      points: 20,
+      resources: { wood: 10 },
+    }))).status).toBe("applied");
+
+    const after = await townOfLedger(ledger);
+    for (const rootSessionId of [reservedSession, clearedSession]) {
+      const operation = selectionDetail(after, { kind: "expedition", cityId: CITY.commonDir, rootSessionId });
+      expect(operation.actions).toEqual([]);
+      expect(operation.actionUnavailableReason).toBe("已有 commit 收成，不能撤回或封存");
+    }
+
+    // checkpoint 重播路徑（衍生索引 + 後續 journal）也要保有同一個旗標。
+    await ledger.checkpoint();
+    const replayed = await townOfLedger(await open(ledger.dir));
+    for (const rootSessionId of [reservedSession, clearedSession]) {
+      expect(selectionDetail(replayed, { kind: "expedition", cityId: CITY.commonDir, rootSessionId }).actions).toEqual([]);
+    }
+  });
+
 });
