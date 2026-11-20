@@ -27,7 +27,7 @@ import { installHooks, removeHooks } from "./core/hooks.js";
 import { RESEARCH_TOKENS_PER_PARCHMENT, RESOURCE_LABELS, RULES_VERSION } from "./core/rules.js";
 import { defaultSelection, parseUi, resolveSelection, savedSelection, selectionOf, serializeUi, withSelection } from "./core/selection.js";
 import { QUOTA_SOURCE, parseQuotaReport } from "./core/quota-source.js";
-import { readQuotas } from "./core/provider-stats.js";
+import { quotaView, readQuotaView } from "./core/quota-view.js";
 import { CLEAR_POINTS, formatResearch, readTown, readTownFromLedger, selectionDetail } from "./core/town.js";
 import { firstExpedition } from "./scenarios/first-expedition.js";
 import {
@@ -298,7 +298,9 @@ async function refreshTown(io, previous) {
     market,
     unresolvedActivities: previous?.unresolvedActivities ?? [],
     unharvestedCommits,
-    ...(previous?.quotas ? { quotas: previous.quotas } : {}),
+    // 額度依「現在」重新判定是不是過期（§9）：沿用上一次的解析結果，畫面開著跨過
+    // TTL／resetsAt 之後還會顯示舊的 remaining。重算只用已存的原始快照，不打 provider。
+    ...(previous?.quotas ? { quotas: quotaView(previous.quotas.snapshot) } : {}),
   });
 }
 /**
@@ -313,13 +315,8 @@ async function refreshTown(io, previous) {
 const quotasPath = () => `${adapterRoot(appHome())}/quotas.json`;
 
 async function loadQuotas(io) {
-  const text = await io.read(quotasPath());
-  if (text === null) return readQuotas(null);
-  try {
-    return readQuotas(JSON.parse(text), { now: Date.now() });
-  } catch {
-    return readQuotas(null); // 壞掉的回報檔＝未知，不影響城鎮
-  }
+  // 模型帶著原始快照：之後的重繪／操作刷新都用「現在」重新判定新鮮度（不呼叫外部 CLI）。
+  return readQuotaView(io, quotasPath());
 }
 
 /** 選取狀態的檔案（不是城的帳本）：選取不產生資源，也不改變土地。 */
@@ -621,6 +618,9 @@ export default class Town extends View {
   }
 
   render(cx) {
+    // 顯示更新時重新判定額度是否過期（S4）：模型帶著原始快照，這裡用「現在」重算一次，
+    // 所以只是選取／重繪（沒有重新抓取）也會在跨過 TTL／resetsAt 後顯示未知。
+    if (this.town?.quotas?.snapshot !== undefined) this.town.quotas = quotaView(this.town.quotas.snapshot);
     const started = Date.now();
     const t = theme();
     const city = this.city();
