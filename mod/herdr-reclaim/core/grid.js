@@ -96,6 +96,39 @@ export function cellAtOffset(point, tile = TILE) {
 }
 
 /**
+ * 滑鼠事件 → 這一格方框內的**版面像素**座標。事件給的座標與 bounds 是同一個單位
+ * （可能含畫面縮放），所以用 bounds.width / 格寬 自己校正，不猜 zoom、不怕每個元素
+ * 的 local_position 原點不同。bounds 沒有寬度時當成已經是版面 px。
+ */
+export function eventPoint(position, bounds, tile = TILE) {
+  if (!position) return null;
+  const width = Number(bounds?.width) || tile.w;
+  const scale = width / tile.w;
+  return { x: position.x / scale, y: position.y / scale };
+}
+
+/** 事件 → 相對這一格的邏輯位移（`cellAtOffset` 的事件版；命中範圍仍是菱形）。 */
+export function cellAtEvent(event, tile = TILE) {
+  const point = eventPoint(event?.local_position, event?.bounds, tile);
+  return point ? cellAtOffset(point, tile) : null;
+}
+
+/**
+ * 捲動／平移：把相機往 delta 的反方向移（往下捲＝內容往上），並夾在畫得出來的範圍內
+ * （`[viewport - size, 0]`，內容比視窗小的那一軸固定在 0）。
+ */
+export function panCamera(camera, delta, size, viewport) {
+  const axis = (value, deltaValue, sizeValue, viewportValue) => {
+    const limit = Math.min(0, viewportValue - sizeValue);
+    return Math.max(limit, Math.min(0, value - deltaValue));
+  };
+  return {
+    x: axis(camera.x, delta.x, size.width, viewport.width),
+    y: axis(camera.y, delta.y, size.height, viewport.height),
+  };
+}
+
+/**
  * 內容座標的點 → 邏輯格（`projectTile` 的反解）：等於把點搬到 (0,0) 那一格再看落點。
  * 回傳 `{x, y}`；點在 361 格之外回 null，畫面不改選取。
  */
