@@ -235,6 +235,7 @@ export function readTownFromLedger(replay = {}) {
           boostPoints: entry.boostPoints ?? 0,
           building: entry.building ?? null,
           scrollsUsed: entry.scrollsUsed ?? 0,
+          harvests: entry.harvests ?? [],
         }
       : null;
   });
@@ -279,6 +280,7 @@ export function readTownFromLedger(replay = {}) {
         boostPoints: entry.boostPoints ?? 0,
         building: entry.building ?? null,
         scrollsUsed: entry.scrollsUsed ?? 0,
+        harvests: entry.harvests ?? [],
       }),
     );
   }
@@ -467,13 +469,27 @@ function newTile(session, city, visit, planned) {
     boostPoints: planned.boostPoints ?? 0,
     building: planned.building ?? null,
     scrollsUsed: planned.scrollsUsed ?? 0,
+    harvests: planned.harvests ?? [],
   };
 }
 
 /** 還沒有任何用量時的加總起點。 */
 export const ZERO_USAGE = { inputNonCache: 0, cacheRead: 0, cacheWrite: 0, output: 0, costKnown: 0, costUnknownEntries: 0 };
 
-/**
+/** 依城與遠征區間彙總 provider 投入。 */
+function providerUsage(sources, cityId, startedAt, endedAt) {
+  const byProvider = new Map();
+  for (const session of sources) {
+    for (const [source, usage] of session.usage) {
+      if (usage.cityId !== cityId || usage.at < startedAt || usage.at >= endedAt) continue;
+      const provider = source.slice(source.lastIndexOf("#") + 1);
+      const total = byProvider.get(provider) ?? { ...ZERO_USAGE };
+      for (const field of Object.keys(ZERO_USAGE)) total[field] += Number(usage[field]) || 0;
+      byProvider.set(provider, total);
+    }
+  }
+  return [...byProvider].map(([provider, usage]) => ({ provider, usage }));
+}
 
 /** §10：自然工作、收成與加速點分開保存，再加總判斷開墾。 */
 function finishTile(tile) {
@@ -524,6 +540,8 @@ function finishTile(tile) {
     // 蓋房與加速的實際支付（§7.6、§10 的造價顯示）：建築保留在格子上，收成照常發生。
     building: tile.building ?? null,
     scrollsUsed: tile.scrollsUsed ?? 0,
+    harvests: tile.harvests ?? [],
+    providerUsage: providerUsage(tile.sources, tile.cityId, startedAt, endedAt),
     investment,
     faction,
     usage: investment.total,
@@ -652,6 +670,19 @@ function expeditionDetail(city, tile) {
     investmentNote: basisNote(tile.investment),
     fields: [
       { label: "工作時間", value: formatDuration(tile.workMs) },
+      { label: "工作區間", value: `${formatTimestamp(tile.activatedAt)} – ${tile.deactivatedAt == null ? "進行中" : formatTimestamp(tile.deactivatedAt)}` },
+      ...(tile.visits ?? []).map((visit, index) => ({
+        label: `Visit ${index + 1}`,
+        value: `${formatTimestamp(visit.startedAt)} – ${visit.endedAt == null ? "進行中" : formatTimestamp(visit.endedAt)} · ${visit.checkout ?? visit.cwd ?? "路徑未知"}`,
+      })),
+      ...(tile.providerUsage ?? []).map(({ provider, usage }) => ({
+        label: `投入 ${provider}`,
+        value: formatUsage(usage),
+      })),
+      ...(tile.harvests ?? []).map((harvest, index) => ({
+        label: `收成 ${index + 1}`,
+        value: `${harvest.sha ?? "commit"}${harvest.subject ? ` · ${harvest.subject}` : ""} · claim ${(harvest.claims ?? []).slice(0, 2).join(", ") || "已記錄"}${(harvest.claimCount ?? 0) > 2 ? "…" : ""} · 路徑 ${(harvest.paths ?? []).slice(0, 2).join(", ") || `${harvest.pathCount ?? 0} 筆`} · ${formatCosts(harvest.resources)} · 規則 v${harvest.rulesVersion ?? "?"}`,
+      })),
       { label: "點數", value: `工作 ${tile.workPoints} · 收成 ${tile.harvestPoints} · 加速 ${tile.boostPoints}` },
       { label: "用量", value: formatUsage(tile.usage) },
       { label: "派系", value: formatFaction(tile.faction) },
@@ -757,6 +788,11 @@ export function formatDuration(ms) {
   const hours = Math.floor(minutes / 60);
   const rest = minutes % 60;
   return rest ? `${hours} 小時 ${rest} 分` : `${hours} 小時`;
+}
+
+function formatTimestamp(value) {
+  const timestamp = Number(value);
+  return Number.isFinite(timestamp) && timestamp > 0 ? new Date(timestamp).toLocaleString("zh-TW") : "時間未知";
 }
 
 /** 右側詳情的用量一行：進／出與快取，價格未知時明說，不假裝是 0。 */

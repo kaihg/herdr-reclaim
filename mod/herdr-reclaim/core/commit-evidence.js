@@ -148,11 +148,14 @@ export function commitContexts({ hooks = [], sources = [], activities = [], remo
   return contexts;
 }
 
-export async function ingestCommits({ ledger, hooks, sources, activities, diffForCommit, remoteMerges = new Set() }) {
+export async function ingestCommits({ ledger, hooks, sources, activities, diffForCommit, subjectForCommit, remoteMerges = new Set() }) {
   const state = await ledger.state();
   const results = [];
   for (const context of commitContexts({ hooks, sources, activities, remoteMerges })) {
     const { sha, rootId, at: commitAt, remoteMerge: isRemoteMerge } = context;
+    const evidence = [...hooks, ...sources].find((record) => record.sha === sha);
+    const subject = evidence?.subject ?? (evidence?.reflog ? evidence.reflog.replace(/^commit(?: \(amend\))?:\s*/, "") : null) ??
+      (subjectForCommit ? await subjectForCommit(sha, evidence) : null);
     const tile = rootId ? generationAt(state, rootId, commitAt) : null;
     const generation = tile?.generation ?? null;
     const reason = context.reason ?? (!tile ? "no-matching-expedition" : null);
@@ -161,8 +164,11 @@ export async function ingestCommits({ ledger, hooks, sources, activities, diffFo
       kind: "commit",
       cityId: ledger.cityId,
       sha,
+      rootSessionId: rootId,
+      generation,
       repo: context.cityId,
       at: commitAt,
+      subject,
       reason: reason ?? "verified",
       ...(reason ? {} : {
         sessionId: context.sessionId,
@@ -184,11 +190,11 @@ export async function ingestCommits({ ledger, hooks, sources, activities, diffFo
       cityId: ledger.cityId,
       rootSessionId: rootId,
       generation: harvest.generation,
-      claims: harvest.claims,
-      paths: harvest.paths,
+      sha,
+      subject,
       points: harvest.points,
       resources: harvest.resources,
-      blobs: { sha, hookKinds: commitOp.hookKinds, attribution: commitOp.basis, paths: harvest.units },
+      blobs: { sha, subject, hookKinds: commitOp.hookKinds, attribution: commitOp.basis, paths: harvest.units },
     }));
     results.push(result);
     if (result.status === "applied") {

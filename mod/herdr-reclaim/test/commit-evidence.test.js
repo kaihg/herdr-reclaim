@@ -8,8 +8,9 @@ import { CityLedger } from "../core/ledger.js";
 import { ingestScenario, processLand, redispatch } from "../core/ingest.js";
 import { ingestCommits, parseRawDiff, parseReflogEvidence, unharvestedCommitReasons } from "../core/commit-evidence.js";
 import { harvestForCommit } from "../core/harvest.js";
-import { readTownFromLedger } from "../core/town.js";
+import { readTownFromLedger, selectionDetail } from "../core/town.js";
 import { activity, visitStart } from "../scenarios/first-expedition.js";
+import { searchHistory } from "../core/history.js";
 import { createFileIo } from "./fs-io.js";
 
 const CITY = "/tmp/reclaim-commit-evidence/.git";
@@ -29,7 +30,7 @@ describe("commit 證據 replay", () => {
     const diffForCommit = async (sha) => sha === baselineSha ? docs("prior", "blob-prior") : [{ status: "A", path: "src/app.js", resultBlob: "code" }, { status: "A", path: "tests/app.test.js", resultBlob: "test-1" }, { status: "A", path: "tests/other.test.js", resultBlob: "test-2" }, { status: "A", path: "docs/new.md", resultBlob: "doc" }];
     await ingestCommits({ ledger, hooks: [baselineHook], sources, activities: [], diffForCommit });
     sources.length = 0;
-    await ingestCommits({ ledger, hooks: [initialHook], sources, activities: [], diffForCommit });
+    await ingestCommits({ ledger, hooks: [initialHook], sources, activities: [], diffForCommit, subjectForCommit: async () => "History marker" });
     const afterUnattributed = await ledger.state();
     expect(afterUnattributed.resources).toEqual({ wood: 0, stone: 0, iron: 0, parchment: 1 });
     const unattributed = afterUnattributed.opSeqs.has(`commit:${initialHook.sha}:terminal-only:unknown`);
@@ -39,11 +40,21 @@ describe("commit 證據 replay", () => {
       .toEqual([{ sha: initialHook.sha, repo: CITY, reason: "terminal-only" }]);
 
     sources.push({ schema: 1, sha: initialHook.sha, cli: "omp", sessionId: "session-1", at: 2 });
-    await ingestCommits({ ledger, hooks: [initialHook], sources, activities: [], diffForCommit });
+    await ingestCommits({ ledger, hooks: [initialHook], sources, activities: [], diffForCommit, subjectForCommit: async () => "History marker" });
     const late = await ledger.state();
     expect(late.resources).toEqual({ wood: 10, stone: 20, iron: 0, parchment: 2 });
     expect(late.tileById.get(`${CITY}@@session-1@@1`).harvestPoints).toBe(40);
     expect(unharvestedCommitReasons({ cityId: CITY, hooks: [initialHook], sources, activities: [], state: late })).toEqual([]);
+    const historyRecords = await ledger.historyRecords();
+    const targetRecords = historyRecords.filter((record) => record.sha === initialHook.sha);
+    expect(targetRecords.filter((record) => record.kind === "commit").map((record) => record.reason)).toEqual(["terminal-only", "verified"]);
+    expect(targetRecords.filter((record) => record.kind === "harvest")).toHaveLength(1);
+    expect(searchHistory({ records: historyRecords, tiles: late.tiles, query: "commit:history marker" }).total).toBe(3);
+    const detail = selectionDetail(readTownFromLedger({ expeditions: late.tiles }), {
+      kind: "expedition", cityId: CITY, rootSessionId: "session-1", generation: 1,
+    });
+    expect(detail.fields.filter((field) => field.label.startsWith("收成")).some((field) => field.value.includes("History marker"))).toBe(true);
+    expect(detail.fields.filter((field) => field.label.startsWith("收成")).every((field) => field.value.includes("規則 v2"))).toBe(true);
 
     const remoteSha = "b".repeat(40);
     const remoteHook = { ...hook(remoteSha), hook: "reflog", reflog: "pull origin/main: Fast-forward" };
