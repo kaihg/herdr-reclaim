@@ -1,4 +1,5 @@
 import { harvestForCommit } from "./harvest.js";
+import { unverifiedReason } from "./session-evidence.js";
 
 export const COMMIT_DIR = "commits";
 export const SOURCE_DIR = "sources";
@@ -57,16 +58,25 @@ export function parseReflogEvidence(output, cityId, checkout) {
   return { records, remoteMerges };
 }
 
-const sessionIdFromHook = (record) => record.env?.PI_SESSION_ID || record.env?.CODEX_THREAD_ID || record.env?.CLAUDE_SESSION_ID || null;
+// 每個 CLI 的 session 變數各自成一個候選：session id 與 cli 一定來自同一支變數，
+// 不會出現「用 omp 的 id 配上 claude 的 cli」這種混搭。同一個紀錄裡有多個變數
+// （例如 OMP 的 bash 底下又開了別的 CLI）就是多個候選 → 衝突 → 不收成。
+const SESSION_ENV = [
+  { key: "PI_SESSION_ID", cli: "omp" },
+  { key: "CODEX_THREAD_ID", cli: "codex" },
+  { key: "CLAUDE_CODE_SESSION_ID", cli: "claude" },
+];
 
-function attributionFor(sha, hooks, sources) {
+function attributionFor(sha, hooks, sources, activities) {
   const hookHits = hooks.filter((record) => record.sha === sha);
   const dirs = [...new Set(hookHits.map((record) => record.commonDir).filter(Boolean))];
   const sourcesForSha = sources.filter((record) => record.sha === sha);
   const identities = [];
   for (const record of hookHits) {
-    const sessionId = sessionIdFromHook(record);
-    if (sessionId) identities.push({ sessionId, cli: record.env?.CODEX_THREAD_ID ? "codex" : record.env?.CLAUDE_SESSION_ID ? "claude" : "omp", basis: "hook-env" });
+    for (const { key, cli } of SESSION_ENV) {
+      const sessionId = record.env?.[key];
+      if (typeof sessionId === "string" && sessionId !== "") identities.push({ sessionId, cli, basis: "hook-env" });
+    }
   }
   for (const record of sourcesForSha) {
     if (record.sessionId) identities.push({ sessionId: record.sessionId, cli: record.cli ?? "omp", basis: "session-artifact" });
@@ -77,7 +87,11 @@ function attributionFor(sha, hooks, sources) {
     const terminalOnly = hookHits.some((record) => record.reason === "terminal-only" || record.env?.HC_TERMINAL_ID) && unique.size === 0;
     return { cityId: dirs[0], identity: null, reason: terminalOnly ? "terminal-only" : unique.size ? "ambiguous-session-source" : "no-session-source" };
   }
-  return { cityId: dirs[0], identity: [...unique.values()][0], reason: null };
+  const only = [...unique.values()][0];
+  // Codex／Claude 的 hook 環境變數要與 adapter 活動檔的 sessionId 完全相等（#10／#11）。
+  const unverified = unverifiedReason(only, activities);
+  if (unverified) return { cityId: dirs[0], identity: null, reason: unverified };
+  return { cityId: dirs[0], identity: only, reason: null };
 }
 
 function rootSession(sessionId, activities) {
@@ -99,7 +113,7 @@ export async function ingestCommits({ ledger, hooks, sources, activities, diffFo
   const results = [];
   const shas = new Set([...hooks, ...sources].map((record) => record.sha));
   for (const sha of shas) {
-    const attribution = attributionFor(sha, hooks, sources);
+    const attribution = attributionFor(sha, hooks, sources, activities);
     const isRemoteMerge = remoteMerges.has(sha);
     const rootId = !isRemoteMerge && attribution.identity ? rootSession(attribution.identity.sessionId, activities) : null;
     const generation = rootId ? state.currentGen.get(`${ledger.cityId}@@${rootId}`) ?? 1 : 1;
@@ -152,7 +166,7 @@ export function unharvestedCommitReasons({ cityId, hooks, sources, activities, r
   const reasons = [];
   const shas = new Set([...hooks, ...sources].map((record) => record.sha));
   for (const sha of shas) {
-    const attribution = attributionFor(sha, hooks, sources);
+    const attribution = attributionFor(sha, hooks, sources, activities);
     if (attribution.cityId !== cityId) continue;
     let reason = remoteMerges.has(sha) ? "remote-merge" : attribution.reason;
     if (!reason) {
