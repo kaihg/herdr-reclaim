@@ -183,7 +183,8 @@ async function loadTown(io) {
       .filter((event) => event.visit?.commonDir === cityId && event.visit.checkout)
       .map((event) => event.visit.checkout)));
     for (const checkout of checkouts) {
-      const reflog = await exec("git", ["-C", checkout, "reflog", "-n", "64", "--format=%H%x09%gs"]);
+      // %ct＝提交時間（秒）：沒有 hook env 的城仍要有一個真實事件時間，不能用讀取當下。
+      const reflog = await exec("git", ["-C", checkout, "reflog", "-n", "64", "--format=%H%x09%ct%x09%gs"]);
       if (reflog.code !== 0) continue;
       const parsed = parseReflogEvidence(reflog.stdout, cityId, checkout);
       for (const sha of parsed.remoteMerges) remoteMerges.get(cityId).add(sha);
@@ -698,12 +699,14 @@ export default class Town extends View {
         const result = remove
           ? await removeHooks({ repo, exec })
           : await installHooks({ repo, exec, io: storageIo(), appHome: appHome() });
-        this.topNotice = result.status === "needs-confirmation"
-          ? `需先確認：${result.reason}`
-          : result.status === "installed" ? "收成 hook 已安裝"
-          : result.status === "removed" ? "收成 hook 已移除"
-          : result.status === "not-installed" ? "目前沒有已安裝的 hook"
-          : `操作未完成：${result.reason ?? result.status}`;
+        this.topNotice = result.status === "refused"
+          ? `未安裝收成 hook：${result.message ?? result.reason}`
+          : result.status === "needs-confirmation"
+            ? `需先確認：${result.reason}`
+            : result.status === "installed" ? "收成 hook 已安裝"
+            : result.status === "removed" ? "收成 hook 已移除"
+            : result.status === "not-installed" ? "目前沒有已安裝的 hook"
+            : `操作未完成：${result.reason ?? result.status}`;
       } catch (error) {
         this.topNotice = `hook 操作失敗：${error}`;
       }

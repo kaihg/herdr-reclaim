@@ -105,6 +105,9 @@ function tokenUsage(round, { cityId, seen }) {
 
 function commitRole(commit, { cityId, rootSessionId, openAt, closeAt }) {
   if (commit.cityId !== cityId) return "none"; // 別的城的提交跟這座城的計量器無關
+  // 沒有可信時間的證據（舊 recorder）判不出落在哪個回合：若它確定屬於這棵樹，保守地
+  // 暫不結算（不發不該給的羊皮卷，而且每次重播的結果都一樣）。
+  if (commit.at === null) return commit.attributed && commit.rootId === rootSessionId ? "pending" : "none";
   if (!(Number(commit.at) >= openAt && Number(commit.at) <= closeAt)) return "none";
   if (commit.attributed && commit.rootId === rootSessionId) return "attributed";
   if (commit.pending) return "pending";
