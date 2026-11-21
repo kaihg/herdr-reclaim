@@ -28,7 +28,7 @@ import { RESEARCH_TOKENS_PER_PARCHMENT, RESOURCE_LABELS, RULES_VERSION } from ".
 import { defaultSelection, parseUi, resolveSelection, selectionOf, serializeUi, withDev, withSelection } from "./core/selection.js";
 import { QUOTA_SOURCE, parseQuotaReport } from "./core/quota-source.js";
 import { quotaView, readQuotaView } from "./core/quota-view.js";
-import { CLEAR_POINTS, formatResearch, readTown, readTownFromLedger, selectionDetail } from "./core/town.js";
+import { CLEAR_POINTS, emptyCity, formatResearch, readTown, readTownFromLedger, selectionDetail } from "./core/town.js";
 import { cityForFolders } from "./core/space-city.js";
 import { firstExpedition } from "./scenarios/first-expedition.js";
 import {
@@ -389,6 +389,7 @@ export default class Town extends View {
     this.shownCityId = null;
     this.syncedCityId = null;
     this.missingFolder = null;
+    this.placeholder = null;
     this.toast = null;
     this.note = "正在讀取城鎮帳本…";
     this.legendOpen = true;
@@ -426,7 +427,7 @@ export default class Town extends View {
           if (first) this.devMode = this.ui.dev;
           // 畫面顯示哪一座城由目前的 space 決定（見 syncCity）；這裡只讓已選的遠征／格子
           // 在帳本變動後仍然有效（不在了就退回那座城的預設）。
-          if (this.selection) this.selection = resolveSelection(this.town, this.selection, this.selection.cityId);
+          if (this.selection && !this.selection.cityId.startsWith("placeholder:")) this.selection = resolveSelection(this.town, this.selection, this.selection.cityId);
           this.note = null;
         } catch (error) {
           this.town = null;
@@ -446,7 +447,8 @@ export default class Town extends View {
   /** 目前顯示的城（由 syncCity 在每次 render 時依 space 決定）。 */
   city() {
     const cities = this.town?.cities ?? [];
-    return (this.shownCityId ? cities.find((city) => city.cityId === this.shownCityId) : null) ?? null;
+    return (this.shownCityId ? cities.find((city) => city.cityId === this.shownCityId) : null) ??
+      (this.placeholder?.cityId === this.shownCityId ? this.placeholder : null);
   }
 
   /** 選取：存檔＋把那一格帶進畫面；門檻 1（≤ 150 ms）＝按下到含新詳情的那一版畫面。 */
@@ -500,7 +502,7 @@ export default class Town extends View {
         const tiles = [];
         const cityNames = {};
         const shown = this.city();
-        for (const city of shown ? [shown] : []) {
+        for (const city of shown && shown !== this.placeholder ? [shown] : []) {
           cityNames[city.cityId] = city.name;
           const ledger = await new CityLedger({
             io: this.io,
@@ -670,8 +672,16 @@ export default class Town extends View {
     let target;
     if (folders.length) {
       target = cityForFolders(cities, folders);
-      this.missingFolder = target ? null : folders[0];
+      this.missingFolder = null;
+      this.placeholder = null;
+      if (!target) {
+        // 這個 space 還沒有任何遠征：照樣顯示城鎮中心與周圍的空地，只是沒有格子在開墾。
+        const folder = folders[0];
+        this.placeholder = emptyCity(`placeholder:${folder}`, folder.split("/").filter(Boolean).pop() ?? folder);
+        target = this.placeholder;
+      }
     } else {
+      this.placeholder = null;
       target = (this.selection?.cityId ? cities.find((city) => city.cityId === this.selection.cityId) : null) ?? cities[0] ?? null;
       this.missingFolder = null;
     }
@@ -679,7 +689,9 @@ export default class Town extends View {
     if (target && this.syncedCityId !== target.cityId) {
       this.syncedCityId = target.cityId;
       if (this.selection?.cityId !== target.cityId) {
-        this.selection = resolveSelection(this.town, selectionOf(this.ui, target.cityId), target.cityId);
+        this.selection = target === this.placeholder
+          ? { kind: "tile", cityId: target.cityId, x: target.center.x, y: target.center.y }
+          : resolveSelection(this.town, selectionOf(this.ui, target.cityId), target.cityId);
       }
       this.requestFocus(this.selection);
       if (!this.focusCell) this.focusCell = { x: target.center.x + 0.5, y: target.center.y + 0.5 };
@@ -739,7 +751,7 @@ export default class Town extends View {
         h_flex().flex_1().min_h(0).children([
           this.expeditionList(city, t, cx, leftW),
           this.mapColumn(city, t, cx, mapArea),
-          this.detailPanel(selectionDetail(this.town, this.selection), t, rightW, cx),
+          this.detailPanel(selectionDetail(this.placeholder && city === this.placeholder ? { ...this.town, cities: [this.placeholder] } : this.town, this.selection), t, rightW, cx),
         ]),
       ]);
     this.finishMeasure(started);

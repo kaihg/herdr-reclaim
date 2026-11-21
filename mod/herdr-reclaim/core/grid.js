@@ -28,6 +28,11 @@ export const CENTER_RING = [
   { x: -1, y: 1 }, { x: -1, y: 0 },
 ];
 
+/** 中心塊四個斜角的格子：不算相鄰、不是選地起點，但開城就揭開（看得到地面）。 */
+export const CENTER_CORNERS = [
+  { x: -1, y: -1 }, { x: 2, y: -1 }, { x: 2, y: 2 }, { x: -1, y: 2 },
+];
+
 /** 4 鄰居，順序就是「距離相同時依北、東、南、西」（§4）。 */
 export const DIRECTIONS = [
   { name: "北", x: 0, y: -1 },
@@ -74,12 +79,12 @@ export function bfsNextTile(isTaken) {
 }
 
 /**
- * 已揭開（看得到地面）的格子鍵：中心塊與它相接的 8 格從開城就是；
+ * 已揭開（看得到地面）的格子鍵：中心塊、相接的 8 格與四個斜角（共 16 格＝4×4）從開城就是；
  * 之後每一格達到 100 點（已開墾／已建）時，它自己和上下左右 4 格也揭開（§4）。
  * 只回傳「看得到」的集合：有沒有遠征在上面是另一件事。
  */
 export function revealedKeys(tiles = []) {
-  const revealed = new Set([...CENTER_CELLS, ...CENTER_RING].map(keyOf));
+  const revealed = new Set([...CENTER_CELLS, ...CENTER_RING, ...CENTER_CORNERS].map(keyOf));
   for (const tile of tiles) {
     if (tile.landStage !== "cleared" && tile.landStage !== "built") continue;
     revealed.add(keyOf(tile));

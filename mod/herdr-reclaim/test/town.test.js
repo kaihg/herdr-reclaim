@@ -201,15 +201,15 @@ describe("C 版遠征指揮桌要用的資料", () => {
       expect(center.fields).toContainEqual({ label: "遠征", value: "2 支" });
     }
     // 中心塊上下左右相接的 8 格：沒有遠征的 6 格看得到地面（北側兩格被這兩支遠征佔了）。
-    for (const [x, y] of [[2, 0], [2, 1], [1, 2], [0, 2], [-1, 1], [-1, 0]]) {
+    for (const [x, y] of [[2, 0], [2, 1], [1, 2], [0, 2], [-1, 1], [-1, 0], [-1, -1], [2, -1], [2, 2], [-1, 2]]) {
       expect(selectionDetail(town, { kind: "tile", cityId: CITY.commonDir, x, y })).toMatchObject({
         kind: "open",
         title: "空地",
         fields: [],
       });
     }
-    // 斜角不算相鄰；更遠的格子還在迷霧裡。
-    for (const [x, y] of [[-1, -1], [2, 2], [3, 3]]) {
+    // 更遠的格子還在迷霧裡。
+    for (const [x, y] of [[-2, -2], [3, 3], [3, 0]]) {
       expect(selectionDetail(town, { kind: "tile", cityId: CITY.commonDir, x, y })).toMatchObject({
         kind: "fog",
         title: "迷霧",

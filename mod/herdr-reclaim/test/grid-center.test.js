@@ -50,12 +50,12 @@ describe("2×2 城鎮中心", () => {
 });
 
 describe("已揭開的格子", () => {
-  test("空城：中心四格加相接的 8 格，其餘都在迷霧裡", () => {
+  test("空城：中心四格加周圍一圈 12 格（含斜角）＝4×4，其餘都在迷霧裡", () => {
     const revealed = revealedKeys([]);
-    expect(revealed.size).toBe(12);
+    expect(revealed.size).toBe(16);
     expect(revealed.has("2,0") && revealed.has("-1,1") && revealed.has("1,2")).toBe(true);
-    expect(revealed.has("-1,-1")).toBe(false); // 斜角
-    expect(revealed.has("3,0")).toBe(false);
+    expect(revealed.has("-1,-1") && revealed.has("2,2")).toBe(true); // 斜角也揭開
+    expect(revealed.has("3,0") || revealed.has("-2,-2")).toBe(false);
   });
 
   test("預留的遠征不揭開鄰格；達到 100 點（已開墾／已建）才揭開自己與上下左右", () => {

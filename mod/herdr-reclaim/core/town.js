@@ -200,6 +200,25 @@ function centerOf(cityId, repoFacts) {
 }
 
 /**
+ * 還沒有任何遠征的空城：space 一開始就看得到城鎮中心與周圍揭開的格子，只是沒有任何格子
+ * 在開墾。它不進帳本；第一支遠征出現後由帳本重建的真城取代它。
+ */
+export function emptyCity(cityId, name) {
+  return {
+    cityId,
+    name,
+    center: centerOf(cityId, {}),
+    resources: { wood: 0, stone: 0, iron: 0, parchment: 0 },
+    research: { tokens: 0 },
+    market: { in: { wood: 0, stone: 0, iron: 0, parchment: 0 }, out: { wood: 0, stone: 0, iron: 0, parchment: 0 } },
+    guild: null,
+    investment: null,
+    tiles: [],
+    unharvestedCommits: [],
+  };
+}
+
+/**
  * 重播接點：`{ activities, repoFacts }` → 公開城鎮讀取模型 `{ schema, cities }`。
  * 同一組事件重播幾次、紀錄在陣列裡怎麼排，結果都一樣。
  */
