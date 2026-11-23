@@ -167,6 +167,14 @@ function fillPath(points) {
 }
 
 /**
+ * mock 圖形（地盤、建築）的座標是格子方框的百分比（assets.js），但路徑吃的是像素：
+ * 沒換算時 50 就是 50 px，圖形會比格子大、跑到菱形外面（建築掉到格子下方與右側）。
+ */
+function percentToBox(points, tile) {
+  return points.map(([x, y]) => [(x * tile.w) / 100, (y * tile.h) / 100]);
+}
+
+/**
  * 一格的方框（絕對定位在它的投影位置）＋它自己的點擊。
  * `cellAtOffset` 把方框內的點換成「相對這一格」的邏輯位移，所以角上的點會算給隔壁那一格。
  */
@@ -242,7 +250,7 @@ function cell(entry, selection, t, tile, origin, radius, onPick, camera) {
       : stroked([LOCAL_CELL], tile, LOCAL);
   return cellBox(entry, tile, origin, radius, onPick, camera).children([
     tilePath(fillPath(points), selected ? t.selected : t.raised, tile),
-    ground ? tilePath(fillPath(PLOT_DIAMOND), Background.solid(t[ground.token] ?? t.muted).opacity(0.35), tile) : null,
+    ground ? tilePath(fillPath(percentToBox(PLOT_DIAMOND, tile)), Background.solid(t[ground.token] ?? t.muted).opacity(0.35), tile) : null,
     building ? buildingMark(building, tile, factionColor) : null,
     tilePath(outline, entry.landStage === "built" ? factionColor : selected ? t.accent : t.muted, tile),
     markBox(`${entry.status === "active" ? "●" : "○"} ${cellName(entry)}`, t, tile, t.foreground),
@@ -253,13 +261,13 @@ function cell(entry, selection, t, tile, origin, radius, onPick, camera) {
 function buildingMark(mock, tile, factionColor) {
   const { roof, body } = buildingPolygons(mock);
   const layers = [
-    tilePath(fillPath(body), Background.solid(factionColor).opacity(0.55), tile),
+    tilePath(fillPath(percentToBox(body, tile)), Background.solid(factionColor).opacity(0.55), tile),
   ];
   if (mock.roof) {
-    layers.push(tilePath(fillPath(roof), factionColor, tile));
+    layers.push(tilePath(fillPath(percentToBox(roof, tile)), factionColor, tile));
   } else {
     // 城牆沒有屋頂：用上緣一條亮線表示，高度仍然最矮。
-    layers.push(tilePath(fillPath([[24, mock.eave], [76, mock.eave], [76, mock.top], [24, mock.top]]), factionColor, tile));
+    layers.push(tilePath(fillPath(percentToBox([[24, mock.eave], [76, mock.eave], [76, mock.top], [24, mock.top]], tile)), factionColor, tile));
   }
   return div().absolute().left(0).top(0).w(tile.w).h(tile.h).children(layers);
 }
