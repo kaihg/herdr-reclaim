@@ -89,13 +89,19 @@ export async function installHooks({ repo, io, exec, appHome }) {
     const file = `${info.hooksPath}/${hook}`;
     const original = `${file}${ORIGINAL_SUFFIX}`;
     const existing = await io.read(file);
-    if (existing !== null) {
-      if ((await io.read(original)) !== null) return { status: "needs-confirmation", hooksPath: info.hooksPath, reason: "backup-exists" };
-      const moved = await command(exec, "mv", [file, original]);
-      if (!successful(moved)) return { status: "error", hooksPath: info.hooksPath, reason: `cannot-preserve-${hook}` };
-      chained.push(hook);
+    // 已經是我們自己的記錄器（再按一次「安裝收成」）：原地更新，不能把它當成使用者的
+    // 既有 hook 備份起來，否則記錄器會串接到自己，下一次安裝還會卡在 backup-exists。
+    if (existing !== null && existing.includes(HOOK_MARKER)) {
+      await io.write(file, hookScript({ hook, appHome }), existing);
+    } else {
+      if (existing !== null) {
+        if ((await io.read(original)) !== null) return { status: "needs-confirmation", hooksPath: info.hooksPath, reason: "backup-exists" };
+        const moved = await command(exec, "mv", [file, original]);
+        if (!successful(moved)) return { status: "error", hooksPath: info.hooksPath, reason: `cannot-preserve-${hook}` };
+        chained.push(hook);
+      }
+      await io.write(file, hookScript({ hook, appHome }), null);
     }
-    await io.write(file, hookScript({ hook, appHome }), null);
     const chmod = await command(exec, "chmod", ["700", file]);
     if (!successful(chmod)) return { status: "error", hooksPath: info.hooksPath, reason: `cannot-enable-${hook}` };
   }

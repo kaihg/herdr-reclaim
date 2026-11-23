@@ -39,6 +39,24 @@ describe("Git hook 收成記錄器", () => {
     } finally { rmSync(repo, { recursive: true, force: true }); }
   });
 
+  test("重複按「安裝收成」：原地更新，不把自己的記錄器備份成既有 hook", async () => {
+    const repo = mkdtempSync(path.join(os.tmpdir(), "reclaim-hook-twice-"));
+    try {
+      git(repo, "init", "-q");
+      const appHome = path.join(repo, "app");
+      const hooks = path.join(repo, ".git", "hooks");
+      expect((await installHooks({ repo, io, exec, appHome })).status).toBe("installed");
+      for (let again = 0; again < 2; again++) {
+        const result = await installHooks({ repo, io, exec, appHome });
+        expect(result.status).toBe("installed");
+        expect(result.chained).toEqual([]);
+      }
+      expect(readdirSync(hooks).filter((name) => name.endsWith(".herdr-reclaim-original"))).toEqual([]);
+      expect((await removeHooks({ repo, exec })).status).toBe("removed");
+      expect(readdirSync(hooks).filter((name) => name.startsWith("post-") && !name.endsWith(".sample"))).toEqual([]);
+    } finally { rmSync(repo, { recursive: true, force: true }); }
+  });
+
   test("偵測 tracked hooks path，不覆寫版控 hook", async () => {
     const repo = mkdtempSync(path.join(os.tmpdir(), "reclaim-hook-tracked-"));
     try {
