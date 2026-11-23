@@ -26,7 +26,7 @@ import { CasConflict, CityLedger, cityDir } from "./core/ledger.js";
 import { hooksStatus, installHooks, removeHooks } from "./core/hooks.js";
 import { RESEARCH_TOKENS_PER_PARCHMENT, RESOURCE_LABELS, RULES_VERSION } from "./core/rules.js";
 import { defaultSelection, parseUi, resolveSelection, selectionOf, serializeUi, withDev, withHookChoice, withSelection } from "./core/selection.js";
-import { QUOTA_SOURCE, parseQuotaReport } from "./core/quota-source.js";
+import { QUOTA_REFRESH_MS, QUOTA_SOURCE, claimQuotaAttempt, parseQuotaReport } from "./core/quota-source.js";
 import { quotaView, readQuotaView } from "./core/quota-view.js";
 import { CLEAR_POINTS, emptyCity, expeditionGroups, formatResearch, readTown, readTownFromLedger, selectionDetail, tileLabel } from "./core/town.js";
 import { cityForFolders } from "./core/space-city.js";
@@ -334,10 +334,15 @@ async function refreshTown(io, previous) {
  *
  * 來源**只有一個**：官方 CLI 自己的 redacted JSON（core/quota-source.js 的 QUOTA_SOURCE）。
  * mod 不讀任何 provider 憑證檔、不解析 token、不改任何設定；指令不存在、沒有登入、
- * 網路失敗或輸出壞掉，都只是「未知」，原因顯示在畫面上。抓取是**使用者按「更新額度」才跑**
- * （不在啟動時自動呼叫外部 CLI：避免每次開 herdr 都打 provider API）。
+ * 網路失敗或輸出壞掉，都只是「未知」；按「更新額度」會把原因顯示出來。
+ *
+ * 抓取時機：啟動時與每 5 分鐘一次（QUOTA_REFRESH_MS），另外使用者可按「更新額度」立刻抓。
+ * 額度是帳號層級、所有 workspace／視窗共用，所以 quotas.json 與「上次嘗試時間」
+ * （quota-attempt.json）都是全域單一檔案，由 claimQuotaAttempt 用 CAS 搶名額：
+ * 不管開幾個視窗，每 5 分鐘最多對 provider 發出一次查詢。
  */
 const quotasPath = () => `${adapterRoot(appHome())}/quotas.json`;
+const quotaAttemptPath = () => `${adapterRoot(appHome())}/quota-attempt.json`;
 
 async function loadQuotas(io) {
   // 模型帶著原始快照：之後的重繪／操作刷新都用「現在」重新判定新鮮度（不呼叫外部 CLI）。
@@ -444,6 +449,7 @@ export default class Town extends View {
       } catch (error) {
         this.note = `活動目錄建立失敗：${error}`;
       }
+      this.refreshQuotas(cx);
       let first = true;
       for (;;) {
         try {
@@ -468,6 +474,8 @@ export default class Town extends View {
         }
       }
     });
+    // 額度每 5 分鐘自動重取（全域限流，見 quotasPath 的說明）；啟動時那一次在上面的 spawn 裡。
+    cx.timer.every(QUOTA_REFRESH_MS, (cx2) => this.refreshQuotas(cx2));
   }
 
   /** 目前顯示的城（由 syncCity 在每次 render 時依 space 決定）。 */
@@ -929,46 +937,66 @@ export default class Town extends View {
   }
 
   /**
-   * 更新額度（§9、§15.2）：跑官方 CLI 的 redacted JSON 輸出，驗證後寫進 quotas.json 再重播城鎮。
+   * 抓一次額度（§9、§15.2）：跑官方 CLI 的 redacted JSON 輸出，驗證後寫進 quotas.json 再重播城鎮。
    * 這是額度唯一的來源；沒有 CLI、沒有登入、網路失敗或輸出壞掉，都只留下原因並顯示未知。
+   * 不 throw；回傳給人看的結果說明。
    */
-  refreshQuotas(cx) {
-    cx.spawn(async (cx2) => {
-      this.showToast(`正在抓取額度：${QUOTA_SOURCE.command} ${QUOTA_SOURCE.args.join(" ")}`, cx2);
-      let text;
-      try {
-        // 從 Dock／Finder 開的 herdr 沒有 shell 的 PATH（bun 的路徑在 ~/.zshrc），裸的 `omp` 會
-        // 啟動失敗（`herdr-exec` 錯誤）。先試 bun 的標準安裝位置，找不到再用 PATH。
-        let result;
-        let failure;
-        for (const command of [`${home()}/.bun/bin/${QUOTA_SOURCE.command}`, QUOTA_SOURCE.command]) {
-          try {
-            result = await exec(command, QUOTA_SOURCE.args);
-            break;
-          } catch (error) {
-            failure = error;
-          }
+  async fetchQuotas() {
+    try {
+      // 從 Dock／Finder 開的 herdr 沒有 shell 的 PATH（bun 的路徑在 ~/.zshrc），裸的 `omp` 會
+      // 啟動失敗（`herdr-exec` 錯誤）。先試 bun 的標準安裝位置，找不到再用 PATH。
+      let result;
+      let failure;
+      for (const command of [`${home()}/.bun/bin/${QUOTA_SOURCE.command}`, QUOTA_SOURCE.command]) {
+        try {
+          result = await exec(command, QUOTA_SOURCE.args);
+          break;
+        } catch (error) {
+          failure = error;
         }
-        if (!result) throw failure;
-        if (result.code !== 0) {
-          text = `額度來源失敗（exit ${result.code}）：${String(result.stderr ?? "").trim().slice(0, 160) || "沒有輸出"}`;
-        } else {
-          const parsed = parseQuotaReport(result.stdout);
-          if (parsed.error) {
-            text = `額度回報無法使用：${parsed.error}`;
-          } else {
-            const before = await this.io.read(quotasPath());
-            await this.io.write(quotasPath(), `${JSON.stringify(parsed.snapshot)}\n`, before);
-            text = parsed.snapshot.warnings.length
-              ? `額度已更新（${parsed.snapshot.warnings.join("；")}）`
-              : "額度已更新";
-            this.town = await loadTown(this.io);
-          }
-        }
-      } catch (error) {
-        text = `額度更新失敗：${error}`;
       }
-      this.showToast(text, cx2);
+      if (!result) throw failure;
+      if (result.code !== 0) {
+        return `額度來源失敗（exit ${result.code}）：${String(result.stderr ?? "").trim().slice(0, 160) || "沒有輸出"}`;
+      }
+      const parsed = parseQuotaReport(result.stdout);
+      if (parsed.error) return `額度回報無法使用：${parsed.error}`;
+      const before = await this.io.read(quotasPath());
+      await this.io.write(quotasPath(), `${JSON.stringify(parsed.snapshot)}\n`, before);
+      this.town = await loadTown(this.io);
+      return parsed.snapshot.warnings.length
+        ? `額度已更新（${parsed.snapshot.warnings.join("；")}）`
+        : "額度已更新";
+    } catch (error) {
+      return `額度更新失敗：${error}`;
+    }
+  }
+
+  /**
+   * 更新額度。`manual`＝使用者按「更新額度」：立刻抓、結果用 toast 說明；
+   * 否則是自動輪（啟動與每 QUOTA_REFRESH_MS 一次）：全域限流，所有視窗共用同一個名額
+   * （額度是帳號層級，不分 workspace），拿不到名額就什麼都不做，失敗也不打擾使用者
+   * （畫面維持「未知」，按鈕仍可看到原因）。
+   */
+  refreshQuotas(cx, { manual = false } = {}) {
+    if (this.quotaFetching) {
+      if (manual) this.showToast("額度正在更新中", cx);
+      return;
+    }
+    this.quotaFetching = true;
+    cx.spawn(async (cx2) => {
+      try {
+        const claimed = await claimQuotaAttempt(this.io, quotaAttemptPath(), Date.now(), { force: manual });
+        if (!claimed) return;
+        if (manual) this.showToast(`正在抓取額度：${QUOTA_SOURCE.command} ${QUOTA_SOURCE.args.join(" ")}`, cx2);
+        const text = await this.fetchQuotas();
+        if (manual) this.showToast(text, cx2);
+        else cx2.notify();
+      } catch (error) {
+        if (manual) this.showToast(`額度更新失敗：${error}`, cx2);
+      } finally {
+        this.quotaFetching = false;
+      }
     });
   }
   topBar(city, t, leftW, rightW, width) {
@@ -1019,7 +1047,7 @@ export default class Town extends View {
           .children(guildBlock(city, this.town?.quotas, t))
           .child(h_flex().flex_wrap().gap(6).items_center().children([
             ...(city === this.placeholder ? [] : [this.hookToggle(city, t)]),
-            hookButton("更新額度", t, (cx2) => this.refreshQuotas(cx2)),
+            hookButton("更新額度", t, (cx2) => this.refreshQuotas(cx2, { manual: true })),
             hookButton(this.devMode ? "開發模式 ✓" : "開發模式", t, (cx2) => this.toggleDev(cx2)),
           ]))
           // 規則版本與量測是開發用的工程資訊：開發模式才出現。

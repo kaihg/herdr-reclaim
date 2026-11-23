@@ -8,8 +8,8 @@
 // 查詢、也不改任何設定：只讀那一支 CLI 已經 redact 過的 stdout（§15.2、§15.5）。
 // 拿不到或驗證失敗一律回報錯誤／未知，不推算數字、不補 0（§9）。
 //
-// 純函式模組：不 import host API、不碰檔案系統，行程啟動與寫檔時機由整合層決定。
-import { QUOTA_TTL_MS } from "./provider-stats.js";
+// 純函式模組＋注入的 io：不 import host API、不直接碰檔案系統，行程啟動與寫檔時機由整合層決定。
+import { CasConflict } from "./cas.js";
 
 /**
  * 唯一允許的額度來源：官方 CLI 的 redacted JSON（stdout）。
@@ -88,13 +88,47 @@ export function parseQuotaReport(stdout) {
   };
 }
 
+/** 自動重取的間隔：全域（所有視窗、所有 workspace 共用同一個帳號額度）每 5 分鐘最多一次。 */
+export const QUOTA_REFRESH_MS = 5 * 60_000;
+
+/** 上一次「嘗試」抓額度的時間（檔案內容 `{ "attemptedAt": <ms> }`）；壞掉、缺欄位都當作沒有。 */
+function attemptedAtOf(text) {
+  if (typeof text !== "string") return null;
+  try {
+    const value = JSON.parse(text)?.attemptedAt;
+    return isFiniteNumber(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
- * 要不要重跑來源：`existing` 是已解析的快照（或 null），`ttlMs` 內就不用再跑一次 CLI。
- * 沒有快照、`generatedAt` 不合法、或已經超過 TTL → true；其餘 false（`now - generatedAt`
- * 剛好等於 `ttlMs` 仍算新鮮，與 `readQuotas` 的判斷一致）。
+ * 要不要現在抓：距離上次嘗試滿 `intervalMs` 才算到期（剛好滿算到期）。
+ * 沒有紀錄、或紀錄在未來（時鐘被調回）→ 到期，不然會一直被擋到時鐘追上。
  */
-export function shouldRefresh(existing, now = Date.now(), ttlMs = QUOTA_TTL_MS) {
-  if (!existing || typeof existing !== "object") return true;
-  if (!isFiniteNumber(existing.generatedAt)) return true;
-  return now - existing.generatedAt > ttlMs;
+export function refreshDue(attemptedAt, now = Date.now(), intervalMs = QUOTA_REFRESH_MS) {
+  if (!isFiniteNumber(attemptedAt) || attemptedAt > now) return true;
+  return now - attemptedAt >= intervalMs;
+}
+
+/**
+ * 全域的抓取名額：所有視窗共用 `path` 這一個檔案，用 CAS 搶「這一輪由誰去抓」。
+ * 回傳 true＝這個呼叫者拿到名額、該去跑 CLI；false＝還沒到期，或另一個視窗剛搶到。
+ *
+ * 失敗也算一次嘗試（先記下才抓）：CLI 不存在、沒登入、網路掛掉時，也是每 5 分鐘才再試一次，
+ * 不會每個視窗各自重試。`force`（使用者按「更新額度」）略過到期判斷，但仍然登記這一次嘗試，
+ * 所以按完之後自動更新會從現在起算 5 分鐘。
+ *
+ * @param {{ read: (path: string) => Promise<string|null>, write: (path: string, text: string, expected: string|null) => Promise<unknown> }} io
+ */
+export async function claimQuotaAttempt(io, path, now = Date.now(), { force = false } = {}) {
+  const before = await io.read(path);
+  if (!force && !refreshDue(attemptedAtOf(before), now)) return false;
+  try {
+    await io.write(path, `${JSON.stringify({ attemptedAt: now })}\n`, before);
+    return true;
+  } catch (error) {
+    if (!(error instanceof CasConflict)) throw error;
+    return force; // 另一個視窗同時搶：自動輪讓給它；使用者明確要求的照抓
+  }
 }

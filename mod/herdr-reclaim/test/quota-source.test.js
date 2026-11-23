@@ -5,7 +5,8 @@
 import { describe, expect, test } from "bun:test";
 import observed from "../../../spikes/s5/observed.json";
 import { QUOTA_TTL_MS, quotaLines, readQuotas } from "../core/provider-stats.js";
-import { QUOTA_SOURCE, parseQuotaReport, shouldRefresh } from "../core/quota-source.js";
+import { QUOTA_REFRESH_MS, QUOTA_SOURCE, claimQuotaAttempt, parseQuotaReport, refreshDue } from "../core/quota-source.js";
+import { CasConflict } from "../core/ledger.js";
 
 const SAMPLE = JSON.stringify(observed);
 const NOW = observed.generatedAt + 60_000;
@@ -156,25 +157,63 @@ describe("parseQuotaReport", () => {
   });
 });
 
-describe("shouldRefresh", () => {
-  test("沒有快照或 generatedAt 不合法 → 要重抓", () => {
-    for (const existing of [null, undefined, {}, { generatedAt: null }, { generatedAt: "x" }, { generatedAt: 0 / 0 }, "snapshot"]) {
-      expect(shouldRefresh(existing, NOW, QUOTA_TTL_MS)).toBe(true);
+describe("refreshDue", () => {
+  test("沒有紀錄、不是有限數字、或紀錄在未來（時鐘被調回）→ 到期", () => {
+    for (const attemptedAt of [null, undefined, "x", 0 / 0, NOW + 1]) {
+      expect(refreshDue(attemptedAt, NOW)).toBe(true);
     }
   });
 
-  test("TTL 內不重抓，超過才重抓（邊界值算新鮮）", () => {
-    const generatedAt = observed.generatedAt;
-    expect(shouldRefresh({ generatedAt }, generatedAt, QUOTA_TTL_MS)).toBe(false);
-    expect(shouldRefresh({ generatedAt }, generatedAt + QUOTA_TTL_MS, QUOTA_TTL_MS)).toBe(false);
-    expect(shouldRefresh({ generatedAt }, generatedAt + QUOTA_TTL_MS + 1, QUOTA_TTL_MS)).toBe(true);
-    expect(shouldRefresh({ generatedAt }, generatedAt + 9 * 60 * 60_000, QUOTA_TTL_MS)).toBe(true);
+  test("5 分鐘內不到期，剛好滿 5 分鐘才到期", () => {
+    expect(QUOTA_REFRESH_MS).toBe(5 * 60_000);
+    expect(refreshDue(NOW, NOW)).toBe(false);
+    expect(refreshDue(NOW, NOW + QUOTA_REFRESH_MS - 1)).toBe(false);
+    expect(refreshDue(NOW, NOW + QUOTA_REFRESH_MS)).toBe(true);
+  });
+});
+
+describe("claimQuotaAttempt：全域只有一個視窗搶到這一輪", () => {
+  const PATH = "/tmp/quota-attempt.json";
+  /** 只放一個檔案的 CAS 後端（語意與 test/fs-io.js 相同）。 */
+  function memoryIo(initial = null) {
+    const box = { text: initial };
+    return {
+      box,
+      read: async () => box.text,
+      write: async (_path, text, expected) => {
+        if (box.text !== expected) throw new CasConflict(PATH, expected === null ? "exists" : "stale");
+        box.text = text;
+      },
+    };
+  }
+
+  test("第一次拿到名額並記下時間；5 分鐘內第二個呼叫者（任何視窗）拿不到", async () => {
+    const io = memoryIo();
+    expect(await claimQuotaAttempt(io, PATH, NOW)).toBe(true);
+    expect(JSON.parse(io.box.text)).toEqual({ attemptedAt: NOW });
+    expect(await claimQuotaAttempt(io, PATH, NOW + 1_000)).toBe(false);
+    expect(await claimQuotaAttempt(io, PATH, NOW + QUOTA_REFRESH_MS - 1)).toBe(false);
+    expect(await claimQuotaAttempt(io, PATH, NOW + QUOTA_REFRESH_MS)).toBe(true);
   });
 
-  test("解析出來的快照直接判斷：剛抓的不重抓，過期才重抓", () => {
-    const { snapshot } = parseQuotaReport(SAMPLE);
-    expect(shouldRefresh(snapshot, snapshot.generatedAt + 60_000, QUOTA_TTL_MS)).toBe(false);
-    expect(shouldRefresh(snapshot, snapshot.generatedAt + QUOTA_TTL_MS + 1, QUOTA_TTL_MS)).toBe(true);
-    expect(shouldRefresh(null, snapshot.generatedAt, QUOTA_TTL_MS)).toBe(true);
+  test("同時搶：兩個視窗讀到同一份舊內容，只有一個過關", async () => {
+    const io = memoryIo();
+    const results = await Promise.all([claimQuotaAttempt(io, PATH, NOW), claimQuotaAttempt(io, PATH, NOW)]);
+    expect(results.filter(Boolean)).toHaveLength(1);
+  });
+
+  test("紀錄壞掉當作沒有；CAS 以外的寫入錯誤不吞掉", async () => {
+    const io = memoryIo("not json");
+    expect(await claimQuotaAttempt(io, PATH, NOW)).toBe(true);
+    const broken = { read: async () => null, write: async () => { throw new Error("EACCES"); } };
+    await expect(claimQuotaAttempt(broken, PATH, NOW)).rejects.toThrow("EACCES");
+  });
+
+  test("force（使用者按更新額度）：5 分鐘內也照抓，並重新起算自動輪", async () => {
+    const io = memoryIo();
+    expect(await claimQuotaAttempt(io, PATH, NOW)).toBe(true);
+    expect(await claimQuotaAttempt(io, PATH, NOW + 1_000, { force: true })).toBe(true);
+    expect(JSON.parse(io.box.text)).toEqual({ attemptedAt: NOW + 1_000 });
+    expect(await claimQuotaAttempt(io, PATH, NOW + 1_000 + QUOTA_REFRESH_MS - 1)).toBe(false);
   });
 });

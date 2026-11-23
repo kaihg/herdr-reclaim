@@ -5,7 +5,7 @@
 // 刷新都用「現在」重新判定一次；不然畫面開著跨過 TTL／resetsAt 之後，仍會把舊的
 // remaining 當成已知數字顯示（§9 要求過期就顯示未知）。
 //
-// 重新判定不呼叫外部 CLI、不碰 provider API：抓取只有使用者按「更新額度」才會發生。
+// 重新判定不呼叫外部 CLI、不碰 provider API：抓取另有排程（見 core/quota-source.js 的 claimQuotaAttempt）。
 import { readQuotas } from "./provider-stats.js";
 
 /** 原始快照 → 模型；`snapshot` 留在模型上，之後可以再依新的「現在」重算。 */

@@ -54,10 +54,13 @@ mod 端由 `core/host-io.js` 把 herdr 的原生錯誤轉成 `CasConflict`（真
   才 compact 已確認的事件。
 
 資料在 `appHome()/data/herdr-reclaim/`：`activity/<sessionId>/<writerEpoch>.json` 是 OMP extension 寫入的活動檔；`cities/<cityId 的雜湊>/` 是每座城的帳本（§13）。
-`quotas.json`（同一個資料目錄）是**選配**的額度回報檔：內容是 provider 明確回報的額度，
+`quotas.json`（同一個資料目錄）是額度回報檔：內容是 provider 明確回報的額度，
 形狀與 `spikes/s5/observed.json` 相同（`omp usage --json --redact` 的輸出：`generatedAt`、
-`reports[].fetchedAt`、`reports[].limits[].amount` 與 `window.resetsAt`）。mod 只讀這個檔案，
-不讀也不會去查任何 provider 憑證；檔案不存在、壞掉、過期，或某個 provider／帳號沒有回報，
+`reports[].fetchedAt`、`reports[].limits[].amount` 與 `window.resetsAt`）。mod 啟動時與每 5 分鐘
+自動跑 `omp usage --json --redact --no-extensions` 寫這個檔案（畫面上的「更新額度」可立刻抓）；
+額度是帳號層級，所以這個檔與 `quota-attempt.json`（上次嘗試時間）都是全域單一檔案，
+不管開幾個視窗、哪個 workspace，每 5 分鐘最多對 provider 查一次（失敗也算一次嘗試）。
+mod 不讀任何 provider 憑證；檔案不存在、壞掉、過期，或某個 provider／帳號沒有回報，
 畫面就顯示「未知」，不推算成 0 或 100，也不把沒有額度的帳號與已知帳號合併（§9、§15.2）。
 
 OMP extension 是獨立檔 `omp-extension/herdr-reclaim.ts`，日常互動 session 自動寫活動檔；
