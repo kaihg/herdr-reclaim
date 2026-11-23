@@ -28,7 +28,7 @@ import { RESEARCH_TOKENS_PER_PARCHMENT, RESOURCE_LABELS, RULES_VERSION } from ".
 import { defaultSelection, parseUi, resolveSelection, selectionOf, serializeUi, withDev, withHookChoice, withSelection } from "./core/selection.js";
 import { QUOTA_SOURCE, parseQuotaReport } from "./core/quota-source.js";
 import { quotaView, readQuotaView } from "./core/quota-view.js";
-import { CLEAR_POINTS, emptyCity, formatResearch, readTown, readTownFromLedger, selectionDetail, tileLabel } from "./core/town.js";
+import { CLEAR_POINTS, emptyCity, expeditionGroups, formatResearch, readTown, readTownFromLedger, selectionDetail, tileLabel } from "./core/town.js";
 import { cityForFolders } from "./core/space-city.js";
 import { firstExpedition } from "./scenarios/first-expedition.js";
 import {
@@ -91,6 +91,12 @@ function zoomFactor() {
 
 function shortId(sessionId) {
   return String(sessionId).slice(0, 8);
+}
+
+function expeditionTitle(tile) {
+  return tile.sessionName?.trim()
+    ? `${tileLabel(tile)}${tile.generation > 1 ? ` · 第 ${tile.generation} 代` : ""}`
+    : `遠征 ${shortId(tile.rootSessionId)} · 第 ${tile.generation} 代`;
 }
 
 /** mod 的資料目錄（在 herdr 的 appHome 底下）；adapter 也寫在同一個根目錄（§6.1）。 */
@@ -413,6 +419,7 @@ export default class Town extends View {
     this.metrics = emptyMetrics();
     // `herdr-app check` 會真的跑 init：不要動使用者的檔案，只渲染固定情境。
     this.historyOpen = false;
+    this.historyListOpen = false;
     this.harvestOpen = false;
     this.dockPanel = null;
     this.trade = null;
@@ -1035,7 +1042,9 @@ export default class Town extends View {
    */
   expeditionList(city, t, cx, width) {
     const unresolved = this.town?.unresolvedActivities ?? [];
-    const summary = stageCounts(city.tiles).map((entry) => `${entry.label} ${entry.count}`).join(" · ");
+    const { live, history, hidden } = expeditionGroups(city.tiles);
+    const shown = city.tiles.filter((tile) => !hidden.includes(tile));
+    const summary = stageCounts(shown).map((entry) => `${entry.label} ${entry.count}`).join(" · ");
     return v_flex()
       .id("expeditions")
       .w(width)
@@ -1049,7 +1058,7 @@ export default class Town extends View {
       .border_color(t.border)
       .children([
         div().text_size(10).text_color(t.dim).child("遠征（每格一支）"),
-        div().text_size(13).font_semibold().child(`${city.tiles.length} 格土地`),
+        div().text_size(13).font_semibold().child(`${shown.length} 格土地`),
         div().text_size(9).text_color(t.muted).truncate().child(summary || "還沒有土地"),
         ...this.hookBanner(city, t),
         // 來源不明與未解析是診斷資訊：一般只看到狀態與數量，原因、sha、cwd 在開發模式才展開。
@@ -1073,14 +1082,52 @@ export default class Town extends View {
           ] : []),
           hookButton("重試歸戶", t, (cx2) => this.retryTown(cx2)),
         ] : []),
-        ...city.tiles.map((tile) => this.expeditionCard(city, tile, t, cx)),
+        div().text_size(10).text_color(t.dim).child(`現役 ${live.length}`),
+        ...live.map((tile) => this.expeditionCard(city, tile, t, cx)),
+        ...(live.length ? [] : [div().text_size(10).text_color(t.muted).child("目前沒有掛著的 agent")]),
+        ...this.historySection(city, history, t, cx),
       ]);
+  }
+
+  /** 歷史對話（不在線上的、已撤回、已封存）：預設收起，只留標題與目前選取的那一筆。 */
+  historySection(city, history, t, cx) {
+    if (!history.length) return [];
+    const open = this.historyListOpen;
+    const rows = open ? history : history.filter((tile) => this.isSelectedTile(tile));
+    return [
+      h_flex()
+        .id("expedition-history-toggle")
+        .w_full()
+        .flex_none()
+        .gap(4)
+        .items_center()
+        .cursor_pointer()
+        .on_click((_event, cx2) => {
+          this.historyListOpen = !this.historyListOpen;
+          cx2.notify();
+        })
+        .child(div().text_size(10).text_color(t.dim).child(`${open ? "▾" : "▸"} 歷史 ${history.length}`)),
+      ...rows.map((tile) => this.historyRow(city, tile, t, cx)),
+    ];
+  }
+
+  isSelectedTile(tile) {
+    return this.selection?.kind === "expedition" &&
+      this.selection.rootSessionId === tile.rootSessionId && this.selection.generation === tile.generation;
+  }
+
+  selectTile(city, tile, cx) {
+    this.select({
+      kind: "expedition",
+      cityId: city.cityId,
+      rootSessionId: tile.rootSessionId,
+      generation: tile.generation,
+    }, cx);
   }
 
   expeditionCard(city, tile, t, cx) {
     const status = statusOf(tile, t);
-    const selected = this.selection?.kind === "expedition" &&
-      this.selection.rootSessionId === tile.rootSessionId && this.selection.generation === tile.generation;
+    const selected = this.isSelectedTile(tile);
     return v_flex()
       .id(`expedition-${tile.rootSessionId}-${tile.generation}`)
       .w_full()
@@ -1093,26 +1140,41 @@ export default class Town extends View {
       .border(1)
       .border_color(selected ? t.accent : t.border)
       .hover((style) => style.bg(selected ? t.selected : t.hover))
-      .on_click((_event, cx2) =>
-        this.select({
-          kind: "expedition",
-          cityId: city.cityId,
-          rootSessionId: tile.rootSessionId,
-          generation: tile.generation,
-        }, cx2),
-      )
+      .on_click((_event, cx2) => this.selectTile(city, tile, cx2))
       .children([
         h_flex().gap(5).items_center()
           .child(div().size(7).rounded_full().bg(status.color))
           .child(div().text_size(11).text_color(status.color).child(status.label))
           .child(stageBadge(tile, t)),
-        div().text_size(12.5).font_semibold().truncate().child(
-          tile.sessionName?.trim() ? `${tileLabel(tile)}${tile.generation > 1 ? ` · 第 ${tile.generation} 代` : ""}` : `遠征 ${shortId(tile.rootSessionId)} · 第 ${tile.generation} 代`,
-        ),
+        div().text_size(12.5).font_semibold().truncate().child(expeditionTitle(tile)),
         div().text_size(11).text_color(t.muted).truncate().child(
           this.devMode ? `${tile.points} / ${CLEAR_POINTS} · ${tile.cli ?? "未知"}` : `${tile.points} / ${CLEAR_POINTS}`,
         ),
         factionTag(tile, t),
+      ]);
+  }
+
+  /** 歷史對話的一行版本：狀態點、名稱、土地階段。 */
+  historyRow(city, tile, t, cx) {
+    const status = statusOf(tile, t);
+    const selected = this.isSelectedTile(tile);
+    return h_flex()
+      .id(`expedition-${tile.rootSessionId}-${tile.generation}`)
+      .w_full()
+      .flex_none()
+      .gap(5)
+      .items_center()
+      .px(6)
+      .py(3)
+      .rounded(4)
+      .cursor_pointer()
+      .bg(selected ? t.selected : t.surface)
+      .hover((style) => style.bg(selected ? t.selected : t.hover))
+      .on_click((_event, cx2) => this.selectTile(city, tile, cx2))
+      .children([
+        div().size(6).flex_none().rounded_full().bg(status.color),
+        div().flex_1().min_w(0).text_size(11).text_color(t.muted).truncate().child(expeditionTitle(tile)),
+        div().flex_none().text_size(9).text_color(t.dim).child(stageOf(tile).label),
       ]);
   }
 
