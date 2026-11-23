@@ -16,7 +16,7 @@
 // 選取狀態不進城的帳本（見 core/selection.js 的說明），存在 mod 資料目錄下的小檔案。
 import { View, div } from "gpui-kit";
 import { InputState, h_flex, v_flex } from "gpui-base";
-import { appHome, checking, exec, panes, props, readTextFile, settings, spaces, theme, watchFolder, writeTextFile } from "herdr";
+import { appHome, checking, exec, home, panes, props, readTextFile, settings, spaces, theme, watchFolder, writeTextFile } from "herdr";
 import { ADAPTER_DIR, activityDir, adapterRoot, citiesOf, loadActivities, repoFactsOf, sessionNamesOf } from "./core/adapter.js";
 import { commitContexts, ingestCommits, loadCommitEvidence, parseRawDiff, parseReflogEvidence, unharvestedCommitReasons } from "./core/commit-evidence.js";
 import { MAP_RADIUS, cameraFor, clampCamera, contentSize, ensureVisible, isCenterCell, keyOf, panCamera, revealedKeys, visibleRect } from "./core/grid.js";
@@ -868,7 +868,19 @@ export default class Town extends View {
       this.showToast(`正在抓取額度：${QUOTA_SOURCE.command} ${QUOTA_SOURCE.args.join(" ")}`, cx2);
       let text;
       try {
-        const result = await exec(QUOTA_SOURCE.command, QUOTA_SOURCE.args);
+        // 從 Dock／Finder 開的 herdr 沒有 shell 的 PATH（bun 的路徑在 ~/.zshrc），裸的 `omp` 會
+        // 啟動失敗（`herdr-exec` 錯誤）。先試 bun 的標準安裝位置，找不到再用 PATH。
+        let result;
+        let failure;
+        for (const command of [`${home()}/.bun/bin/${QUOTA_SOURCE.command}`, QUOTA_SOURCE.command]) {
+          try {
+            result = await exec(command, QUOTA_SOURCE.args);
+            break;
+          } catch (error) {
+            failure = error;
+          }
+        }
+        if (!result) throw failure;
         if (result.code !== 0) {
           text = `額度來源失敗（exit ${result.code}）：${String(result.stderr ?? "").trim().slice(0, 160) || "沒有輸出"}`;
         } else {
