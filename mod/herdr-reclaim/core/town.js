@@ -639,7 +639,8 @@ function detail(kind, city, tile, title, statusLabel, fields) {
     // 下方三個欄位是 §7.6 的操作入口：庫存足夠的配方、這一格能不能加速、市集可換的配對。
     buildable: [],
     boost: null,
-    market: marketDetail(city),
+    market: [],
+    harvests: [],
     // 派系、投入與行會人力只影響顯示（§9）：遠征給自己的，中央格給整座城與帳號額度。
     faction: null,
     investment: null,
@@ -696,7 +697,9 @@ function expeditionDetail(city, tile) {
     // §7.6：庫存足以支付完整配方的建築才列出來；加速只列這一格用得起的那一種。
     buildable: tile.landStage === "cleared" ? buildableRecipes(city.resources) : [],
     boost: boostDetail(city, tile),
-    market: marketDetail(city),
+    // 市集是城鎮中心的功能：只有中心格的詳情列出可換的配對。
+    market: [],
+    harvests: harvestList(tile),
     // §9：這一格的投資（依 provider 分開）決定建築派系；畫面要標明比較基準的限制。
     faction: tile.faction,
     investment: tile.investment,
@@ -713,16 +716,6 @@ function expeditionDetail(city, tile) {
         label: `投入 ${provider}`,
         // 每個欄位各自判斷未知（formatUsage）：部分未知時只有那個欄位是「未知」，不是 0。
         value: formatUsage(usage),
-        dev: true,
-      })),
-      // 玩家看到的是「這次 commit 收了什麼」；sha、claim、路徑與規則版本是開發模式的明細。
-      ...(tile.harvests ?? []).map((harvest, index) => ({
-        label: `成果 ${index + 1}`,
-        value: `${harvest.subject || "commit"} · ${formatCosts(harvest.resources)}`,
-      })),
-      ...(tile.harvests ?? []).map((harvest, index) => ({
-        label: `收成 ${index + 1}`,
-        value: `${harvest.sha ?? "commit"}${harvest.subject ? ` · ${harvest.subject}` : ""} · claim ${(harvest.claims ?? []).slice(0, 2).join(", ") || "已記錄"}${(harvest.claimCount ?? 0) > 2 ? "…" : ""} · 路徑 ${(harvest.paths ?? []).slice(0, 2).join(", ") || `${harvest.pathCount ?? 0} 筆`} · ${formatCosts(harvest.resources)} · 規則 v${harvest.rulesVersion ?? "?"}`,
         dev: true,
       })),
       { label: "點數", value: `工作 ${tile.workPoints} · 收成 ${tile.harvestPoints} · 加速 ${tile.boostPoints}`, dev: true },
@@ -874,4 +867,17 @@ export function formatUsage(usage = ZERO_USAGE) {
     field("cacheWrite", "快取寫", usage.cacheWrite),
   ];
   return `${parts.join(" · ")}${cost}${unknown}`;
+}
+
+/**
+ * 這一格收成過的 commit 清單（右側詳情只顯示筆數，清單在「成果」面板）。
+ * `detail` 是 sha、claim、路徑與規則版本，只有開發模式才顯示。
+ */
+function harvestList(tile) {
+  return (tile.harvests ?? []).map((harvest) => ({
+    subject: harvest.subject || "commit",
+    sha: harvest.sha ?? null,
+    resources: formatCosts(harvest.resources),
+    detail: `claim ${(harvest.claims ?? []).slice(0, 2).join(", ") || "已記錄"}${(harvest.claimCount ?? 0) > 2 ? "…" : ""} · 路徑 ${(harvest.paths ?? []).slice(0, 2).join(", ") || `${harvest.pathCount ?? 0} 筆`} · 規則 v${harvest.rulesVersion ?? "?"}`,
+  }));
 }

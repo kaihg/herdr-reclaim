@@ -36,6 +36,7 @@ import {
   isSubmitKeystroke,
 } from "./core/history-search.js";
 import { historyPanel } from "./ui/history.js";
+import { harvestPanel } from "./ui/harvests.js";
 import { mapView } from "./ui/map.js";
 import { stageCounts, stageOf } from "./ui/assets.js";
 import { factionTag, guildBlock, investmentSection, quotaSection } from "./ui/standing.js";
@@ -410,6 +411,7 @@ export default class Town extends View {
     this.metrics = emptyMetrics();
     // `herdr-app check` 會真的跑 init：不要動使用者的檔案，只渲染固定情境。
     this.historyOpen = false;
+    this.harvestOpen = false;
     this.historyState = historyOpened();
     this.historyInput = InputState.new({ placeholder: "搜尋日期、城、session、commit 或成果路徑" });
     // 三條送出查詢的路都走同一個狀態機：輸入框的 submit 事件、Enter／Return 的 keydown，
@@ -466,6 +468,7 @@ export default class Town extends View {
 
   /** 選取：存檔＋把那一格帶進畫面；門檻 1（≤ 150 ms）＝按下到含新詳情的那一版畫面。 */
   select(selection, cx) {
+    this.harvestOpen = false;
     this.mark("pick");
     this.selection = selection;
     this.ui = withSelection(this.ui ?? parseUi(null), selection.cityId, selection);
@@ -1231,6 +1234,18 @@ export default class Town extends View {
   // ---- 右側：選取遠征或格子的詳情（§12 的入口）
 
   detailPanel(detail, t, width, cx) {
+    if (this.harvestOpen && detail.harvests?.length) {
+      return harvestPanel({
+        title: detail.title,
+        harvests: detail.harvests,
+        theme: t,
+        dev: this.devMode,
+        onClose: (cx2) => {
+          this.harvestOpen = false;
+          cx2.notify();
+        },
+      }).w(width).flex_none().min_h(0).bg(t.chrome).border_l(1).border_color(t.border);
+    }
     if (this.historyOpen) {
       return historyPanel({
         state: this.historyState,
@@ -1275,6 +1290,12 @@ export default class Town extends View {
             ? div().text_size(9).text_color(t.muted).child("已揭開的空地：看得到地面，還沒有遠征進駐。新的遠征會從離城鎮中心最近的空地開始。")
             : null,
           detail.pointsTarget ? progress(detail, t) : null,
+          detail.harvests?.length
+            ? hookButton(`成果 ${detail.harvests.length} 筆 ›`, t, (cx2) => {
+              this.harvestOpen = true;
+              cx2.notify();
+            })
+            : null,
           ...detail.fields.filter((field) => this.devMode || !field.dev).map((field) => fieldRow(field, t)),
           ...(detail.investment ? investmentSection(detail, t, this.devMode) : []),
           ...(detail.quota?.length ? quotaSection(detail, t) : []),

@@ -171,6 +171,11 @@ describe("市集（§7.6、§11）", () => {
     const centerOf = (town) => selectionDetail(town, { kind: "tile", cityId: CITY, x: 0, y: 0 });
     let center = centerOf(await townOf(ledger));
     expect(center.kind).toBe("center");
+    // 市集是城鎮中心的功能：庫存換得起時，遠征格、空地與迷霧的詳情都不列市集配對。
+    const stocked = await townOf(ledger);
+    const tileDetail = (x, y) => selectionDetail(stocked, { kind: "tile", cityId: CITY, x, y });
+    expect(tileDetail(0, -1).kind).toBe("expedition");
+    for (const detail of [tileDetail(0, -1), tileDetail(2, 0), tileDetail(5, 5)]) expect(detail.market).toEqual([]);
     // 木材 1 換不出（1 // 3 = 0），羊皮卷 3 可以換 1 份到另外三種資源。
     expect(center.market.map((pair) => `${pair.from}->${pair.to}:${pair.amount}`))
       .toEqual(["parchment->wood:1", "parchment->stone:1", "parchment->iron:1"]);

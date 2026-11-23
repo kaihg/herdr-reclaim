@@ -53,8 +53,10 @@ describe("commit 證據 replay", () => {
     const detail = selectionDetail(readTownFromLedger({ expeditions: late.tiles }), {
       kind: "expedition", cityId: CITY, rootSessionId: "session-1", generation: 1,
     });
-    expect(detail.fields.filter((field) => field.label.startsWith("收成")).some((field) => field.value.includes("History marker"))).toBe(true);
-    expect(detail.fields.filter((field) => field.label.startsWith("收成")).every((field) => field.value.includes("規則 v2"))).toBe(true);
+    expect(detail.harvests.some((item) => item.subject === "History marker")).toBe(true);
+    expect(detail.harvests.every((item) => item.detail.includes("規則 v2"))).toBe(true);
+    // 詳情的欄位不再逐筆列出 commit（清單在「成果」面板）。
+    expect(detail.fields.some((field) => field.label.startsWith("收成") || field.label.startsWith("成果"))).toBe(false);
 
     const remoteSha = "b".repeat(40);
     const remoteHook = { ...hook(remoteSha), hook: "reflog", reflog: "pull origin/main: Fast-forward" };
