@@ -7,17 +7,25 @@ export const RESOURCE_KEYS = Object.keys(RESOURCE_LABELS);
 
 const stock = (resources, key) => Number(resources?.[key] ?? 0);
 
-/** 這一種資源最多可以換幾份（3 換 1，無條件捨去）。 */
+/** 畫面上一次至少換 10 份、以 10 為單位（單份太細，操作不便）；帳本本身仍接受任何正整數。 */
+export const TRADE_STEP = 10;
+
+/** 這一種資源理論上最多可以換幾份（3 換 1，無條件捨去）。 */
 export function maxTradeAmount(resources, from) {
   return Math.floor(stock(resources, from) / TRADE_RATE);
 }
 
-/** 數量夾在 [1, 最多]；一份都換不出來時是 0。 */
+/** 畫面上真正能選的最大數量：理論上限往下取到 10 的倍數；不到 10 就是 0（換不出來）。 */
+export function tradeCap(resources, from) {
+  return Math.floor(maxTradeAmount(resources, from) / TRADE_STEP) * TRADE_STEP;
+}
+
+/** 數量是 10 的倍數、夾在 [10, 上限]；不到 10 份時是 0。 */
 function clampAmount(resources, from, amount) {
-  const max = maxTradeAmount(resources, from);
-  if (max <= 0) return 0;
-  const wanted = Number.isInteger(amount) ? amount : 1;
-  return Math.min(max, Math.max(1, wanted));
+  const cap = tradeCap(resources, from);
+  if (cap <= 0) return 0;
+  const wanted = Number.isInteger(amount) ? Math.round(amount / TRADE_STEP) * TRADE_STEP : TRADE_STEP;
+  return Math.min(cap, Math.max(TRADE_STEP, wanted));
 }
 
 /** 預設：付出庫存最多的資源，換成庫存最少的另一種（同量取清單順序在前的），數量 1。 */
@@ -25,7 +33,7 @@ export function defaultTrade(resources) {
   const byStock = [...RESOURCE_KEYS].sort((a, b) => stock(resources, b) - stock(resources, a));
   const from = byStock[0];
   const to = [...RESOURCE_KEYS].filter((key) => key !== from).sort((a, b) => stock(resources, a) - stock(resources, b))[0];
-  return { from, to, amount: clampAmount(resources, from, 1) };
+  return { from, to, amount: clampAmount(resources, from, TRADE_STEP) };
 }
 
 /** 庫存變動（交易後、新的收成）時讓選擇仍然有效：不能換成自己，數量不超過現有庫存。 */
@@ -47,11 +55,11 @@ export function setTradeTo(trade, resources, to) {
 }
 
 export function stepTrade(trade, resources, delta) {
-  return normalizeTrade({ ...trade, amount: trade.amount + delta }, resources);
+  return normalizeTrade({ ...trade, amount: trade.amount + delta * TRADE_STEP }, resources);
 }
 
 export function maxTrade(trade, resources) {
-  return normalizeTrade({ ...trade, amount: maxTradeAmount(resources, trade.from) }, resources);
+  return normalizeTrade({ ...trade, amount: tradeCap(resources, trade.from) }, resources);
 }
 
 /** 「付出 木材 6 → 得到 石材 2」的數字；數量 0 代表換不出來。 */

@@ -3,7 +3,7 @@
 import { div } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
 import { RESOURCE_LABELS } from "../core/rules.js";
-import { RESOURCE_KEYS, buildOptions, maxTradeAmount, tradePreview } from "../core/dock.js";
+import { RESOURCE_KEYS, TRADE_STEP, buildOptions, tradeCap, tradePreview } from "../core/dock.js";
 
 export const DOCK_H = 40;
 
@@ -69,7 +69,7 @@ export function buildPanel({ t, resources, onBuild }) {
 export function marketPanel({ t, resources, trade, handlers }) {
   const stock = (key) => Number(resources?.[key] ?? 0);
   const preview = tradePreview(trade);
-  const max = maxTradeAmount(resources, trade.from);
+  const max = tradeCap(resources, trade.from);
   const row = (title, current, onPick, disabledOf) =>
     h_flex().gap(6).items_center()
       .child(div().w(34).text_size(10).text_color(t.dim).child(title))
@@ -80,11 +80,11 @@ export function marketPanel({ t, resources, trade, handlers }) {
       })));
   const canTrade = trade.amount > 0;
   return panelFrame(t, "市集（3 換 1）", [
-    row("付出", trade.from, handlers.onFrom, (key) => maxTradeAmount(resources, key) <= 0),
+    row("付出", trade.from, handlers.onFrom, (key) => tradeCap(resources, key) <= 0),
     row("換成", trade.to, handlers.onTo, (key) => key === trade.from),
     h_flex().gap(6).items_center()
       .child(div().w(34).text_size(10).text_color(t.dim).child("數量"))
-      .child(pill("−", t, { disabled: trade.amount <= 1, onClick: (cx) => handlers.onStep(-1, cx) }))
+      .child(pill("−", t, { disabled: trade.amount <= TRADE_STEP, onClick: (cx) => handlers.onStep(-1, cx) }))
       .child(div().w(30).text_center().text_size(12).font_semibold().child(String(trade.amount)))
       .child(pill("＋", t, { disabled: trade.amount >= max, onClick: (cx) => handlers.onStep(1, cx) }))
       .child(pill(`最多 ${max}`, t, { disabled: max <= 0 || trade.amount >= max, onClick: (cx) => handlers.onMax(cx) })),
@@ -92,7 +92,7 @@ export function marketPanel({ t, resources, trade, handlers }) {
       .child(div().text_size(10.5).text_color(canTrade ? t.foreground : t.dim).child(
         canTrade
           ? `付出 ${RESOURCE_LABELS[trade.from]} ${preview.give} → 得到 ${RESOURCE_LABELS[trade.to]} ${preview.get}`
-          : `${RESOURCE_LABELS[trade.from]}不到 3，換不出來`,
+          : `${RESOURCE_LABELS[trade.from]}要有 ${TRADE_STEP * 3} 以上才能換（一次至少 ${TRADE_STEP} 份）`,
       ))
       .child(pill("交換", t, { disabled: !canTrade, selected: canTrade, onClick: (cx) => (canTrade ? handlers.onConfirm(cx) : null) })),
   ]);

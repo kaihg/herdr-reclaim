@@ -1,48 +1,49 @@
 // 底部動作列：按鈕狀態與不能按的原因、市集的預設值／數量邊界／預覽。
 import { describe, expect, test } from "bun:test";
-import { buildOptions, defaultTrade, dockState, maxTrade, maxTradeAmount, normalizeTrade, setTradeFrom, setTradeTo, stepTrade, tradePreview } from "../core/dock.js";
+import { buildOptions, defaultTrade, dockState, maxTrade, maxTradeAmount, normalizeTrade, setTradeFrom, setTradeTo, stepTrade, tradeCap, tradePreview } from "../core/dock.js";
 
 const stock = (wood, stone, iron, parchment) => ({ wood, stone, iron, parchment });
 
-describe("市集數量", () => {
-  test("預設付出庫存最多的資源、換成庫存最少的另一種；數量 1", () => {
-    expect(defaultTrade(stock(42, 30, 8, 3))).toEqual({ from: "wood", to: "parchment", amount: 1 });
+describe("市集數量（一次至少 10 份、以 10 為單位）", () => {
+  test("預設付出庫存最多的資源、換成庫存最少的另一種；數量 10", () => {
+    expect(defaultTrade(stock(90, 60, 30, 30))).toEqual({ from: "wood", to: "iron", amount: 10 });
   });
 
-  test("沒有任何資源換得起（每種都不到 3）：數量 0，不會是 1", () => {
-    const trade = defaultTrade(stock(2, 1, 0, 2));
-    expect(trade.amount).toBe(0);
-    expect(maxTradeAmount(stock(2, 1, 0, 2), trade.from)).toBe(0);
+  test("庫存不夠換 10 份（要 30 以上）：數量 0；即使理論上換得出 1～9 份", () => {
+    const resources = stock(29, 3, 0, 2);
+    expect(maxTradeAmount(resources, "wood")).toBe(9); // 帳本接受，但畫面不開放
+    expect(tradeCap(resources, "wood")).toBe(0);
+    expect(defaultTrade(resources).amount).toBe(0);
   });
 
-  test("步進與最多：夾在 1 到 floor(庫存 / 3)", () => {
-    const resources = stock(14, 0, 0, 0); // 最多 4 份
-    let trade = { from: "wood", to: "stone", amount: 1 };
-    trade = stepTrade(trade, resources, -1);
-    expect(trade.amount).toBe(1);
+  test("步進與最多：10 的倍數，夾在 10 到上限（庫存 / 3 往下取到 10 的倍數）", () => {
+    const resources = stock(100, 0, 0, 0); // 理論 33 份，畫面上限 30
+    expect(tradeCap(resources, "wood")).toBe(30);
+    let trade = { from: "wood", to: "stone", amount: 10 };
+    expect(stepTrade(trade, resources, -1).amount).toBe(10);
     trade = stepTrade(trade, resources, 1);
-    expect(trade.amount).toBe(2);
+    expect(trade.amount).toBe(20);
     trade = maxTrade(trade, resources);
-    expect(trade.amount).toBe(4);
-    expect(stepTrade(trade, resources, 1).amount).toBe(4);
-    expect(tradePreview(trade)).toEqual({ give: 12, get: 4 });
+    expect(trade.amount).toBe(30);
+    expect(stepTrade(trade, resources, 1).amount).toBe(30);
+    expect(tradePreview(trade)).toEqual({ give: 90, get: 30 });
   });
 
   test("換成自己的選項會自動讓開；換「付出」的資源時數量重新夾住", () => {
-    const resources = stock(30, 6, 0, 0);
-    let trade = { from: "wood", to: "stone", amount: 7 };
-    trade = setTradeFrom(trade, resources, "stone"); // 石材只剩 2 份；原本的「換成」也是石材
+    const resources = stock(300, 60, 0, 0);
+    let trade = { from: "wood", to: "stone", amount: 70 };
+    trade = setTradeFrom(trade, resources, "stone"); // 石材 60 → 20 份
     expect(trade.from).toBe("stone");
     expect(trade.to).not.toBe("stone");
-    expect(trade.amount).toBe(2);
-    trade = setTradeTo(trade, resources, "stone"); // 把「換成」選成付出的那一種：付出改讓開
+    expect(trade.amount).toBe(20);
+    trade = setTradeTo(trade, resources, "stone");
     expect(trade.to).toBe("stone");
     expect(trade.from).not.toBe("stone");
   });
 
-  test("庫存在交易後變少：已選的數量跟著收斂；選到的資源不存在就退回預設", () => {
-    expect(normalizeTrade({ from: "wood", to: "stone", amount: 9 }, stock(7, 0, 0, 0)).amount).toBe(2);
-    expect(normalizeTrade({ from: "gold", to: "stone", amount: 1 }, stock(7, 0, 0, 0)).from).toBe("wood");
+  test("庫存在交易後變少：數量跟著收斂；選到的資源不存在就退回預設", () => {
+    expect(normalizeTrade({ from: "wood", to: "stone", amount: 90 }, stock(70, 0, 0, 0)).amount).toBe(20);
+    expect(normalizeTrade({ from: "gold", to: "stone", amount: 10 }, stock(70, 0, 0, 0)).from).toBe("wood");
   });
 });
 

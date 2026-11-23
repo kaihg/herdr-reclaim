@@ -180,12 +180,12 @@ describe("市集（§7.6、§11）", () => {
     for (const detail of [center, tileDetail(0, -1), tileDetail(2, 0), tileDetail(5, 5)]) {
       expect(dockState({ detail, hasLedgerCity: true }).market.enabled).toBe(true);
     }
-    // 木材 1 換不出（1 // 3 = 0），羊皮卷 3 換得出 1 份。
+    // 木材 1 換不出；羊皮卷 3 在帳本上換得出 1 份，但畫面一次至少 10 份，所以動作列沒有可選的數量。
     const resources = stocked.cities[0].resources;
     expect(maxTradeAmount(resources, "wood")).toBe(0);
-    const trade = defaultTrade(resources);
-    expect(trade).toMatchObject({ from: "parchment", amount: 1 });
-    expect(maxTradeAmount(resources, trade.from)).toBe(1);
+    expect(maxTradeAmount(resources, "parchment")).toBe(1);
+    expect(defaultTrade(resources).amount).toBe(0);
+    const trade = { from: "parchment", amount: 1 }; // 帳本仍接受 1 份
 
     expect((await processTrade(ledger, { from: trade.from, to: "wood", amount: trade.amount, at: T(600_000) })).status)
       .toBe("applied");
