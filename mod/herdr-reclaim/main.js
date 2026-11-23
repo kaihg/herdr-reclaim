@@ -413,7 +413,7 @@ export default class Town extends View {
     this.hookStates = {};
     this.toast = null;
     this.note = "正在讀取城鎮帳本…";
-    this.legendOpen = true;
+    this.legendOpen = false;
     this.metricsOpen = false;
     this.camera = null;
     this.metrics = emptyMetrics();
