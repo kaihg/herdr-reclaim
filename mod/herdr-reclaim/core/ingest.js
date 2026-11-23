@@ -58,7 +58,11 @@ export async function ingestActivities(ledger, activities, cityId) {
  */
 export async function ingestExpeditions(ledger, scenario, cityId) {
   const results = [];
-  for (const plan of planExpeditions(scenario)) {
+  // 用帳本已保存的完整活動來算：adapter 檔在 ack 後會 compact，visit_start 等早期事件已不在檔案裡，
+  // 只看檔案會讓「第一次對話才建格」永遠看不到這支 session 的 visit（城鎮不出現）。
+  // 呼叫端先 ingestActivities，所以帳本已含這一輪的新事件。
+  const stored = [...(await ledger.state()).activities.values()];
+  for (const plan of planExpeditions({ ...scenario, activities: stored })) {
     if (cityId && plan.cityId !== cityId) continue;
     results.push(await ledger.submit((state) => expeditionOp(state, plan)));
   }

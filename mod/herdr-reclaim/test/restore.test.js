@@ -330,14 +330,36 @@ describe("帳本重建城鎮", () => {
     const silent = activity({
       sessionId,
       writerEpoch: "silent",
-      events: [{ kind: "visit_start", at: AT, visit }],
+      events: [{ eventSeq: 1, kind: "visit_start", at: AT, visit }],
     });
     const ledger = await open(newDir());
     await ingestScenario(ledger, { activities: [silent], repoFacts: firstExpedition.repoFacts }, CITY.commonDir);
     expect((await townOfLedger(ledger)).cities.flatMap((city) => city.tiles)).toEqual([]);
 
-    const talked = { ...silent, events: [...silent.events, { kind: "interval_open", at: AT + 1 }] };
+    const talked = { ...silent, events: [...silent.events, { eventSeq: 2, kind: "interval_open", at: AT + 1 }] };
     await ingestScenario(ledger, { activities: [talked], repoFacts: firstExpedition.repoFacts }, CITY.commonDir);
+    expect((await townOfLedger(ledger)).cities[0].tiles.map((tile) => tile.rootSessionId)).toEqual([sessionId]);
+  });
+
+  test("visit_start 已被 compact 掉、檔案只剩 interval_open 的尾巴時，第一次對話仍建格", async () => {
+    const sessionId = "compacted-new-session";
+    const visit = { visitId: "compacted-visit", cwd: CITY.checkout, commonDir: CITY.commonDir, checkout: CITY.checkout };
+    const head = activity({
+      sessionId,
+      writerEpoch: "compacted",
+      events: [{ eventSeq: 1, kind: "visit_start", at: AT, visit }],
+    });
+    const ledger = await open(newDir());
+    await ingestScenario(ledger, { activities: [head], repoFacts: firstExpedition.repoFacts }, CITY.commonDir);
+    expect((await townOfLedger(ledger)).cities.flatMap((city) => city.tiles)).toEqual([]);
+
+    // adapter 在 ack 之後只保留新尾巴：沒有 visit_start。
+    const tail = activity({
+      sessionId,
+      writerEpoch: "compacted",
+      events: [{ eventSeq: 2, kind: "interval_open", at: AT + 1 }],
+    });
+    await ingestScenario(ledger, { activities: [tail], repoFacts: firstExpedition.repoFacts }, CITY.commonDir);
     expect((await townOfLedger(ledger)).cities[0].tiles.map((tile) => tile.rootSessionId)).toEqual([sessionId]);
   });
 
