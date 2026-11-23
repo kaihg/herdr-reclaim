@@ -1301,10 +1301,6 @@ export default class Town extends View {
           ...(detail.quota?.length ? quotaSection(detail, t) : []),
           ...(detail.actions ?? []).map((action) =>
             hookButton(actionLabels[action], t, (cx2) => this.operateLand(detail, action, cx2))),
-          // 有 commit 收成的格不能撤回或封存：不在詳情放說明文字，按下按鈕才用提示說明原因。
-          detail.actionUnavailableReason
-            ? hookButton("撤回／封存", t, (cx2) => this.showToast(detail.actionUnavailableReason, cx2))
-            : null,
           ...this.economySection(detail, t, cx),
           this.note ? div().text_size(9).text_color(t.muted).child(this.note) : null,
         ].filter(Boolean),
