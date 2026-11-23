@@ -7,7 +7,7 @@
 // 土地生命週期、commit 收成、建築與額度由 #4／#5 接上；庫存與行會在這裡先固定成
 // 「還沒有收成」與「沒有額度來源」。
 import { CENTER, CENTER_CELLS, bfsNextTile, isCenterCell, keyOf, revealedKeys } from "./grid.js";
-import { BOOST_POINTS_PER_PARCHMENT, CLEAR_POINTS, RECIPES, RESEARCH_TOKENS_PER_PARCHMENT, RESOURCE_LABELS, TRADE_RATE, buildableRecipes } from "./rules.js";
+import { BOOST_POINTS_PER_PARCHMENT, CLEAR_POINTS, RECIPES, RESEARCH_TOKENS_PER_PARCHMENT, RESOURCE_LABELS, buildableRecipes } from "./rules.js";
 import { allTokensUnknown, basisNote, factionOf, formatFaction, investmentsOf, mergeInvestments, quotaLines } from "./provider-stats.js";
 
 export const SCHEMA = 1;

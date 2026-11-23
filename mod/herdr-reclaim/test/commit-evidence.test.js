@@ -8,6 +8,7 @@ import { CityLedger } from "../core/ledger.js";
 import { ingestScenario, processLand, redispatch } from "../core/ingest.js";
 import { ingestCommits, parseRawDiff, parseReflogEvidence, unharvestedCommitReasons } from "../core/commit-evidence.js";
 import { harvestForCommit } from "../core/harvest.js";
+import { RULES_VERSION } from "../core/rules.js";
 import { readTownFromLedger, selectionDetail } from "../core/town.js";
 import { activity, visitStart } from "../scenarios/first-expedition.js";
 import { searchHistory } from "../core/history.js";
@@ -54,7 +55,7 @@ describe("commit 證據 replay", () => {
       kind: "expedition", cityId: CITY, rootSessionId: "session-1", generation: 1,
     });
     expect(detail.harvests.some((item) => item.subject === "History marker")).toBe(true);
-    expect(detail.harvests.every((item) => item.detail.includes("規則 v2"))).toBe(true);
+    expect(detail.harvests.every((item) => item.detail.includes(`規則 v${RULES_VERSION}`))).toBe(true);
     // 詳情的欄位不再逐筆列出 commit（清單在「成果」面板）。
     expect(detail.fields.some((field) => field.label.startsWith("收成") || field.label.startsWith("成果"))).toBe(false);
 

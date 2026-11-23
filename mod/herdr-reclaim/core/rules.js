@@ -5,8 +5,9 @@
 // 版本歷程：
 //   1  ticket #7 的土地生命週期（撤回、封存、重新派遣）
 //   2  ticket #8 的研究匯率、加速點數、市集費率與建築配方
+//   3  市集依資源配對訂不同費率：羊皮卷 → 其他 1 換 10；其他 → 羊皮卷 30 換 1；其他之間仍是 3 換 1
 
-export const RULES_VERSION = 2;
+export const RULES_VERSION = 3;
 
 /** 庫存裡的資源種類；羊皮卷同時是市集商品與加速材料（§11）。 */
 export const RESOURCES = ["wood", "stone", "iron", "parchment"];
@@ -22,8 +23,22 @@ export const RESEARCH_TOKENS_PER_PARCHMENT = 100_000;
 /** §7.6：每張羊皮卷 +10 開墾點；超過 100 的部分不退還、也不會轉到其他格。 */
 export const BOOST_POINTS_PER_PARCHMENT = 10;
 
-/** §7.6：市集任兩種資源 3 換 1。 */
-export const TRADE_RATE = 3;
+/**
+ * §7.6：市集的費率依資源配對而不同，一筆交易的 `amount` 是「換幾次」。
+ *   - 羊皮卷 → 木／石／鐵：1 張換 10 個（羊皮卷產出少，值錢）
+ *   - 木／石／鐵 → 羊皮卷：30 個換 1 張（往返只剩 1/3，不能無損耗互換；附錄 A）
+ *   - 木／石／鐵之間：3 換 1
+ * `give`／`get` 是一次交換付出與取得的數量；`step` 是畫面一次調整的次數（3:1 太細，以 10 為單位）。
+ */
+export function tradeTerms(from, to) {
+  if (from === to || !RESOURCES.includes(from) || !RESOURCES.includes(to)) return null;
+  if (from === "parchment") return { give: 1, get: 10, step: 1 };
+  if (to === "parchment") return { give: 30, get: 1, step: 1 };
+  return { give: 3, get: 1, step: 10 };
+}
+
+/** 規則版本 2 以前的市集一律 3 換 1，舊紀錄重播時沿用（紀錄裡沒有 give／get）。 */
+export const LEGACY_TRADE_GIVE = 3;
 
 /** §8.1 的暫定建築配方；建材不合理時改這裡，不動帳本。 */
 export const RECIPES = {

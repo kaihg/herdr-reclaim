@@ -6,7 +6,7 @@ import { bfsNextTile, keyOf } from "./grid.js";
 import { planExpeditions } from "./town.js";
 import { activityKey } from "./ledger.js";
 import { planResearch } from "./research.js";
-import { RECIPES, TRADE_RATE } from "./rules.js";
+import { RECIPES, tradeTerms } from "./rules.js";
 
 /** 這支 session 的紀錄有沒有碰到這座城（含 compact 前已在帳本保存的 visit）。 */
 function touchesCity(record, cityId) {
@@ -157,6 +157,7 @@ export async function processBoost(ledger, { rootSessionId, generation, scrolls,
 
 /** 市集（§7.6、§11）：同城任兩種資源 3 換 1；庫存不足時整筆不執行，不會有部分交易。 */
 export async function processTrade(ledger, { from, to, amount, at, opId }) {
+  const terms = tradeTerms(from, to);
   return ledger.submit(() => ({
     opId: opId ?? `trade:${ledger.cityId}:${from}:${to}:${amount}:${at}`,
     kind: "trade",
@@ -165,7 +166,9 @@ export async function processTrade(ledger, { from, to, amount, at, opId }) {
     from,
     to,
     amount,
-    rate: TRADE_RATE,
+    // 費率跟著紀錄存下來：之後調整規則，已落帳的交易仍照當時的費率重播（precheck 核對它跟規則表一致）。
+    give: terms?.give,
+    get: terms?.get,
   }));
 }
 

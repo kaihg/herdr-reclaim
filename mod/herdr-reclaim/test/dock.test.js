@@ -1,47 +1,74 @@
 // 底部動作列：按鈕狀態與不能按的原因、市集的預設值／數量邊界／預覽。
 import { describe, expect, test } from "bun:test";
-import { buildOptions, defaultTrade, dockState, maxTrade, maxTradeAmount, normalizeTrade, setTradeFrom, setTradeTo, stepTrade, tradeCap, tradePreview } from "../core/dock.js";
+import { buildOptions, canPay, defaultTrade, dockState, maxTrade, maxTradeAmount, minPay, normalizeTrade, setTradeFrom, setTradeTo, stepTrade, tradeCap, tradePreview } from "../core/dock.js";
 
 const stock = (wood, stone, iron, parchment) => ({ wood, stone, iron, parchment });
 
-describe("市集數量（一次至少 10 份、以 10 為單位）", () => {
-  test("預設付出庫存最多的資源、換成庫存最少的另一種；數量 10", () => {
+describe("市集費率與次數", () => {
+  test("羊皮卷 → 其他：1 張換 10；其他 → 羊皮卷：30 換 1；其他之間：3 換 1", () => {
+    const resources = stock(300, 300, 300, 300);
+    expect(tradePreview({ from: "parchment", to: "wood", amount: 2 })).toEqual({ give: 2, get: 20 });
+    expect(tradePreview({ from: "wood", to: "parchment", amount: 2 })).toEqual({ give: 60, get: 2 });
+    expect(tradePreview({ from: "wood", to: "stone", amount: 10 })).toEqual({ give: 30, get: 10 });
+    expect(maxTradeAmount(resources, "parchment", "wood")).toBe(300);
+    expect(maxTradeAmount(resources, "wood", "parchment")).toBe(10);
+  });
+
+  test("往返有損耗：1 羊皮卷換成木材再換回來，拿不回 1 張", () => {
+    const out = tradePreview({ from: "parchment", to: "wood", amount: 1 }).get; // 10 木材
+    const back = Math.floor(out / 30); // 木材 → 羊皮卷要 30 個換 1
+    expect(back).toBe(0);
+  });
+
+  test("預設付出庫存最多而且付得起的資源，換成庫存最少的另一種", () => {
     expect(defaultTrade(stock(90, 60, 30, 30))).toEqual({ from: "wood", to: "iron", amount: 10 });
+    // 羊皮卷庫存最多：付得起（1 張就能換），預設以它付出，一次 1 張
+    expect(defaultTrade(stock(0, 0, 0, 5))).toMatchObject({ from: "parchment", amount: 1 });
   });
 
-  test("庫存不夠換 10 份（要 30 以上）：數量 0；即使理論上換得出 1～9 份", () => {
-    const resources = stock(29, 3, 0, 2);
-    expect(maxTradeAmount(resources, "wood")).toBe(9); // 帳本接受，但畫面不開放
-    expect(tradeCap(resources, "wood")).toBe(0);
+  test("庫存湊不出一個 step：次數 0（木／石／鐵之間要 30；換進羊皮卷要 30）", () => {
+    const resources = stock(29, 3, 0, 0);
+    expect(tradeCap(resources, "wood", "stone")).toBe(0);
+    expect(maxTradeAmount(resources, "wood", "stone")).toBe(9); // 帳本接受，但畫面不開放
+    expect(canPay(resources, "wood")).toBe(false);
     expect(defaultTrade(resources).amount).toBe(0);
+    expect(minPay({ from: "wood", to: "stone" })).toBe(30);
+    expect(minPay({ from: "wood", to: "parchment" })).toBe(30);
+    expect(minPay({ from: "parchment", to: "wood" })).toBe(1);
   });
 
-  test("步進與最多：10 的倍數，夾在 10 到上限（庫存 / 3 往下取到 10 的倍數）", () => {
-    const resources = stock(100, 0, 0, 0); // 理論 33 份，畫面上限 30
-    expect(tradeCap(resources, "wood")).toBe(30);
+  test("步進與最多：木／石／鐵之間以 10 次為單位，羊皮卷的配對以 1 次為單位", () => {
+    const resources = stock(100, 0, 0, 7);
+    expect(tradeCap(resources, "wood", "stone")).toBe(30); // 理論 33，畫面 30
     let trade = { from: "wood", to: "stone", amount: 10 };
     expect(stepTrade(trade, resources, -1).amount).toBe(10);
-    trade = stepTrade(trade, resources, 1);
-    expect(trade.amount).toBe(20);
-    trade = maxTrade(trade, resources);
+    trade = maxTrade(stepTrade(trade, resources, 1), resources);
     expect(trade.amount).toBe(30);
     expect(stepTrade(trade, resources, 1).amount).toBe(30);
     expect(tradePreview(trade)).toEqual({ give: 90, get: 30 });
+
+    let scrolls = { from: "parchment", to: "wood", amount: 1 };
+    scrolls = stepTrade(scrolls, resources, 1);
+    expect(scrolls.amount).toBe(2);
+    expect(maxTrade(scrolls, resources).amount).toBe(7);
+    expect(tradePreview(maxTrade(scrolls, resources))).toEqual({ give: 7, get: 70 });
+    // 換進羊皮卷：木材 100 → 3 張（付 90）
+    expect(tradeCap(resources, "wood", "parchment")).toBe(3);
   });
 
-  test("換成自己的選項會自動讓開；換「付出」的資源時數量重新夾住", () => {
-    const resources = stock(300, 60, 0, 0);
+  test("換成自己的選項會自動讓開；換資源後次數回到那一對的一個 step", () => {
+    const resources = stock(300, 60, 0, 5);
     let trade = { from: "wood", to: "stone", amount: 70 };
-    trade = setTradeFrom(trade, resources, "stone"); // 石材 60 → 20 份
+    trade = setTradeFrom(trade, resources, "stone");
     expect(trade.from).toBe("stone");
     expect(trade.to).not.toBe("stone");
-    expect(trade.amount).toBe(20);
     trade = setTradeTo(trade, resources, "stone");
     expect(trade.to).toBe("stone");
     expect(trade.from).not.toBe("stone");
+    expect(setTradeTo({ from: "wood", to: "stone", amount: 70 }, resources, "parchment").amount).toBe(1);
   });
 
-  test("庫存在交易後變少：數量跟著收斂；選到的資源不存在就退回預設", () => {
+  test("庫存在交易後變少：次數跟著收斂；選到的資源不存在就退回預設", () => {
     expect(normalizeTrade({ from: "wood", to: "stone", amount: 90 }, stock(70, 0, 0, 0)).amount).toBe(20);
     expect(normalizeTrade({ from: "gold", to: "stone", amount: 10 }, stock(70, 0, 0, 0)).from).toBe("wood");
   });

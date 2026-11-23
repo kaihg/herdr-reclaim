@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { commitContexts, ingestCommits } from "../core/commit-evidence.js";
 import { CityLedger } from "../core/ledger.js";
-import { defaultTrade, dockState, maxTradeAmount } from "../core/dock.js";
+import { canPay, defaultTrade, dockState, maxTradeAmount } from "../core/dock.js";
 import { ingestScenario, processBoost, processBuild, processLand, processTrade, redispatch } from "../core/ingest.js";
 import { RECIPES, RULES_VERSION } from "../core/rules.js";
 import { readTownFromLedger, selectionDetail } from "../core/town.js";
@@ -145,25 +145,39 @@ describe("加速（§7.6、§17.1 情境 6）", () => {
 });
 
 describe("市集（§7.6、§11）", () => {
-  test("同城任兩種資源 3 換 1；庫存不足時整筆不執行，不會有部分交易", async () => {
+  test("費率依配對：羊皮卷 → 其他 1 換 10、其他 → 羊皮卷 30 換 1、其他之間 3 換 1；庫存不足整筆不執行", async () => {
     const ledger = await townWith("trade", 5);
-    await credit(ledger, { parchment: 3, wood: 2 });
+    await credit(ledger, { parchment: 3, wood: 31 });
     const traded = await processTrade(ledger, { from: "parchment", to: "wood", amount: 1, at: T(600_000) });
     expect(traded.status).toBe("applied");
     let city = (await townOf(ledger)).cities[0];
-    expect({ ...city.resources }).toEqual({ wood: 3, stone: 0, iron: 0, parchment: 0 });
-    expect(city.market.in.wood).toBe(1); // 市集轉入與 commit 直接發放分開記錄
-    expect(city.market.out.parchment).toBe(3);
-    // 從 0 的庫存換不出東西；從 3 想換 2 份需要 6，也整筆拒絕（不會先扣 3 再補）。
+    expect({ ...city.resources }).toEqual({ wood: 41, stone: 0, iron: 0, parchment: 2 });
+    expect(city.market.in.wood).toBe(10); // 市集轉入與 commit 直接發放分開記錄
+    expect(city.market.out.parchment).toBe(1);
+    // 木材 → 羊皮卷：30 換 1。
+    expect((await processTrade(ledger, { from: "wood", to: "parchment", amount: 1, at: T(650_000) })).status).toBe("applied");
+    city = (await townOf(ledger)).cities[0];
+    expect({ ...city.resources }).toEqual({ wood: 11, stone: 0, iron: 0, parchment: 3 });
+    // 其他之間 3 換 1：木材 11 最多換 3 次。
+    expect((await processTrade(ledger, { from: "wood", to: "stone", amount: 3, at: T(660_000) })).status).toBe("applied");
+    expect({ ...(await townOf(ledger)).cities[0].resources }).toEqual({ wood: 2, stone: 3, iron: 0, parchment: 3 });
+    // 庫存不足：整筆拒絕，不會先扣再補。
     const short = await processTrade(ledger, { from: "iron", to: "stone", amount: 1, at: T(700_000) });
     expect(short).toMatchObject({ status: "rejected", reason: "insufficient_resources" });
-    const partial = await processTrade(ledger, { from: "wood", to: "stone", amount: 2, at: T(750_000) });
+    const partial = await processTrade(ledger, { from: "wood", to: "stone", amount: 1, at: T(750_000) });
     expect(partial).toMatchObject({ status: "rejected", reason: "insufficient_resources" });
-    city = (await townOf(ledger)).cities[0];
-    expect({ ...city.resources }).toEqual({ wood: 3, stone: 0, iron: 0, parchment: 0 }); // 整筆不執行
+    expect({ ...(await townOf(ledger)).cities[0].resources }).toEqual({ wood: 2, stone: 3, iron: 0, parchment: 3 });
 
     const invalid = await processTrade(ledger, { from: "wood", to: "wood", amount: 1, at: T(800_000) });
     expect(invalid).toMatchObject({ status: "rejected", reason: "invalid_trade" });
+  });
+
+  test("往返有損耗：1 張羊皮卷換成 10 木材，換不回 1 張（要 30 個）", async () => {
+    const ledger = await townWith("trade-loss", 5);
+    await credit(ledger, { parchment: 1 });
+    await processTrade(ledger, { from: "parchment", to: "wood", amount: 1, at: T(600_000) });
+    const back = await processTrade(ledger, { from: "wood", to: "parchment", amount: 1, at: T(700_000) });
+    expect(back).toMatchObject({ status: "rejected", reason: "insufficient_resources" });
   });
 
   test("市集是整座城的功能：不論選到哪一格都可用；交易後庫存與市集欄位跟著更新，詳情不再列配對", async () => {
@@ -180,19 +194,18 @@ describe("市集（§7.6、§11）", () => {
     for (const detail of [center, tileDetail(0, -1), tileDetail(2, 0), tileDetail(5, 5)]) {
       expect(dockState({ detail, hasLedgerCity: true }).market.enabled).toBe(true);
     }
-    // 木材 1 換不出；羊皮卷 3 在帳本上換得出 1 份，但畫面一次至少 10 份，所以動作列沒有可選的數量。
+    // 木材 1 付不起；羊皮卷 3 張可以換 3 次（每次 1 換 10），動作列預設就以羊皮卷付出。
     const resources = stocked.cities[0].resources;
-    expect(maxTradeAmount(resources, "wood")).toBe(0);
-    expect(maxTradeAmount(resources, "parchment")).toBe(1);
-    expect(defaultTrade(resources).amount).toBe(0);
-    const trade = { from: "parchment", amount: 1 }; // 帳本仍接受 1 份
+    expect(canPay(resources, "wood")).toBe(false);
+    expect(maxTradeAmount(resources, "parchment", "wood")).toBe(3);
+    expect(defaultTrade(resources)).toMatchObject({ from: "parchment", amount: 1 });
 
-    expect((await processTrade(ledger, { from: trade.from, to: "wood", amount: trade.amount, at: T(600_000) })).status)
+    expect((await processTrade(ledger, { from: "parchment", to: "wood", amount: 3, at: T(600_000) })).status)
       .toBe("applied");
     const town = await townOf(ledger);
-    expect({ ...town.cities[0].resources }).toEqual({ wood: 2, stone: 0, iron: 0, parchment: 0 });
-    expect(centerOf(town).fields.find((field) => field.label === "市集").value).toBe("轉入 木材 1 · 轉出 羊皮卷 3");
-    expect(defaultTrade(town.cities[0].resources).amount).toBe(0); // 木材 2 也換不出
+    expect({ ...town.cities[0].resources }).toEqual({ wood: 31, stone: 0, iron: 0, parchment: 0 });
+    expect(centerOf(town).fields.find((field) => field.label === "市集").value).toBe("轉入 木材 30 · 轉出 羊皮卷 3");
+    expect(defaultTrade(town.cities[0].resources)).toMatchObject({ from: "wood", amount: 10 }); // 木材 31 可以換 10 次（3 換 1）
   });
 
   test("一次換多份：amount 3 扣 9 換 3，帳本直接支援，畫面只是調整數量", async () => {
@@ -304,19 +317,19 @@ describe("兩個畫面競爭同一筆操作（CAS）", () => {
     const city = (await townOf(a)).cities[0];
     expect([city.resources.wood, city.resources.stone, city.tiles[0].landStage]).toEqual([0, 0, "built"]);
 
-    // 市集：庫存剛好 3 張羊皮卷，兩個畫面同時想換木材。
+    // 市集：庫存 3 張羊皮卷，兩個畫面各想換 2 次（共 4 張）：只有一筆成立。
     const market = await townWith("race-trade", 5);
     await credit(market, { parchment: 3 });
     const marketDir = market.dir;
     const c = await new CityLedger({ io: createFileIo(), dir: marketDir, cityId: CITY }).open();
     const d = await new CityLedger({ io: createFileIo(), dir: marketDir, cityId: CITY }).open();
     const trades = await Promise.all([
-      processTrade(c, { from: "parchment", to: "wood", amount: 1, at: T(600_000) }),
-      processTrade(d, { from: "parchment", to: "wood", amount: 1, at: T(600_001) }),
+      processTrade(c, { from: "parchment", to: "wood", amount: 2, at: T(600_000) }),
+      processTrade(d, { from: "parchment", to: "wood", amount: 2, at: T(600_001) }),
     ]);
     expect(trades.filter((result) => result.status === "applied")).toHaveLength(1);
     const marketCity = (await townOf(c)).cities[0];
-    expect([marketCity.resources.parchment, marketCity.resources.wood]).toEqual([0, 1]);
+    expect([marketCity.resources.parchment, marketCity.resources.wood]).toEqual([1, 20]);
 
     // 撤回後座標被別的遠征佔走：舊的一代不再佔著座標，加速整筆不成立。
     const racing = await townWith("race-withdraw", 5);

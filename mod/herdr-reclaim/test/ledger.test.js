@@ -667,7 +667,7 @@ describe("checkpoint 的內容完整性：被改過就不能當資料", () => {
 
   test("ops 子頁內容被換掉（筆數不變）：已落帳的操作不會再執行一次", async () => {
     const city = await checkpointedCity("tamper-ops", { pageLimit: 700 });
-    const trade = { opId: "trade:one", kind: "trade", at: AT, cityId: CITY_ID, from: "wood", to: "stone", amount: 2, rate: 3 };
+    const trade = { opId: "trade:one", kind: "trade", at: AT, cityId: CITY_ID, from: "wood", to: "stone", amount: 2, give: 3, get: 1 };
     const ledger = await open(city.dir, createFileIo(), city.options);
     expect((await ledger.submit(() => trade)).status).toBe("applied");
     const { seq } = await ledger.checkpoint();

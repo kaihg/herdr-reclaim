@@ -32,7 +32,7 @@ import { BlobStore } from "./blobs.js";
 import { byteLen, canonicalJson, hashText } from "./bytes.js";
 import { casWrite, rejectUnlessConflict } from "./cas.js";
 import { PrefixIndex } from "./pages.js";
-import { BOOST_POINTS_PER_PARCHMENT, CLEAR_POINTS, RECIPES, RESEARCH_TOKENS_PER_PARCHMENT, RESOURCES, RULES_VERSION, TRADE_RATE, affordable } from "./rules.js";
+import { BOOST_POINTS_PER_PARCHMENT, CLEAR_POINTS, RECIPES, RESEARCH_TOKENS_PER_PARCHMENT, RESOURCES, RULES_VERSION, LEGACY_TRADE_GIVE, affordable, tradeTerms } from "./rules.js";
 import { historyRecordOf } from "./history.js";
 
 export { byteLen, hashText };
@@ -418,7 +418,8 @@ export const KINDS = {
     },
   },
   /**
-   * 市集（§7.6、§11）：同城任兩種資源 3 換 1，一次一筆 CAS。庫存不足時整筆不執行，
+   * 市集（§7.6、§11）：同城任兩種資源依配對的費率交換（見 rules.js 的 tradeTerms），一次一筆 CAS。
+   * 庫存不足時整筆不執行，
    * 不會產生部分交易。市集轉入與轉出另外記，跟 commit 的直接發放分開（§11）。
    */
   trade: {
@@ -428,16 +429,20 @@ export const KINDS = {
       const invalid = !RESOURCES.includes(op.from) || !RESOURCES.includes(op.to) || op.from === op.to ||
         !Number.isInteger(amount) || amount <= 0;
       if (invalid) return "invalid_trade";
-      if (Number(state.resources[op.from] ?? 0) < amount * TRADE_RATE) return "insufficient_resources";
+      const terms = tradeTerms(op.from, op.to);
+      if (op.give !== terms.give || op.get !== terms.get) return "rate_mismatch";
+      if (Number(state.resources[op.from] ?? 0) < amount * terms.give) return "insufficient_resources";
       return null;
     },
     apply(state, entry) {
       const amount = Number(entry.amount);
-      const spent = amount * TRADE_RATE;
+      // 紀錄裡存了當時的費率；規則版本 2 以前的紀錄沒有，一律是 3 換 1。
+      const spent = amount * Number(entry.give ?? LEGACY_TRADE_GIVE);
+      const received = amount * Number(entry.get ?? 1);
       state.resources[entry.from] = Number(state.resources[entry.from] ?? 0) - spent;
-      state.resources[entry.to] = Number(state.resources[entry.to] ?? 0) + amount;
+      state.resources[entry.to] = Number(state.resources[entry.to] ?? 0) + received;
       state.market.out[entry.from] = Number(state.market.out[entry.from] ?? 0) + spent;
-      state.market.in[entry.to] = Number(state.market.in[entry.to] ?? 0) + amount;
+      state.market.in[entry.to] = Number(state.market.in[entry.to] ?? 0) + received;
     },
   },
   /**

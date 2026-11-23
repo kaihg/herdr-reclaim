@@ -7,7 +7,7 @@ import observed from "../../../spikes/s5/observed.json";
 import { CityLedger } from "../core/ledger.js";
 import { ingestScenario } from "../core/ingest.js";
 import { QUOTA_TTL_MS, basisNote, factionOf, factionOfProvider, formatClock, investmentRows, quotaLines, readQuotas } from "../core/provider-stats.js";
-import { CLEAR_POINTS, RECIPES, TRADE_RATE } from "../core/rules.js";
+import { CLEAR_POINTS, RECIPES, tradeTerms } from "../core/rules.js";
 import { readTown, readTownFromLedger, selectionDetail } from "../core/town.js";
 import { createFileIo } from "./fs-io.js";
 
@@ -380,7 +380,7 @@ describe("派系與額度不改變數值（§9、§17.1 情境 8）", () => {
     expect(withFaction.cities[0].resources).toEqual(without.cities[0].resources);
     expect(withFaction.cities[0].resources).toEqual({ wood: 20, stone: 20, iron: 5, parchment: 0 });
     expect(a.buildable.map((recipe) => recipe.costs)).toEqual(a.buildable.map((recipe) => RECIPES[recipe.name].costs));
-    expect(TRADE_RATE).toBe(3);
+    expect(tradeTerms("wood", "stone")).toMatchObject({ give: 3, get: 1 });
     expect(a.faction.name).toBe("Anthropic");
     expect(b.faction.name).toBe("無派系");
     expect(formatClock(0)).toBe("未知");
