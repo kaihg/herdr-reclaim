@@ -288,7 +288,10 @@ describe("帳本重建城鎮", () => {
     const unresolvedRecord = activity({
       sessionId,
       writerEpoch: "unresolved",
-      events: [{ kind: "visit_start", at: AT, visit: { visitId: "unresolved-visit", cwd, commonDir: null, checkout: null } }],
+      events: [
+        { kind: "visit_start", at: AT, visit: { visitId: "unresolved-visit", cwd, commonDir: null, checkout: null } },
+        { kind: "interval_open", at: AT + 1 },
+      ],
     });
     const unresolved = {
       sessionId,
@@ -309,16 +312,33 @@ describe("帳本重建城鎮", () => {
 
     const repaired = {
       ...unresolvedRecord,
-      events: unresolvedRecord.events.map((event) => ({
+      events: unresolvedRecord.events.map((event) => event.visit ? {
         ...event,
         visit: { ...event.visit, cwd: CITY.checkout, commonDir: CITY.commonDir, checkout: CITY.checkout },
-      })),
+      } : event),
     };
     const ledger = await open(newDir());
     await ingestScenario(ledger, { activities: [repaired], repoFacts: firstExpedition.repoFacts }, CITY.commonDir);
     const attributed = await townOfLedger(ledger);
     expect(attributed.cities[0].tiles.map((tile) => tile.rootSessionId)).toEqual([sessionId]);
     expect(attributed.unresolvedActivities).toEqual([]);
+  });
+
+  test("還沒開始對話（沒有 agent_start）的 session 不佔土地；第一次對話後才建格", async () => {
+    const sessionId = "silent-new-session";
+    const visit = { visitId: "silent-visit", cwd: CITY.checkout, commonDir: CITY.commonDir, checkout: CITY.checkout };
+    const silent = activity({
+      sessionId,
+      writerEpoch: "silent",
+      events: [{ kind: "visit_start", at: AT, visit }],
+    });
+    const ledger = await open(newDir());
+    await ingestScenario(ledger, { activities: [silent], repoFacts: firstExpedition.repoFacts }, CITY.commonDir);
+    expect((await townOfLedger(ledger)).cities.flatMap((city) => city.tiles)).toEqual([]);
+
+    const talked = { ...silent, events: [...silent.events, { kind: "interval_open", at: AT + 1 }] };
+    await ingestScenario(ledger, { activities: [talked], repoFacts: firstExpedition.repoFacts }, CITY.commonDir);
+    expect((await townOfLedger(ledger)).cities[0].tiles.map((tile) => tile.rootSessionId)).toEqual([sessionId]);
   });
 
   test("已收成的格子經公開讀取模型就不再提供撤回或封存", async () => {

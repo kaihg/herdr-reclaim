@@ -461,9 +461,13 @@ function replayTown(replay, place) {
   };
 }
 
-/** 只有互動的 root 與互動的 fork 建格；child 與 print／headless 不建格（§1、§6.1）。 */
+/**
+ * 只有互動的 root 與互動的 fork 建格；child 與 print／headless 不建格（§1、§6.1）。
+ * 還沒有任何工作區間（沒有 agent_start）的 session 也不建格：/new 之後沒講話的 session
+ * 在 omp 裡也無法 resume，不佔土地；第一次對話開始時才取得土地。
+ */
 function createsTile(session) {
-  return session.interactive && session.role !== "child";
+  return session.interactive && session.role !== "child" && session.intervals.length > 0;
 }
 
 function cityFor(cities, cityId, checkout) {
