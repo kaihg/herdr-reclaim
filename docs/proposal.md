@@ -425,7 +425,7 @@ herdr 一次只能讀 1 MiB（`herdr.d.ts:27-29`），所以**每個檔案都必
 
 ### 15.2 循序驗證：S8、S5（2026-11-19）
 
-**S8 尚未通過。** 可重跑：`sh spikes/s8/hook-matrix.sh`。測試使用暫存 repo，隔離全域 Git 設定，結束自動清除；沒有安裝到使用者的城。
+**S8 尚未通過（2026-11-19 快照；後續結果見本節末的 2026-11-20 更新）。** 可重跑：`sh spikes/s8/hook-matrix.sh`。測試使用暫存 repo，隔離全域 Git 設定，結束自動清除；沒有安裝到使用者的城。
 
 | 操作（Apple Git 2.50.1） | 實際 hook |
 |---|---|
@@ -438,9 +438,11 @@ herdr 一次只能讀 1 MiB（`herdr.d.ts:27-29`），所以**每個檔案都必
 - 第一父節點 diff、初始 commit `--root`、rewrite 的舊／新 SHA 對照均有斷言通過。amend／rebase 會重複通知，不能按 hook 次數發資源。
 - 測試安裝器尊重 repo-local `core.hooksPath`；既有 hook 收到原參數與 rewrite stdin，即使回傳 7，記錄器仍回傳 0；Husky／已追蹤的 hook 路徑會拒絕直接安裝。這是 spike，不是正式安裝器。
 - OMP **bash** 路徑的 hook 有 `PI_SESSION_ID`、`PI_TOOL_CALL_ID`。同一次 bash 工具呼叫內，模擬 IDE 提交只保留 `HC_TERMINAL_ID`、移除 session 變數，該 SHA 沒有 agent 身分；不能用 terminal ID 自動歸戶。
-- OMP **eval `commit` namespace** 的隔離實測：`post-commit` 有執行，但 `PI_SESSION_ID` 與 `PI_TOOL_CALL_ID` 都是空值，只有 `HC_TERMINAL_ID=t58`。這證明 **hook 環境變數不足以辨認來源**，不是 OMP 完全沒有來源紀錄。後續已在目前 session 的 `changes.jsonl` 核對四筆精確提交 SHA，包含測試提交 `10a36617b5395ca0a8ad819ed68e532d70e4a31b`；可由 adapter 讀取並與 hook 配對，不必猜相鄰工具呼叫。實機證據、v18.22.0 原始碼與中斷／跨 repo 限制見 [提交來源查證](../spikes/s8/commit-attribution.md)。**正式整合尚未實作，S8 仍未通過。**
+- OMP **eval `commit` namespace** 的隔離實測：`post-commit` 有執行，但 `PI_SESSION_ID` 與 `PI_TOOL_CALL_ID` 都是空值，只有 `HC_TERMINAL_ID=t58`。這證明 **hook 環境變數不足以辨認來源**，不是 OMP 完全沒有來源紀錄。後續已在目前 session 的 `changes.jsonl` 核對四筆精確提交 SHA，包含測試提交 `10a36617b5395ca0a8ad819ed68e532d70e4a31b`；可由 adapter 讀取並與 hook 配對，不必猜相鄰工具呼叫。實機證據、v18.22.0 原始碼與中斷／跨 repo 限制見 [提交來源查證](../spikes/s8/commit-attribution.md)。**當時正式整合尚未實作。**
 - 關閉 hook 的提交可由 reflog 找到，但沒有來源證據。正式帳本尚未接線，所以「不發資源」目前僅是規格，沒有端到端驗證。
 - Python spike 記錄器 50 次：中位數 **61.27 ms**、p95 **64.34 ms**、最大 **66.01 ms**，未達 50 ms。這只量測新記錄器；既有 hook 的執行時間不受本 mod 控制，§7.1 的總耗時保證仍須釐清。
+- **2026-11-20 更新：[#6](https://github.com/kaihg/herdr-reclaim/issues/6) 已結案，兩項未過都已解決。** selective commit 的來源改用 OMP session artifacts：extension 讀 `changes.jsonl`，把每個 `type: commit` 的 SHA 寫成 `sources/<sha>.omp.<session>.json` 憑證（`omp-extension/herdr-reclaim.ts:212-240`）；mod 讀 `commits/`（hook 寫的）與 `sources/`（extension 寫的），依 SHA 配對（`mod/herdr-reclaim/core/commit-evidence.js`）。recorder 改寫後 100 次 p95 33.47 ms（目標 ≤50 ms）。
+- 因此 **bash 執行 `git commit` 與 eval `commit` namespace 兩條路都會自動收成**：前者靠 hook 環境的 `PI_SESSION_ID`，後者靠 OMP artifacts 的精確 SHA。沒有「agent 必須用 bash 執行 git commit」這條規則，也不需要。已知限制只剩巢狀 OMP 且環境變數衝突時視為來源不明。
 
 **S5 CLI spike 通過；正式城鎮 UI 尚未接線。** 指令：`omp usage --json --redact --no-extensions`，`generatedAt=1795082919780`。原始數值與擷取時間保存在 `spikes/s5/observed.json`（移除帳號識別欄位）；執行 `python3 spikes/s5/show.py`，已觀察到 Databricks 顯示「未知（沒有 provider report）」、無額度的 Codex 帳號另列未知，不和已知帳號合併。
 
