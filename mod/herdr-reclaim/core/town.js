@@ -34,6 +34,7 @@ export function mergeActivities(records) {
       continue;
     }
     merged.events = dedupeEvents([...merged.events, ...events]);
+    if ((record.updatedAt ?? 0) >= (merged.updatedAt ?? 0) && record.sessionName) merged.sessionName = record.sessionName;
     merged.updatedAt = Math.max(merged.updatedAt ?? 0, record.updatedAt ?? 0);
   }
   return [...byWriter.values()].sort((a, b) =>
@@ -331,7 +332,7 @@ export function readTownFromLedger(replay = {}) {
       const sources = sessions.filter((session) =>
         rootOf(session) === tile.rootSessionId && session.visits.some((visit) => visit.commonDir === tile.cityId));
       const visits = root?.visits.filter((visit) => visit.commonDir === tile.cityId) ?? [];
-      return finishTile({ ...tile, sources, visits });
+      return finishTile({ ...tile, sources, visits, sessionName: replay.sessionNames?.[tile.rootSessionId] ?? null });
     });
   }
   for (const city of town.cities) {
@@ -549,6 +550,7 @@ function finishTile(tile) {
     x: tile.x,
     y: tile.y,
     rootSessionId: tile.rootSessionId,
+    sessionName: tile.sessionName ?? null,
     generation: tile.generation,
     activatedAt: tile.activatedAt,
     deactivatedAt: tile.deactivatedAt,
@@ -685,7 +687,7 @@ function expeditionDetail(city, tile) {
     rootSessionId: tile.rootSessionId,
     generation: tile.generation,
     tile: { x: tile.x, y: tile.y, landStage: tile.landStage ?? "reserved", harvested: tile.harvested === true },
-    title: `遠征 ${shortId(tile.rootSessionId)} · 第 ${tile.generation} 代`,
+    title: tile.sessionName?.trim() ? `${tileLabel(tile)}${tile.generation > 1 ? ` · 第 ${tile.generation} 代` : ""}` : `遠征 ${shortId(tile.rootSessionId)} · 第 ${tile.generation} 代`,
     statusLabel: tile.status === "active" ? "探索中" : "駐紮",
     points: tile.points,
     pointsTarget: CLEAR_POINTS,
@@ -821,6 +823,15 @@ export function formatMarket(market = {}) {
   const outSide = entries("out");
   if (!inSide.length && !outSide.length) return "還沒有交易";
   return `轉入 ${inSide.join("・") || "無"} · 轉出 ${outSide.join("・") || "無"}`;
+}
+
+/**
+ * 土地的顯示名稱：綁定的 session 的名稱（omp 的 session title，使用者可以改）；
+ * 還沒有名稱時退回短 id，不讓畫面出現空白。
+ */
+export function tileLabel(tile) {
+  const name = typeof tile.sessionName === "string" ? tile.sessionName.trim() : "";
+  return name || `遠征 ${shortId(tile.rootSessionId)}`;
 }
 
 function shortId(sessionId) {

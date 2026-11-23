@@ -17,7 +17,7 @@
 import { View, div } from "gpui-kit";
 import { InputState, h_flex, v_flex } from "gpui-base";
 import { appHome, checking, exec, panes, props, readTextFile, settings, spaces, theme, watchFolder, writeTextFile } from "herdr";
-import { ADAPTER_DIR, activityDir, adapterRoot, citiesOf, loadActivities, repoFactsOf } from "./core/adapter.js";
+import { ADAPTER_DIR, activityDir, adapterRoot, citiesOf, loadActivities, repoFactsOf, sessionNamesOf } from "./core/adapter.js";
 import { commitContexts, ingestCommits, loadCommitEvidence, parseRawDiff, parseReflogEvidence, unharvestedCommitReasons } from "./core/commit-evidence.js";
 import { MAP_RADIUS, cameraFor, clampCamera, contentSize, ensureVisible, isCenterCell, keyOf, panCamera, revealedKeys, visibleRect } from "./core/grid.js";
 import { ingestResearch, ingestScenario, processBoost, processBuild, processLand, processTrade, redispatch } from "./core/ingest.js";
@@ -28,7 +28,7 @@ import { RESEARCH_TOKENS_PER_PARCHMENT, RESOURCE_LABELS, RULES_VERSION } from ".
 import { defaultSelection, parseUi, resolveSelection, selectionOf, serializeUi, withDev, withHookChoice, withSelection } from "./core/selection.js";
 import { QUOTA_SOURCE, parseQuotaReport } from "./core/quota-source.js";
 import { quotaView, readQuotaView } from "./core/quota-view.js";
-import { CLEAR_POINTS, emptyCity, formatResearch, readTown, readTownFromLedger, selectionDetail } from "./core/town.js";
+import { CLEAR_POINTS, emptyCity, formatResearch, readTown, readTownFromLedger, selectionDetail, tileLabel } from "./core/town.js";
 import { cityForFolders } from "./core/space-city.js";
 import { firstExpedition } from "./scenarios/first-expedition.js";
 import {
@@ -263,6 +263,7 @@ async function loadTown(io) {
   return readTownFromLedger({
     activities: stored,
     expeditions,
+    sessionNames: sessionNamesOf(activities),
     repoFacts,
     resources,
     research,
@@ -306,6 +307,9 @@ async function refreshTown(io, previous) {
     expeditions,
     repoFacts,
     resources,
+    // 名稱不進帳本：沿用上一份城鎮模型裡各格的名稱（重讀活動檔時才會更新）。
+    sessionNames: Object.fromEntries((previous?.cities ?? []).flatMap((city) => city.tiles)
+      .filter((tile) => tile.sessionName).map((tile) => [tile.rootSessionId, tile.sessionName])),
     research,
     market,
     unresolvedActivities: previous?.unresolvedActivities ?? [],
@@ -1028,7 +1032,9 @@ export default class Town extends View {
           .child(div().size(7).rounded_full().bg(status.color))
           .child(div().text_size(11).text_color(status.color).child(status.label))
           .child(stageBadge(tile, t)),
-        div().text_size(12.5).font_semibold().truncate().child(`遠征 ${shortId(tile.rootSessionId)} · 第 ${tile.generation} 代`),
+        div().text_size(12.5).font_semibold().truncate().child(
+          tile.sessionName?.trim() ? `${tileLabel(tile)}${tile.generation > 1 ? ` · 第 ${tile.generation} 代` : ""}` : `遠征 ${shortId(tile.rootSessionId)} · 第 ${tile.generation} 代`,
+        ),
         div().text_size(11).text_color(t.muted).truncate().child(
           this.devMode ? `${tile.points} / ${CLEAR_POINTS} · ${tile.cli ?? "未知"}` : `${tile.points} / ${CLEAR_POINTS}`,
         ),

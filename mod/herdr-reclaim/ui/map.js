@@ -245,7 +245,7 @@ function cell(entry, selection, t, tile, origin, radius, onPick, camera) {
     ground ? tilePath(fillPath(PLOT_DIAMOND), Background.solid(t[ground.token] ?? t.muted).opacity(0.35), tile) : null,
     building ? buildingMark(building, tile, factionColor) : null,
     tilePath(outline, entry.landStage === "built" ? factionColor : selected ? t.accent : t.muted, tile),
-    markBox(`${entry.status === "active" ? "●" : "○"} ${String(entry.rootSessionId).slice(0, 8)}`, t, tile, t.foreground),
+    markBox(`${entry.status === "active" ? "●" : "○"} ${cellName(entry)}`, t, tile, t.foreground),
   ].filter(Boolean));
 }
 
@@ -280,4 +280,11 @@ function markBox(label, t, tile, color) {
 /** 格子最小 56 px，所以標籤一定看得清楚（不再隨 pane 縮小而互相重疊）。 */
 function labelSize(tile) {
   return Math.max(8, Math.min(10, Math.round(tile.w / 9)));
+}
+
+/** 格子上放得下的短名稱：session 名稱前幾個字（以字元計，不切壞 emoji），沒有名稱就用短 id。 */
+function cellName(entry) {
+  const name = typeof entry.sessionName === "string" ? Array.from(entry.sessionName.trim()) : [];
+  if (!name.length) return String(entry.rootSessionId).slice(0, 8);
+  return name.length > 7 ? `${name.slice(0, 6).join("")}…` : name.join("");
 }

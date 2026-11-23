@@ -80,6 +80,8 @@ interface Activity {
   interactive: boolean;
   writerEpoch: string;
   events: ActivityEvent[];
+  /** omp 的 session 名稱（title）；還沒有名稱時沒有這個欄位。 */
+  sessionName?: string;
   updatedAt: number;
 }
 
@@ -100,6 +102,7 @@ interface SessionManagerView {
   getCwd(): string;
   getHeader(): { parentSession?: string } | null;
   getEntries(): SessionEntryView[];
+  getSessionName?(): string | undefined;
 }
 
 interface HandlerContext {
@@ -320,6 +323,19 @@ class Writer {
     this.activity.updatedAt = Math.max(this.activity.updatedAt, at);
   }
 
+  /**
+   * session 名稱（omp 的 session title）：自動產生的標題在第一輪之後才出現，使用者也可以改，
+   * 所以每次 handler 與 heartbeat 都重讀；名稱是 activity 的頂層欄位，下一次寫檔就會帶出去。
+   */
+  refreshName(ctx: HandlerContext) {
+    try {
+      const name = ctx.sessionManager.getSessionName?.()?.trim();
+      if (name && name !== this.activity.sessionName) this.activity.sessionName = name;
+    } catch (error) {
+      logError("sessionName", error);
+    }
+  }
+
   /** 寫檔；順便把已經 ack 的事件刪掉（§6.2：只能刪 eventSeq ≤ ackedEventSeq）。 */
   flush() {
     try {
@@ -434,6 +450,7 @@ export default function (pi: ExtensionApi) {
           ctx,
           timer: ctx.setInterval(() => {
             if (writer !== started) return; // 換手之後舊 timer 不再寫
+            started.refreshName(ctx);
             started.heartbeat(Date.now());
           }, HEARTBEAT_MS),
         };
@@ -441,6 +458,7 @@ export default function (pi: ExtensionApi) {
         logError("setInterval", error);
       }
     }
+    writer.refreshName(ctx);
     return writer;
   }
 

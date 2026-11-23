@@ -42,6 +42,20 @@ export async function loadActivities(io, dir) {
   return mergeActivities(records);
 }
 
+/**
+ * 每個 session 目前的名稱（omp 的 session title）：取「最後更新的那份活動檔」裡的名稱。
+ * 名稱不進城帳本（它會被使用者改，不是歷史事實），每次重讀活動檔時重新取得。
+ */
+export function sessionNamesOf(activities) {
+  const latest = new Map();
+  for (const record of activities ?? []) {
+    if (typeof record.sessionName !== "string" || !record.sessionName.trim()) continue;
+    const current = latest.get(record.sessionId);
+    if (!current || (record.updatedAt ?? 0) >= (current.updatedAt ?? 0)) latest.set(record.sessionId, record);
+  }
+  return Object.fromEntries([...latest].map(([sessionId, record]) => [sessionId, record.sessionName.trim()]));
+}
+
 /** 這些活動碰到的城（§13：一個帳本只管一座城）。 */
 export function citiesOf(activities) {
   const ids = new Set();

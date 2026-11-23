@@ -113,6 +113,28 @@ describe("OMP extension 寫入遠征活動檔", () => {
     expect(readActivity("root-id")).toHaveLength(2);
     expect(readActivity("root-id").map((record) => record.writerEpoch).sort()).toHaveLength(2);
   });
+
+  test("session 名稱（title）寫進活動檔頂層，之後被改名也會更新；沒有名稱時沒有這個欄位", () => {
+    const handlers = new Map();
+    install({ on: (name, handler) => handlers.set(name, handler) });
+    const fire = (name, payload, ctx) => handlers.get(name)(payload, ctx);
+    let title;
+    const ctx = context({ sessionId: "named-id" });
+    ctx.sessionManager.getSessionName = () => title;
+
+    fire("session_start", {}, ctx);
+    fire("agent_start", {}, ctx);
+    expect(readActivity("named-id")[0].sessionName).toBeUndefined();
+
+    title = "🏘️ TOWN: 第一版";
+    fire("agent_end", {}, ctx);
+    expect(readActivity("named-id")[0].sessionName).toBe("🏘️ TOWN: 第一版");
+
+    title = "使用者改名";
+    fire("agent_start", {}, ctx);
+    fire("agent_end", {}, ctx);
+    expect(readActivity("named-id")[0].sessionName).toBe("使用者改名");
+  });
   test("selective commit 的 artifacts 只寫入同一個精確 SHA 的來源憑證", () => {
     const handlers = new Map();
     install({ on: (name, handler) => handlers.set(name, handler) });
