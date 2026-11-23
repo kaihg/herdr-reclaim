@@ -636,10 +636,10 @@ function detail(kind, city, tile, title, statusLabel, fields) {
     statusLabel,
     points: null,
     pointsTarget: null,
-    // 下方三個欄位是 §7.6 的操作入口：庫存足夠的配方、這一格能不能加速、市集可換的配對。
+    // 蓋房、加速的條件（§7.6）；操作入口在底部動作列。
     buildable: [],
+    buildBlocked: null,
     boost: null,
-    market: [],
     harvests: [],
     // 派系、投入與行會人力只影響顯示（§9）：遠征給自己的，中央格給整座城與帳號額度。
     faction: null,
@@ -650,19 +650,12 @@ function detail(kind, city, tile, title, statusLabel, fields) {
   };
 }
 
-/** 市集（§7.6）：3 換 1，列出庫存換得起的所有配對，畫面只顯示這些。 */
-function marketDetail(city) {
-  if (!city) return [];
-  const pairs = [];
-  for (const from of Object.keys(RESOURCE_LABELS)) {
-    const amount = Math.floor(Number(city.resources?.[from] ?? 0) / TRADE_RATE);
-    if (amount <= 0) continue;
-    for (const to of Object.keys(RESOURCE_LABELS)) {
-      if (to === from) continue;
-      pairs.push({ from, to, amount, label: `${RESOURCE_LABELS[from]} → ${RESOURCE_LABELS[to]}` });
-    }
-  }
-  return pairs;
+/** 這一格現在不能蓋房的原因；null＝可以蓋（庫存夠不夠由動作列的面板另外標示）。 */
+function buildBlockedReason(tile) {
+  if (tile.landStage === "withdrawn" || tile.landStage === "archived") return "這一格已撤回或封存";
+  if (tile.landStage === "built") return "這一格已經蓋了房";
+  if (tile.landStage !== "cleared") return "這一格還沒開墾完成（要滿 100 點）";
+  return null;
 }
 
 function expeditionDetail(city, tile) {
@@ -694,11 +687,10 @@ function expeditionDetail(city, tile) {
     pointsTarget: CLEAR_POINTS,
     actions,
     actionUnavailableReason: tile.harvested ? "已有 commit 收成，不能撤回或封存" : null,
-    // §7.6：庫存足以支付完整配方的建築才列出來；加速只列這一格用得起的那一種。
+    // §7.6：蓋房與加速的入口在底部動作列；這裡只提供這一格的條件（不能做的原因）。
     buildable: tile.landStage === "cleared" ? buildableRecipes(city.resources) : [],
+    buildBlocked: buildBlockedReason(tile),
     boost: boostDetail(city, tile),
-    // 市集是城鎮中心的功能：只有中心格的詳情列出可換的配對。
-    market: [],
     harvests: harvestList(tile),
     // §9：這一格的投資（依 provider 分開）決定建築派系；畫面要標明比較基準的限制。
     faction: tile.faction,
@@ -784,10 +776,10 @@ function centerDetail(city, quotas = null) {
     points: null,
     pointsTarget: null,
     quota: quotaLines(quotas, { providers }),
-    // 中心格也能操作市集（§7.6）：這裡沒有格子，所以沒有加速與蓋房，只有庫存換得起的配對。
+    // 市集、蓋房與加速在底部動作列（core/dock.js）：中心格只放城的資訊。
     buildable: [],
     boost: null,
-    market: marketDetail(city),
+    buildBlocked: null,
     fields: [
       { label: "身份", value: city.center.label },
       { label: "座標", value: `${city.center.x}, ${city.center.y}（2×2）`, dev: true },

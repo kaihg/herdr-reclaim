@@ -5,3 +5,4 @@ mod/*/tsconfig.json
 mod/*/*/*.d.ts
 mod/*/*/jsconfig.json
 mod/*/*/tsconfig.json
+.codegraph/

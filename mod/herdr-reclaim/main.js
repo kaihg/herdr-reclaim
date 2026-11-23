@@ -37,6 +37,8 @@ import {
 } from "./core/history-search.js";
 import { historyPanel } from "./ui/history.js";
 import { harvestPanel } from "./ui/harvests.js";
+import { DOCK_H, buildPanel, dockBar, marketPanel } from "./ui/dock.js";
+import { dockState, maxTrade, normalizeTrade, setTradeFrom, setTradeTo, stepTrade, tradePreview } from "./core/dock.js";
 import { mapView } from "./ui/map.js";
 import { stageCounts, stageOf } from "./ui/assets.js";
 import { factionTag, guildBlock, investmentSection, quotaSection } from "./ui/standing.js";
@@ -412,6 +414,8 @@ export default class Town extends View {
     // `herdr-app check` 會真的跑 init：不要動使用者的檔案，只渲染固定情境。
     this.historyOpen = false;
     this.harvestOpen = false;
+    this.dockPanel = null;
+    this.trade = null;
     this.historyState = historyOpened();
     this.historyInput = InputState.new({ placeholder: "搜尋日期、城、session、commit 或成果路徑" });
     // 三條送出查詢的路都走同一個狀態機：輸入框的 submit 事件、Enter／Return 的 keydown，
@@ -469,6 +473,7 @@ export default class Town extends View {
   /** 選取：存檔＋把那一格帶進畫面；門檻 1（≤ 150 ms）＝按下到含新詳情的那一版畫面。 */
   select(selection, cx) {
     this.harvestOpen = false;
+    this.dockPanel = null;
     this.mark("pick");
     this.selection = selection;
     this.ui = withSelection(this.ui ?? parseUi(null), selection.cityId, selection);
@@ -610,10 +615,11 @@ export default class Town extends View {
    * 加速、蓋房與市集（§7.6）：每一筆都是帳本的一筆 CAS 操作。同一次點擊只產生一個
    * operation ID，重送（中斷後重試）不會重複扣卷或重複扣料；前提不符就整筆不成立。
    */
-  operateEconomy(kind, detail, payload, cx) {
+  operateEconomy(kind, detail, payload, cx, doneText) {
     if (!detail?.cityId) return;
     const startedAt = Date.now();
     cx.spawn(async (cx2) => {
+      let text;
       try {
         const ledger = await new CityLedger({
           io: this.io,
@@ -628,16 +634,51 @@ export default class Town extends View {
             : processTrade(ledger, { from: payload.from, to: payload.to, amount: payload.amount, at });
         const result = await operation;
         if (result.status !== "applied" && result.status !== "duplicate") {
-          this.note = `${ECONOMY_LABELS[kind]}未完成：${result.reason ?? result.status}`;
+          text = `${ECONOMY_LABELS[kind]}未完成：${result.reason ?? result.status}`;
         } else {
           this.town = await refreshTown(this.io, this.town);
-          this.note = null;
+          text = doneText;
         }
       } catch (error) {
-        this.note = `${ECONOMY_LABELS[kind]}失敗：${error}`;
+        text = `${ECONOMY_LABELS[kind]}失敗：${error}`;
       }
       this.metrics.pending = { kind: "action", at: startedAt };
+      this.showToast(text, cx2);
+    });
+  }
+
+  /** 動作列展開的面板：蓋房或市集。 */
+  dockPanelView(city, detail, t) {
+    if (this.dockPanel === "build") {
+      return buildPanel({
+        t,
+        resources: city.resources,
+        onBuild: (option, cx2) => {
+          this.dockPanel = null;
+          this.operateEconomy("build", detail, { recipe: option.name }, cx2, `已蓋好：${option.label}`);
+        },
+      });
+    }
+    const update = (next, cx2) => {
+      this.trade = next;
       cx2.notify();
+    };
+    return marketPanel({
+      t,
+      resources: city.resources,
+      trade: this.trade,
+      handlers: {
+        onFrom: (key, cx2) => update(setTradeFrom(this.trade, city.resources, key), cx2),
+        onTo: (key, cx2) => update(setTradeTo(this.trade, city.resources, key), cx2),
+        onStep: (delta, cx2) => update(stepTrade(this.trade, city.resources, delta), cx2),
+        onMax: (cx2) => update(maxTrade(this.trade, city.resources), cx2),
+        onConfirm: (cx2) => {
+          const { from, to, amount } = this.trade;
+          const preview = tradePreview(this.trade);
+          this.operateEconomy("trade", { cityId: city.cityId }, { from, to, amount }, cx2,
+            `已交換：${RESOURCE_LABELS[from]} ${preview.give} → ${RESOURCE_LABELS[to]} ${preview.get}`);
+        },
+      },
     });
   }
 
@@ -750,7 +791,11 @@ export default class Town extends View {
     const leftW = Math.round(clamp(MIN_LEFT_W, width * 0.19, MAX_LEFT_W));
     const rightW = Math.round(clamp(MIN_RIGHT_W, width * 0.26, MAX_RIGHT_W));
     // 地圖就是列裡剩下的那一塊；用 root 的尺寸算，不另外量自己。
-    const mapArea = { width: Math.max(80, width - leftW - rightW), height: Math.max(80, height - TOP_H) };
+    const mapArea = { width: Math.max(80, width - leftW - rightW), height: Math.max(80, height - TOP_H - DOCK_H) };
+    const detail = selectionDetail(this.placeholder && city === this.placeholder ? { ...this.town, cities: [this.placeholder] } : this.town, this.selection);
+    const dock = dockState({ detail, hasLedgerCity: city !== this.placeholder });
+    if (this.dockPanel && !dock[this.dockPanel]?.enabled) this.dockPanel = null;
+    this.trade = normalizeTrade(this.trade, city.resources);
     const root = v_flex()
       .id("root")
       .size_full()
@@ -767,9 +812,23 @@ export default class Town extends View {
         h_flex().flex_1().min_h(0).children([
           this.expeditionList(city, t, cx, leftW),
           this.mapColumn(city, t, cx, mapArea),
-          this.detailPanel(selectionDetail(this.placeholder && city === this.placeholder ? { ...this.town, cities: [this.placeholder] } : this.town, this.selection), t, rightW, cx),
+          this.detailPanel(detail, t, rightW, cx),
         ]),
-      ]);
+        dockBar({
+          t,
+          state: dock,
+          panel: this.dockPanel,
+          onToggle: (kind, cx2) => {
+            this.dockPanel = this.dockPanel === kind ? null : kind;
+            cx2.notify();
+          },
+          onBoost: (cx2) => this.operateEconomy("boost", detail, { scrolls: dock.boost.scrolls }, cx2, `已加速：用掉 ${dock.boost.scrolls} 張羊皮卷`),
+          onBlocked: (reason, cx2) => this.showToast(reason, cx2),
+        }),
+      ])
+      .when(this.dockPanel !== null, (element) => element.child(
+        div().absolute().left(leftW + 12).bottom(DOCK_H + 8).child(this.dockPanelView(city, detail, t)),
+      ));
     this.finishMeasure(started);
     return root;
   }
@@ -1301,49 +1360,12 @@ export default class Town extends View {
           ...(detail.quota?.length ? quotaSection(detail, t) : []),
           ...(detail.actions ?? []).map((action) =>
             hookButton(actionLabels[action], t, (cx2) => this.operateLand(detail, action, cx2))),
-          ...this.economySection(detail, t, cx),
           this.note ? div().text_size(9).text_color(t.muted).child(this.note) : null,
         ].filter(Boolean),
       );
   }
-
-  /**
-   * §7.6 的操作區（右側詳情）：只列出現在做得到的操作 —— 庫存足以支付完整配方的建築、
-   * 這一格用得起的加速張數，以及庫存換得起的市集配對。做得到的才畫按鈕。
-   */
-  economySection(detail, t, cx) {
-    const rows = [];
-    const boost = detail.boost;
-    if (boost?.available && boost.scrolls > 0) {
-      rows.push(hookButton(
-        `加速 ${boost.scrolls} 卷（+${boost.scrolls * boost.pointsPerScroll} 點）`,
-        t,
-        (cx2) => this.operateEconomy("boost", detail, { scrolls: boost.scrolls }, cx2),
-      ));
-    }
-    if (detail.buildable?.length) {
-      rows.push(div().text_size(10).text_color(t.dim).child("蓋房（一次扣除整份配方）"));
-      for (const recipe of detail.buildable) {
-        rows.push(hookButton(`${recipe.label} · ${costsLabel(recipe.costs)}`, t,
-          (cx2) => this.operateEconomy("build", detail, { recipe: recipe.name }, cx2)));
-      }
-    }
-    if (detail.market?.length) {
-      rows.push(div().text_size(10).text_color(t.dim).child("市集 3 換 1"));
-      for (const pair of detail.market) {
-        rows.push(hookButton(`${pair.label}（可得 ${pair.amount}）`, t,
-          (cx2) => this.operateEconomy("trade", detail, { from: pair.from, to: pair.to, amount: 1 }, cx2)));
-      }
-    }
-    return rows;
-  }
 }
 
-
-/** 配方的實付資源一行（main.js 只負責顯示；扣款與版本在帳本那一層）。 */
-function costsLabel(costs = {}) {
-  return Object.entries(costs).map(([key, amount]) => `${RESOURCE_LABELS[key] ?? key}${amount}`).join("・");
-}
 
 function hookButton(label, t, action) {
   return div().role("button").tab_index(0)

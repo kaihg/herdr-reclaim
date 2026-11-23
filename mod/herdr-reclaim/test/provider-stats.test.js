@@ -375,7 +375,7 @@ describe("派系與額度不改變數值（§9、§17.1 情境 8）", () => {
     expect(a.points).toBe(b.points);
     expect(a.points).toBe(CLEAR_POINTS);
     expect(a.buildable).toEqual(b.buildable);
-    expect(a.market).toEqual(b.market);
+    expect(a.buildBlocked).toEqual(b.buildBlocked);
     expect(a.boost).toEqual(b.boost);
     expect(withFaction.cities[0].resources).toEqual(without.cities[0].resources);
     expect(withFaction.cities[0].resources).toEqual({ wood: 20, stone: 20, iron: 5, parchment: 0 });
