@@ -821,7 +821,8 @@ export function tileLabel(tile) {
 
 /**
  * 左側遠征列表的分組（對齊 herdr 的 agents 頁面）：
- *   live    現役——有 agent 掛著（status active）且土地沒撤回／封存；新的在上。
+ *   live    現役——session 還掛著（有未結束的 visit：session_start 到 session_shutdown，
+ *           agent 回完一輪進入 idle 也算）且土地沒撤回／封存；新的在上。
  *   history 其餘的歷史對話（駐紮、已撤回、已封存）；新的在上，畫面縮成一行。
  *   hidden  撤回、沒有任何 provider 用量也沒有收成的格——使用者一句話都沒講，
  *           就像 omp /resume 的清單一樣不出現；它不計入左側的數量與摘要。
@@ -835,7 +836,7 @@ export function expeditionGroups(tiles = []) {
   for (const tile of tiles) {
     const released = tile.landStage === "withdrawn" || tile.landStage === "archived";
     if (tile.landStage === "withdrawn" && !tile.providerUsage?.length && !tile.harvests?.length) hidden.push(tile);
-    else if (!released && tile.status === "active") live.push(tile);
+    else if (!released && (tile.visits ?? []).some((visit) => visit.endedAt == null)) live.push(tile);
     else history.push(tile);
   }
   return { live: live.sort(byNewest), history: history.sort(byNewest), hidden };

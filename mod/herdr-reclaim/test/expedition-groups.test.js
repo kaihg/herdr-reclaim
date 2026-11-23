@@ -8,6 +8,7 @@ const tile = (id, patch = {}) => ({
   generation: 1,
   activatedAt: 1000,
   status: "idle",
+  visits: [{ endedAt: 1 }],
   landStage: "reserved",
   providerUsage: [{ provider: "anthropic", usage: {} }],
   harvests: [],
@@ -17,14 +18,15 @@ const tile = (id, patch = {}) => ({
 const ids = (tiles) => tiles.map((entry) => entry.rootSessionId);
 
 describe("expeditionGroups", () => {
-  test("掛著的 agent 在現役、新的在上；其餘進歷史", () => {
+  test("session 還掛著（含 idle）在現役、新的在上；其餘進歷史", () => {
     const groups = expeditionGroups([
-      tile("old-live", { status: "active", activatedAt: 1000 }),
+      tile("old-live", { visits: [{ endedAt: null }], activatedAt: 1000 }),
       tile("parked", { activatedAt: 3000 }),
-      tile("new-live", { status: "active", activatedAt: 2000 }),
-      tile("done", { landStage: "archived", status: "active", activatedAt: 500 }),
+      tile("idle-attached", { activatedAt: 1500, status: "idle", visits: [{ endedAt: null }] }),
+      tile("new-live", { visits: [{ endedAt: null }], activatedAt: 2000 }),
+      tile("done", { landStage: "archived", visits: [{ endedAt: null }], activatedAt: 500 }),
     ]);
-    expect(ids(groups.live)).toEqual(["new-live", "old-live"]);
+    expect(ids(groups.live)).toEqual(["new-live", "idle-attached", "old-live"]);
     expect(ids(groups.history)).toEqual(["parked", "done"]);
     expect(groups.hidden).toEqual([]);
   });
@@ -40,7 +42,7 @@ describe("expeditionGroups", () => {
   });
 
   test("沒講過話但還駐紮著（沒撤回）的格仍列出，等使用者決定", () => {
-    const groups = expeditionGroups([tile("fresh", { status: "active", providerUsage: [] })]);
+    const groups = expeditionGroups([tile("fresh", { visits: [{ endedAt: null }], providerUsage: [] })]);
     expect(ids(groups.live)).toEqual(["fresh"]);
     expect(groups.hidden).toEqual([]);
   });
