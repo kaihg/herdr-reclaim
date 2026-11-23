@@ -45,4 +45,4 @@ Everything is under `~/.config/herdr-app/data/herdr-reclaim/`. The ledger is app
 
 ## License
 
-[MIT](LICENSE)
+Code: [MIT](LICENSE). Images in [`mod/herdr-reclaim/assets/`](mod/herdr-reclaim/assets/) are AI-generated and licensed separately under CC BY 4.0; read its `NOTICE.md` first.

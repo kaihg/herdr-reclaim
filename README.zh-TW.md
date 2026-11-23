@@ -45,4 +45,4 @@ sh tools/install.sh
 
 ## 授權
 
-[MIT](LICENSE)
+程式碼：[MIT](LICENSE)。[`mod/herdr-reclaim/assets/`](mod/herdr-reclaim/assets/) 的圖片由 AI 生成，另採 CC BY 4.0，使用前請先讀該資料夾的 `NOTICE.md`。
