@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathS
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { hookScript, installHooks, removeHooks } from "../core/hooks.js";
+import { hookScript, hooksStatus, installHooks, removeHooks } from "../core/hooks.js";
 
 const exec = async (command, args = [], options = {}) => {
   const result = spawnSync(command, args, { cwd: options.cwd, encoding: "utf8" });
@@ -54,6 +54,22 @@ describe("Git hook 收成記錄器", () => {
       expect(readdirSync(hooks).filter((name) => name.endsWith(".herdr-reclaim-original"))).toEqual([]);
       expect((await removeHooks({ repo, exec })).status).toBe("removed");
       expect(readdirSync(hooks).filter((name) => name.startsWith("post-") && !name.endsWith(".sample"))).toEqual([]);
+    } finally { rmSync(repo, { recursive: true, force: true }); }
+  });
+
+  test("hooksStatus：沒裝＝missing、三個都在＝installed、少一個＝partial、移除後回到 missing", async () => {
+    const repo = mkdtempSync(path.join(os.tmpdir(), "reclaim-hook-status-"));
+    try {
+      git(repo, "init", "-q");
+      const appHome = path.join(repo, "app");
+      expect((await hooksStatus({ repo, io, exec })).status).toBe("missing");
+      await installHooks({ repo, io, exec, appHome });
+      expect((await hooksStatus({ repo, io, exec })).status).toBe("installed");
+      rmSync(path.join(repo, ".git", "hooks", "post-merge"));
+      expect((await hooksStatus({ repo, io, exec })).status).toBe("partial");
+      await installHooks({ repo, io, exec, appHome });
+      await removeHooks({ repo, exec });
+      expect((await hooksStatus({ repo, io, exec })).status).toBe("missing");
     } finally { rmSync(repo, { recursive: true, force: true }); }
   });
 

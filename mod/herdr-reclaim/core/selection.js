@@ -10,7 +10,7 @@
 export const UI_SCHEMA = 1;
 
 export function emptyUi() {
-  return { schema: UI_SCHEMA, selections: {}, dev: false };
+  return { schema: UI_SCHEMA, selections: {}, dev: false, hooks: {} };
 }
 
 export function parseUi(text) {
@@ -18,7 +18,8 @@ export function parseUi(text) {
   try {
     const data = JSON.parse(text);
     if (!data || typeof data !== "object" || !data.selections || typeof data.selections !== "object") return emptyUi();
-    return { schema: UI_SCHEMA, selections: data.selections, dev: data.dev === true };
+    const hooks = data.hooks && typeof data.hooks === "object" ? data.hooks : {};
+    return { schema: UI_SCHEMA, selections: data.selections, dev: data.dev === true, hooks };
   } catch {
     return emptyUi(); // 壞掉的 UI 檔不影響城鎮，回到預設選取
   }
@@ -31,6 +32,11 @@ export function withSelection(ui, cityId, selection) {
 /** 開發模式（顯示工程資訊）也是畫面自己的狀態，跟選取放在同一個檔案。 */
 export function withDev(ui, dev) {
   return { ...ui, schema: UI_SCHEMA, dev: dev === true };
+}
+
+/** 使用者對「這座城要不要開自動收成」的回答（目前只記「先不要」，不再重複詢問）。 */
+export function withHookChoice(ui, cityId, choice) {
+  return { ...ui, schema: UI_SCHEMA, hooks: { ...(ui.hooks ?? {}), [cityId]: choice } };
 }
 
 export function selectionOf(ui, cityId) {

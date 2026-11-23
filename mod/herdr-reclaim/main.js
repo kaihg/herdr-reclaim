@@ -23,9 +23,9 @@ import { MAP_RADIUS, cameraFor, clampCamera, contentSize, ensureVisible, isCente
 import { ingestResearch, ingestScenario, processBoost, processBuild, processLand, processTrade, redispatch } from "./core/ingest.js";
 import { hostIo } from "./core/host-io.js";
 import { CasConflict, CityLedger, cityDir } from "./core/ledger.js";
-import { installHooks, removeHooks } from "./core/hooks.js";
+import { hooksStatus, installHooks, removeHooks } from "./core/hooks.js";
 import { RESEARCH_TOKENS_PER_PARCHMENT, RESOURCE_LABELS, RULES_VERSION } from "./core/rules.js";
-import { defaultSelection, parseUi, resolveSelection, selectionOf, serializeUi, withDev, withSelection } from "./core/selection.js";
+import { defaultSelection, parseUi, resolveSelection, selectionOf, serializeUi, withDev, withHookChoice, withSelection } from "./core/selection.js";
 import { QUOTA_SOURCE, parseQuotaReport } from "./core/quota-source.js";
 import { quotaView, readQuotaView } from "./core/quota-view.js";
 import { CLEAR_POINTS, emptyCity, formatResearch, readTown, readTownFromLedger, selectionDetail } from "./core/town.js";
@@ -49,6 +49,13 @@ const TOP_H = 104;
 const CELL_MARGIN = 6;
 /** 操作結果小提示顯示多久（ms）。 */
 const TOAST_MS = 6000;
+
+/** 自動收成要先請使用者確認的原因（白話）。 */
+const HOOK_CONFIRM_LABELS = {
+  husky: "這個 repo 的 hook 由 husky 管理，自動開啟可能改到版控內的檔案，所以沒有動。",
+  "tracked-hooks": "這個 repo 的 hook 目錄已納入版本控制，自動開啟會弄髒工作樹，所以沒有動。",
+  "backup-exists": "hook 目錄裡已有 *.herdr-reclaim-original 備份檔，為免蓋掉你的 hook，所以沒有動。請先確認那些檔案。",
+};
 
 const RESOURCES = [
   { key: "wood", label: "木材", color: "ansi3" },
@@ -390,6 +397,7 @@ export default class Town extends View {
     this.syncedCityId = null;
     this.missingFolder = null;
     this.placeholder = null;
+    this.hookStates = {};
     this.toast = null;
     this.note = "正在讀取城鎮帳本…";
     this.legendOpen = true;
@@ -433,6 +441,7 @@ export default class Town extends View {
           this.town = null;
           this.note = `城鎮帳本讀取失敗：${error}`;
         }
+        await this.refreshHookStates();
         cx.notify();
         first = false;
         try {
@@ -771,6 +780,52 @@ export default class Town extends View {
 
   // ---- 上方：城鎮庫存與主要行會（§9、§14.1）
 
+  /** 這座城的自動收成開著嗎（讀 hook 檔，不是記憶）。已經確定的城不重查。 */
+  async refreshHookStates() {
+    for (const city of this.town?.cities ?? []) {
+      if (this.hookStates[city.cityId] === "installed") continue;
+      const repo = city.tiles.find((tile) => tile.repo?.checkout)?.repo.checkout;
+      if (!repo) continue;
+      try {
+        this.hookStates[city.cityId] = (await hooksStatus({ repo, exec, io: storageIo() })).status;
+      } catch {
+        this.hookStates[city.cityId] = "unknown";
+      }
+    }
+  }
+
+  hookToggle(city, t) {
+    const on = this.hookStates[city.cityId] === "installed";
+    return hookButton(on ? "停止自動收成" : "開啟自動收成", t, (cx2) => this.manageHooks(city, on, cx2));
+  }
+
+  /**
+   * 第一次看到一座還沒開自動收成的城，先問使用者（寫進 repo 的 .git/hooks，不能默默做）。
+   * 回答「先不要」會記在 ui.json，之後不再跳出；頂欄的按鈕隨時可以開。
+   */
+  hookBanner(city, t) {
+    if (city === this.placeholder) return [];
+    const state = this.hookStates[city.cityId];
+    if (state !== "missing" && state !== "partial") return [];
+    if (this.ui?.hooks?.[city.cityId] === "declined") return [];
+    return [v_flex().gap(4).p(7).rounded(6).bg(t.surface).border(1).border_color(t.accent).children([
+      div().text_size(11).font_semibold().child("開啟自動收成？"),
+      div().text_size(9).text_color(t.muted).child(
+        "agent 在這個 repo 的 commit 要換成資源，需要在 .git/hooks 加入三個記錄用的小檔案。只在本機記一筆，不連網、不改你的 commit，隨時可以停止。沒開的話這座城不會收成。",
+      ),
+      h_flex().gap(6).children([
+        hookButton("開啟", t, (cx2) => this.manageHooks(city, false, cx2)),
+        hookButton("先不要", t, (cx2) => this.declineHooks(city, cx2)),
+      ]),
+    ])];
+  }
+
+  declineHooks(city, cx) {
+    this.ui = withHookChoice(this.ui ?? parseUi(null), city.cityId, "declined");
+    if (this.io) updateUi(this.io, (ui) => withHookChoice(ui, city.cityId, "declined")).catch(() => {});
+    cx.notify();
+  }
+
   manageHooks(city, remove, cx) {
     const repo = city.tiles.find((tile) => tile.repo?.checkout)?.repo.checkout;
     if (!repo) {
@@ -783,16 +838,18 @@ export default class Town extends View {
         const result = remove
           ? await removeHooks({ repo, exec })
           : await installHooks({ repo, exec, io: storageIo(), appHome: appHome() });
+        if (result.status === "installed") this.hookStates[city.cityId] = "installed";
+        if (result.status === "removed" || result.status === "not-installed") this.hookStates[city.cityId] = "missing";
         text = result.status === "refused"
-          ? `未安裝收成 hook：${result.message ?? result.reason}`
+          ? `沒有開啟自動收成：${result.message ?? result.reason}`
           : result.status === "needs-confirmation"
-            ? `需先確認：${result.reason}`
-            : result.status === "installed" ? "收成 hook 已安裝"
-            : result.status === "removed" ? "收成 hook 已移除"
-            : result.status === "not-installed" ? "目前沒有已安裝的 hook"
+            ? HOOK_CONFIRM_LABELS[result.reason] ?? `需先確認：${result.reason}`
+            : result.status === "installed" ? "已開啟自動收成"
+            : result.status === "removed" ? "已停止自動收成"
+            : result.status === "not-installed" ? "目前沒有開啟自動收成"
             : `操作未完成：${result.reason ?? result.status}`;
       } catch (error) {
-        text = `hook 操作失敗：${error}`;
+        text = `自動收成操作失敗：${error}`;
       }
       this.showToast(text, cx2);
     });
@@ -876,8 +933,7 @@ export default class Town extends View {
           .gap(3)
           .children(guildBlock(city, this.town?.quotas, t))
           .child(h_flex().flex_wrap().gap(6).items_center().children([
-            hookButton("安裝收成", t, (cx2) => this.manageHooks(city, false, cx2)),
-            hookButton("移除", t, (cx2) => this.manageHooks(city, true, cx2)),
+            ...(city === this.placeholder ? [] : [this.hookToggle(city, t)]),
             hookButton("更新額度", t, (cx2) => this.refreshQuotas(cx2)),
             hookButton(this.devMode ? "開發模式 ✓" : "開發模式", t, (cx2) => this.toggleDev(cx2)),
           ]))
@@ -917,6 +973,7 @@ export default class Town extends View {
         div().text_size(10).text_color(t.dim).child("遠征（每格一支）"),
         div().text_size(13).font_semibold().child(`${city.tiles.length} 格土地`),
         div().text_size(9).text_color(t.muted).truncate().child(summary || "還沒有土地"),
+        ...this.hookBanner(city, t),
         // 來源不明與未解析是診斷資訊：一般只看到狀態與數量，原因、sha、cwd 在開發模式才展開。
         ...(city.unharvestedCommits?.length ? [
           h_flex().gap(5).items_center().child(statusBadge("來源不明", t))

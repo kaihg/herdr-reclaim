@@ -108,6 +108,18 @@ export async function installHooks({ repo, io, exec, appHome }) {
   return { status: "installed", hooksPath: info.hooksPath, chained };
 }
 
+/** 這座 repo 的三個記錄器都在才算「已開啟」；只有一部分（例如被刪掉一個）是 partial。 */
+export async function hooksStatus({ repo, io, exec }) {
+  const info = await repoInfo(repo, exec);
+  if (!info) return { status: "not-git-repository" };
+  let found = 0;
+  for (const hook of HOOK_NAMES) {
+    const text = await io.read(`${info.hooksPath}/${hook}`);
+    if (typeof text === "string" && text.includes(HOOK_MARKER)) found++;
+  }
+  return { status: found === HOOK_NAMES.length ? "installed" : found > 0 ? "partial" : "missing", hooksPath: info.hooksPath };
+}
+
 export async function removeHooks({ repo, exec }) {
   const info = await repoInfo(repo, exec);
   if (!info) return { status: "not-git-repository" };
