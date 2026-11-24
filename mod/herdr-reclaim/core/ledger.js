@@ -32,7 +32,7 @@ import { BlobStore } from "./blobs.js";
 import { byteLen, canonicalJson, hashText } from "./bytes.js";
 import { casWrite, rejectUnlessConflict } from "./cas.js";
 import { PrefixIndex } from "./pages.js";
-import { BOOST_POINTS_PER_PARCHMENT, CLEAR_POINTS, RECIPES, RESEARCH_TOKENS_PER_PARCHMENT, RESOURCES, RULES_VERSION, LEGACY_TRADE_GIVE, WORK_TOKENS_PER_UNIT, affordable, tradeTerms, workYieldOf } from "./rules.js";
+import { ACHIEVEMENT_YIELD, BOOST_POINTS_PER_PARCHMENT, CLEAR_POINTS, RECIPES, RESEARCH_TOKENS_PER_PARCHMENT, RESOURCES, RULES_VERSION, LEGACY_TRADE_GIVE, WORK_TOKENS_PER_UNIT, affordable, tradeTerms, workYieldOf } from "./rules.js";
 import { historyRecordOf } from "./history.js";
 
 export { byteLen, hashText };
@@ -520,6 +520,31 @@ export const KINDS = {
       for (const source of entry.sources ?? []) state.claims.set(claimKey(entry.cityId, source), entry.journalSeq);
     },
   },
+  /**
+   * 共用城市的成果收成（#24）：歸屬確定、且帶來新內容的 commit 另外發一份建材。`claims` 是這個
+   * commit 改到的內容版本（路徑＋result blob），寫進城級 claim 索引——同一個 commit 從兩個 space
+   * 抵達、重播、或 rebase／amend 後內容不變，都不會再發。
+   */
+  achievement: {
+    precheck(state, op) {
+      if (op.cityId !== state.cityId) return "wrong_city";
+      if (!Array.isArray(op.claims) || op.claims.length === 0) return "missing_claims";
+      const paid = Object.entries(ACHIEVEMENT_YIELD);
+      const got = Object.entries(op.resources ?? {});
+      if (got.length !== paid.length || !paid.every(([key, amount]) => Number(op.resources?.[key]) === amount)) {
+        return "rate_mismatch";
+      }
+      if (op.claims.some((claim) => state.claims.has(claimKey(op.cityId, claim)))) return "claim_exists";
+      return null;
+    },
+    apply(state, entry) {
+      for (const [name, amount] of Object.entries(entry.resources ?? {})) {
+        state.resources[name] = Number(state.resources[name] ?? 0) + Number(amount);
+      }
+      for (const claim of entry.claims ?? []) state.claims.set(claimKey(entry.cityId, claim), entry.journalSeq);
+    },
+  },
+
   /**
    * 活動合併（§6.2）：以 (sessionId, writerEpoch) 為鍵。adapter 收到 ack 後會 compact
    * 磁碟快照，後續 entry 只含未 ack 的尾巴；帳本重播時必須把事件併回舊快照，不能覆蓋它。

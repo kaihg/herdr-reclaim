@@ -8,10 +8,13 @@
 // input + output、用量未知的回合不結算、child 併進同一棵樹。差別只在這裡不限哪一座舊城：
 // 所有 repo 的工作都進同一個計量器，而且沒有可歸屬 commit 的限制（那是 #24 的額外收成）。
 //
-// 這一票只交付「工作 → 基本建材 + 常駐庫存」。選址、預定地與自動施工是 #25–#27；
-// 舊版各城帳本（`cities/<hash>/`）原封不動：共用帳本放在別的目錄，不讀也不改它們。
+// 這一票交付「工作 → 基本建材 + 常駐庫存」；明確成果的額外收成是 #24（`ingestAchievements`）。
+// 選址、預定地與自動施工是 #25–#27；舊版各城帳本（`cities/<hash>/`）原封不動：共用帳本放在
+// 別的目錄，不讀也不改它們。
 import { claimKey } from "./ledger.js";
-import { WORK_TOKENS_PER_UNIT, WORK_YIELD, workYieldOf } from "./rules.js";
+import { ACHIEVEMENT_YIELD, WORK_TOKENS_PER_UNIT, WORK_YIELD, workYieldOf } from "./rules.js";
+import { changesOfCommit } from "./harvest.js";
+import { commitContexts } from "./commit-evidence.js";
 import { createsTile, rootOf, roundsOf, sessionIndex } from "./research.js";
 
 /**
@@ -151,4 +154,58 @@ export function readSharedCity(state = {}) {
       work: { tokens: Number(state.work?.tokens ?? 0), unitTokens: WORK_TOKENS_PER_UNIT },
     },
   };
+
+}
+
+/**
+ * 明確成果的額外收成（#24）：歸屬確定、發生在啟用之後、且帶來新內容的 commit 各發一份建材。
+ *
+ * 歸屬只認 `commitContexts` 的核對結果：只看到 terminal、時間接近、對不到 adapter session…
+ * 都是「來源不明」，不發成果加成；基本收入與它們無關，照樣入帳。遠端合併與沒有可信提交時間的
+ * 證據也不發（不能拿讀取當下冒充提交時間）。
+ *
+ * 去重分兩層：`opId` 綁 sha，同一個 commit 從兩個 space 抵達或重播只落一次；`claims` 是內容
+ * 版本（路徑＋result blob），rebase／amend 換了 sha 但內容已在帳上時不再發。第二個不同且
+ * 合格的成果仍有自己的新 claim，可以入帳。
+ */
+export async function ingestAchievements(ledger, { activities = [], hooks = [], sources = [], remoteMerges = new Set(), diffForCommit, activateAt } = {}) {
+  const state = await ledger.state();
+  const since = state.work?.since ?? await startWork(ledger, activateAt);
+  const byId = sessionIndex(activities);
+  const results = [];
+  for (const context of commitContexts({ hooks, sources, activities, remoteMerges })) {
+    if (!context.attributed || context.at == null) continue;
+    // 啟用之前的 commit 屬於舊城歷史（#22：轉換另行規劃），不補發。
+    if (Number(context.at) < Number(since)) continue;
+    // 成果必須是某段真實工作的產物；print／headless 或對不到工作 session 的提交不算。
+    if (!createsTile(byId.get(context.rootId))) continue;
+    const opId = `achievement:${ledger.cityId}:${context.sha}`;
+    if (state.opSeqs.has(opId)) continue; // 已入帳：不必再問 git 要差異
+    const hook = hooks.find((record) => record.sha === context.sha && record.commonDir === context.cityId);
+    const changes = typeof diffForCommit === "function" ? await diffForCommit(context.sha, hook) : [];
+    // claim 帶上 repo 身分：兩個專案的同名、同內容檔案是兩個成果；同一 repo 的 rebase／amend
+    // 仍在同一個命名空間裡，內容已在帳上就不再發。
+    const claims = changesOfCommit(changes).map((unit) => `${context.cityId}|${unit.claim}`)
+      .filter((claim) => !state.claims.has(claimKey(ledger.cityId, claim)));
+    if (claims.length === 0) continue; // 空 commit、只改排除路徑、或內容已經入帳
+    results.push(await ledger.submit((current) => {
+      const fresh = claims.filter((claim) => !current.claims.has(claimKey(ledger.cityId, claim)));
+      if (fresh.length === 0) return null;
+      return {
+        opId,
+        kind: "achievement",
+        at: context.at,
+        cityId: ledger.cityId,
+        sha: context.sha,
+        repo: context.cityId,
+        rootSessionId: context.rootId,
+        sessionId: context.sessionId,
+        cli: context.cli,
+        basis: context.basis,
+        claims: fresh,
+        resources: { ...ACHIEVEMENT_YIELD },
+      };
+    }));
+  }
+  return results;
 }

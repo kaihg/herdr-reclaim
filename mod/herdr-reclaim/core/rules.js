@@ -7,8 +7,9 @@
 //   2  ticket #8 的研究匯率、加速點數、市集費率與建築配方
 //   3  市集依資源配對訂不同費率：羊皮卷 → 其他 1 換 10；其他 → 羊皮卷 30 換 1；其他之間仍是 3 換 1
 //   4  ticket #23 共用城市的基本收入：每 10,000 個有效 token 收木 3、石 2、鐵 1
+//   5  ticket #24 明確成果的額外收成：每個歸屬確定、帶來新內容的 commit 另收木 3、石 2、鐵 1
 
-export const RULES_VERSION = 4;
+export const RULES_VERSION = 5;
 
 /** 庫存裡的資源種類；羊皮卷同時是市集商品與加速材料（§11）。 */
 export const RESOURCES = ["wood", "stone", "iron", "parchment"];
@@ -77,3 +78,9 @@ export function workYieldOf(tokens = 0) {
   const units = Math.floor(total / WORK_TOKENS_PER_UNIT);
   return Object.fromEntries(Object.entries(WORK_YIELD).map(([key, amount]) => [key, amount * units]));
 }
+
+/**
+ * #24：一個可核對成果的額外收成——歸屬確定的 commit 另外發一份建材，基本收入照發。
+ * 只發基本建材（羊皮卷仍是研究與加速材料），確認收穫不看 commit 大小（試玩參數）。
+ */
+export const ACHIEVEMENT_YIELD = { wood: 3, stone: 2, iron: 1 };

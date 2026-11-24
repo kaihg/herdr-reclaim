@@ -29,7 +29,7 @@ import { defaultSelection, parseUi, resolveSelection, selectionOf, serializeUi, 
 import { QUOTA_REFRESH_MS, QUOTA_SOURCE, claimQuotaAttempt, parseQuotaReport } from "./core/quota-source.js";
 import { quotaView, readQuotaView } from "./core/quota-view.js";
 import { CLEAR_POINTS, emptyCity, expeditionGroups, formatResearch, mergeActivities, readTown, readTownFromLedger, selectionDetail, tileLabel } from "./core/town.js";
-import { SHARED_CITY_ID, ingestIncome, readSharedCity, sharedCityDir } from "./core/shared-city.js";
+import { SHARED_CITY_ID, ingestAchievements, ingestIncome, readSharedCity, sharedCityDir } from "./core/shared-city.js";
 import { cityForFolders } from "./core/space-city.js";
 import { firstExpedition } from "./scenarios/first-expedition.js";
 import {
@@ -199,6 +199,25 @@ async function loadTown(io) {
   const repoFacts = await repoFactsOf(io, cityIds);
   const replay = { activities, repoFacts };
   const evidence = await loadCommitEvidence(io, adapterRoot(appHome()), listActivityFiles);
+  // 同一個 commit 在這一輪會被問不只一次（各城的收成、共用城市的成果收成），
+  // 所以差異只問 git 一次；key 帶 checkout，工作樹不同就不是同一份答案。
+  const commitDiffs = new Map();
+  /** 一個 commit 的第一父節點差異（新 repo 的第一筆用 `--root`）；收成與成果收成共用。 */
+  const diffForCommit = async (sha, hook) => {
+    if (!hook?.toplevel) return [];
+    const key = `${hook.toplevel}@@${sha}`;
+    if (commitDiffs.has(key)) return commitDiffs.get(key);
+    let result = await exec("git", ["-C", hook.toplevel, "diff-tree", "-r", "-M", "--raw", "-z", `${sha}^1`, sha]);
+    if (result.code !== 0) result = await exec("git", ["-C", hook.toplevel, "diff-tree", "--root", "-r", "-M", "--raw", "-z", sha]);
+    const changes = result.code === 0 ? parseRawDiff(result.stdout) : [];
+    commitDiffs.set(key, changes);
+    return changes;
+  };
+  const subjectForCommit = async (sha, hook) => {
+    if (!hook?.toplevel) return null;
+    const result = await exec("git", ["-C", hook.toplevel, "show", "-s", "--format=%s", sha]);
+    return result.code === 0 ? result.stdout.trim() : null;
+  };
   const remoteMerges = new Map(cityIds.map((cityId) => [cityId, new Set()]));
   for (const cityId of cityIds) {
     const checkouts = new Set(activities.flatMap((record) => (record.events ?? [])
@@ -233,17 +252,8 @@ async function loadTown(io) {
       ...evidence,
       activities: [...before.activities.values()],
       remoteMerges: remoteMerges.get(cityId),
-      diffForCommit: async (sha, hook) => {
-        if (!hook?.toplevel) return [];
-        let result = await exec("git", ["-C", hook.toplevel, "diff-tree", "-r", "-M", "--raw", "-z", `${sha}^1`, sha]);
-        if (result.code !== 0) result = await exec("git", ["-C", hook.toplevel, "diff-tree", "--root", "-r", "-M", "--raw", "-z", sha]);
-        return result.code === 0 ? parseRawDiff(result.stdout) : [];
-      },
-      subjectForCommit: async (sha, hook) => {
-        if (!hook?.toplevel) return null;
-        const result = await exec("git", ["-C", hook.toplevel, "show", "-s", "--format=%s", sha]);
-        return result.code === 0 ? result.stdout.trim() : null;
-      },
+      diffForCommit,
+      subjectForCommit,
     });
     // 研究羊皮卷（§7.4）排在收成之後：這個回合有沒有歸屬確定的 commit 要用同一份來源核對。
     const state = await ledger.state();
@@ -291,6 +301,14 @@ async function loadTown(io) {
   }).open();
   await shared.maybeCheckpoint();
   await ingestIncome(shared, { activities: mergeActivities([...stored, ...activities]) });
+  // 明確成果的額外收成（#24）：歸屬確定的 commit 另外發一份；遠端合併不可能有歸屬，
+  // 所以各城的遠端合併集合取聯集即可。
+  await ingestAchievements(shared, {
+    activities: mergeActivities([...stored, ...activities]),
+    ...evidence,
+    remoteMerges: new Set([...remoteMerges.values()].flatMap((set) => [...set])),
+    diffForCommit,
+  });
   return { ...town, shared: readSharedCity(await shared.state()) };
 }
 /**
