@@ -6,8 +6,9 @@
 //   1  ticket #7 的土地生命週期（撤回、封存、重新派遣）
 //   2  ticket #8 的研究匯率、加速點數、市集費率與建築配方
 //   3  市集依資源配對訂不同費率：羊皮卷 → 其他 1 換 10；其他 → 羊皮卷 30 換 1；其他之間仍是 3 換 1
+//   4  ticket #23 共用城市的基本收入：每 10,000 個有效 token 收木 3、石 2、鐵 1
 
-export const RULES_VERSION = 3;
+export const RULES_VERSION = 4;
 
 /** 庫存裡的資源種類；羊皮卷同時是市集商品與加速材料（§11）。 */
 export const RESOURCES = ["wood", "stone", "iron", "parchment"];
@@ -59,4 +60,20 @@ export function buildableRecipes(resources = {}) {
   return Object.entries(RECIPES)
     .filter(([, recipe]) => affordable(recipe.costs, resources))
     .map(([name, recipe]) => ({ name, label: recipe.label, costs: { ...recipe.costs } }));
+}
+
+/** #23：共用城市的基本收入——每 WORK_TOKENS_PER_UNIT 個有效 token 收成一份建材（試玩參數）。 */
+export const WORK_TOKENS_PER_UNIT = 10_000;
+
+/** 一份收成的建材。羊皮卷不在其中：它是成果收成與加速材料，不是日常工作收入。 */
+export const WORK_YIELD = { wood: 3, stone: 2, iron: 1 };
+
+/**
+ * 一批有效工作的收成：整份的建材（計量器餘數由帳本的 work.tokens 另外保留）。
+ * 長短對話、換 provider、換專案只改變 token 從哪裡來，收成只依 token 總量。
+ */
+export function workYieldOf(tokens = 0) {
+  const total = Math.max(0, Math.floor(Number(tokens) || 0));
+  const units = Math.floor(total / WORK_TOKENS_PER_UNIT);
+  return Object.fromEntries(Object.entries(WORK_YIELD).map(([key, amount]) => [key, amount * units]));
 }

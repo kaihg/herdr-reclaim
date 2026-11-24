@@ -28,7 +28,8 @@ import { RESEARCH_TOKENS_PER_PARCHMENT, RESOURCE_LABELS, RULES_VERSION } from ".
 import { defaultSelection, parseUi, resolveSelection, selectionOf, serializeUi, withDev, withHookChoice, withSelection } from "./core/selection.js";
 import { QUOTA_REFRESH_MS, QUOTA_SOURCE, claimQuotaAttempt, parseQuotaReport } from "./core/quota-source.js";
 import { quotaView, readQuotaView } from "./core/quota-view.js";
-import { CLEAR_POINTS, emptyCity, expeditionGroups, formatResearch, readTown, readTownFromLedger, selectionDetail, tileLabel } from "./core/town.js";
+import { CLEAR_POINTS, emptyCity, expeditionGroups, formatResearch, mergeActivities, readTown, readTownFromLedger, selectionDetail, tileLabel } from "./core/town.js";
+import { SHARED_CITY_ID, ingestIncome, readSharedCity, sharedCityDir } from "./core/shared-city.js";
 import { cityForFolders } from "./core/space-city.js";
 import { firstExpedition } from "./scenarios/first-expedition.js";
 import {
@@ -269,7 +270,7 @@ async function loadTown(io) {
     .map((event) => `${record.sessionId}@@${record.writerEpoch}@@${event.eventSeq}`)));
   const unresolvedActivities = unresolvedCandidates.filter((event) =>
     !resolvedEventKeys.has(`${event.sessionId}@@${event.writerEpoch}@@${event.eventSeq}`));
-  return readTownFromLedger({
+  const town = readTownFromLedger({
     activities: stored,
     expeditions,
     sessionNames: sessionNamesOf(activities),
@@ -281,6 +282,16 @@ async function loadTown(io) {
     unharvestedCommits: unharvested,
     quotas: await loadQuotas(io),
   });
+  // 共用城市（#23、ADR-0001）：所有專案的工作進同一座城、同一個倉庫。舊版各城帳本照舊，
+  // 共用帳本另外放在 `shared/`；活動用帳本保存的那一份（`stored`），adapter 的快照會被 compact。
+  const shared = await new CityLedger({
+    io,
+    dir: sharedCityDir(adapterRoot(appHome())),
+    cityId: SHARED_CITY_ID,
+  }).open();
+  await shared.maybeCheckpoint();
+  await ingestIncome(shared, { activities: mergeActivities([...stored, ...activities]) });
+  return { ...town, shared: readSharedCity(await shared.state()) };
 }
 /**
  * 操作之後的最小重讀（門檻 4 的關鍵）：只把各城的帳本狀態重讀一次，不重跑
@@ -311,7 +322,7 @@ async function refreshTown(io, previous) {
     repoFacts[city.cityId] = { hadHead: city.center?.kind === "oldtown" ? true : city.center?.kind === "founded" ? false : undefined };
     unharvestedCommits[city.cityId] = city.unharvestedCommits ?? [];
   }
-  return readTownFromLedger({
+  const town = readTownFromLedger({
     activities: stored,
     expeditions,
     repoFacts,
@@ -327,6 +338,13 @@ async function refreshTown(io, previous) {
     // TTL／resetsAt 之後還會顯示舊的 remaining。重算只用已存的原始快照，不打 provider。
     ...(previous?.quotas ? { quotas: quotaView(previous.quotas.snapshot) } : {}),
   });
+  // 共用倉庫只重讀（入帳在完整重載時做）：操作之後畫面立刻看到同一份庫存。
+  const shared = await new CityLedger({
+    io,
+    dir: sharedCityDir(adapterRoot(appHome())),
+    cityId: SHARED_CITY_ID,
+  }).open();
+  return { ...town, shared: readSharedCity(await shared.state()) };
 }
 /**
  * 額度回報（§9、§15.2）：provider 明確回報的額度，形狀是 S5 的
@@ -1005,20 +1023,35 @@ export default class Town extends View {
     const blockW = Math.round(clamp(96, rightW * 0.62, 176));
     const centerW = Math.max(60, width - leftW - blockW - 52);
     const stacked = centerW < 430;
+    // 共用倉庫（#23）：同一份本機資料的一座城、一個倉庫，切 repo／space 看到的是同一份庫存。
+    // 沒有共用模型時（`herdr-app check` 的固定情境）沿用這一座舊城的庫存。舊版各城的市集與
+    // 蓋房還沒退役（#25–#27 接手），它們扣的是那一座城的庫存，面板自己會列出金額，頂欄只放共用倉庫。
+    const shared = this.town?.shared?.city ?? null;
+    const stockOf = shared ? shared.resources : city.resources;
+    const stockKeys = shared ? RESOURCES.filter((resource) => resource.key in shared.resources) : RESOURCES;
     const stock = h_flex()
       .gap(10)
       .items_center()
-      .child(div().text_size(10).text_color(t.dim).child("庫存"))
-      .children(RESOURCES.map((resource) => resourceChip(resource, city.resources[resource.key], t)));
+      .child(div().text_size(10).text_color(t.dim).child(shared ? "共用倉庫" : "庫存"))
+      .children(stockKeys.map((resource) => resourceChip(resource, stockOf[resource.key], t)));
+    // 工作進度（#23）：還沒換成一份建材的有效工作；沒有工地也看得見累積。
+    const work = shared
+      ? h_flex()
+        .gap(6)
+        .items_center()
+        .child(div().text_size(10).text_color(t.dim).child("工作"))
+        .child(div().text_size(12.5).child(`${shared.work.tokens}/${shared.work.unitTokens}`))
+      : null;
     // §7.4 的研究計量器：每滿 100,000 換 1 張羊皮卷，餘數按城保留。
     const research = h_flex()
       .gap(6)
       .items_center()
       .child(div().text_size(10).text_color(t.dim).child("研究"))
       .child(div().text_size(12.5).child(`${city.research?.tokens ?? 0} / ${RESEARCH_TOKENS_PER_PARCHMENT}`));
+    // 窄 pane 時三行（庫存、研究、工作）各自一列：共用庫存與工作進度都不能被裁掉。
     const center = stacked
-      ? v_flex().flex_1().min_w(0).overflow_hidden().gap(2).child(stock).child(research)
-      : h_flex().flex_1().min_w(0).overflow_hidden().items_center().justify_center().gap(14).child(stock).child(research);
+      ? v_flex().flex_1().min_w(0).overflow_hidden().gap(2).child(stock).child(research).when(Boolean(work), (element) => element.child(work))
+      : h_flex().flex_1().min_w(0).overflow_hidden().items_center().justify_center().gap(14).child(stock).child(research).when(Boolean(work), (element) => element.child(work));
     return h_flex()
       .id("top")
       .flex_none()

@@ -32,7 +32,7 @@ import { BlobStore } from "./blobs.js";
 import { byteLen, canonicalJson, hashText } from "./bytes.js";
 import { casWrite, rejectUnlessConflict } from "./cas.js";
 import { PrefixIndex } from "./pages.js";
-import { BOOST_POINTS_PER_PARCHMENT, CLEAR_POINTS, RECIPES, RESEARCH_TOKENS_PER_PARCHMENT, RESOURCES, RULES_VERSION, LEGACY_TRADE_GIVE, affordable, tradeTerms } from "./rules.js";
+import { BOOST_POINTS_PER_PARCHMENT, CLEAR_POINTS, RECIPES, RESEARCH_TOKENS_PER_PARCHMENT, RESOURCES, RULES_VERSION, LEGACY_TRADE_GIVE, WORK_TOKENS_PER_UNIT, affordable, tradeTerms, workYieldOf } from "./rules.js";
 import { historyRecordOf } from "./history.js";
 
 export { byteLen, hashText };
@@ -147,6 +147,7 @@ const zeroResources = () => Object.fromEntries(RESOURCES.map((key) => [key, 0]))
  * 空狀態。`tiles`／`activities` 的順序就是 journal 的附加順序，重播結果因此可重現。
  * `opSeqs`／`claims` 是索引（§13.2）；`currentGen` 是每支遠征的現役 generation。
  * `research.tokens` 是這座城還沒換成羊皮卷的研究進度（餘數，§7.4）；
+ * `work.tokens` 是共用城市（#23）還沒換成建材的有效工作進度（餘數）；
  * `market` 分開記錄市集轉入與轉出，跟 commit 的直接發放分開（§11）。
  */
 export function emptyState(cityId) {
@@ -163,6 +164,7 @@ export function emptyState(cityId) {
     claims: new Map(),
     resources: zeroResources(),
     research: { tokens: 0 },
+    work: { tokens: 0, since: null },
     market: { in: zeroResources(), out: zeroResources() },
   };
 }
@@ -469,6 +471,53 @@ export const KINDS = {
       state.research.tokens = total % RESEARCH_TOKENS_PER_PARCHMENT;
       const scrolls = Math.floor(total / RESEARCH_TOKENS_PER_PARCHMENT);
       if (scrolls > 0) state.resources.parchment = Number(state.resources.parchment ?? 0) + scrolls;
+    },
+  },
+
+  /**
+   * 共用城市的啟用邊界（#23）：只寫一次，記下第一次啟用的時間。之前已結束的舊城歷史不重發，
+   * 舊資料的轉換另行規劃（#22）。時間跟著 entry 存進 journal，重播不會改變。
+   */
+  workStart: {
+    precheck(state, op) {
+      if (op.cityId !== state.cityId) return "wrong_city";
+      if (state.work.since != null) return "already_started";
+      return Number.isFinite(Number(op.at)) ? null : "invalid_work_start";
+    },
+    apply(state, entry) {
+      state.work.since = Number(entry.at);
+    },
+  },
+  /**
+   * 共用城市的基本收入（#23）：一個結束的有效工作回合，把 non-cache input + output token
+   * 加進共用倉庫的計量器；每滿 WORK_TOKENS_PER_UNIT 收成一份建材，餘數保留。
+   *
+   * entry 自己帶收成的資源向量（調整費率不改寫已落帳的結果）；`sources` 是這個回合用掉的
+   * 用量來源鍵，寫進城級 claim 索引——兩個 space 或恢復對話後的另一個 epoch 重送同一份
+   * 工作時，整筆不重複入帳。舊版各城帳本沒有這種 entry，重播不受影響。
+   */
+  income: {
+    precheck(state, op) {
+      if (op.cityId !== state.cityId) return "wrong_city";
+      if (!(Number.isInteger(Number(op.tokens)) && Number(op.tokens) > 0)) return "invalid_income";
+      if (!Array.isArray(op.sources) || op.sources.length === 0) return "missing_sources";
+      // 收成要跟「這筆提交之前」的計量器餘數相符：CAS 重試重新計算，驗的也是同一條規則。
+      const expected = workYieldOf(Number(state.work.tokens ?? 0) + Number(op.tokens));
+      const paid = Object.entries(expected);
+      const got = Object.entries(op.resources ?? {});
+      if (got.length !== paid.length || !paid.every(([key, amount]) => Number(op.resources?.[key]) === amount)) {
+        return "rate_mismatch";
+      }
+      if (op.sources.some((source) => state.claims.has(claimKey(op.cityId, source)))) return "source_exists";
+      return null;
+    },
+    apply(state, entry) {
+      const total = Number(state.work.tokens ?? 0) + Number(entry.tokens);
+      state.work.tokens = total % WORK_TOKENS_PER_UNIT;
+      for (const [name, amount] of Object.entries(entry.resources ?? {})) {
+        state.resources[name] = Number(state.resources[name] ?? 0) + Number(amount);
+      }
+      for (const source of entry.sources ?? []) state.claims.set(claimKey(entry.cityId, source), entry.journalSeq);
     },
   },
   /**
@@ -928,6 +977,7 @@ export class CityLedger {
       segment,
       resources: state.resources,
       research: state.research,
+      work: state.work,
       market: state.market,
       // 每一組索引的內容摘要（固定 6 個 16 進位字串；不隨資料量成長）。
       digests: Object.fromEntries(Object.entries(built).map(([part, result]) => [part, result.digest])),
@@ -1026,6 +1076,7 @@ export class CityLedger {
       for (const [key, packed] of read.activities.entries) state.activities.set(key, await this.unpackRecord(packed));
       state.resources = manifest.resources ?? state.resources;
       state.research = manifest.research ?? state.research;
+      state.work = manifest.work ?? state.work;
       state.market = manifest.market ?? state.market;
       return { state, segment: manifest.segment };
     } catch (error) {

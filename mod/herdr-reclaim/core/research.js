@@ -25,7 +25,7 @@ export function researchOpId(cityId, record, round) {
 }
 
 /** 目前的 session → 紀錄（同一支 session 可能有多個 writer epoch；身份取第一筆）。 */
-function sessionIndex(activities) {
+export function sessionIndex(activities) {
   const byId = new Map();
   for (const record of activities ?? []) {
     if (!byId.has(record.sessionId)) byId.set(record.sessionId, record);
@@ -34,7 +34,7 @@ function sessionIndex(activities) {
 }
 
 /** child → 上層 → … → 實際建格的 root（§1、§6.1）。 */
-function rootOf(byId, sessionId) {
+export function rootOf(byId, sessionId) {
   const seen = new Set();
   let current = byId.get(sessionId);
   let root = current ?? null;
@@ -47,7 +47,7 @@ function rootOf(byId, sessionId) {
 }
 
 /** §1、§6.1：只有互動的 root 與互動的 fork 建格；它們的樹才算遠征。 */
-function createsTile(record) {
+export function createsTile(record) {
   return record?.interactive === true && record.role !== "child";
 }
 
@@ -55,7 +55,7 @@ function createsTile(record) {
  * 一支 session（一個 writer epoch）的回合：用 eventSeq 判斷哪些事件屬於哪個回合，
  * 所以同一個時間戳開關兩次也不會分錯。用量事件依當時的 visit 記在它發生的那座城。
  */
-function roundsOf(record) {
+export function roundsOf(record) {
   const events = [...(record.events ?? [])].sort((a, b) => a.eventSeq - b.eventSeq);
   const rounds = [];
   let cityId = null;
