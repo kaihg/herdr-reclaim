@@ -12,7 +12,8 @@
 // 選址、預定地與自動施工是 #25–#27；舊版各城帳本（`cities/<hash>/`）原封不動：共用帳本放在
 // 別的目錄，不讀也不改它們。
 import { claimKey } from "./ledger.js";
-import { ACHIEVEMENT_YIELD, WORK_TOKENS_PER_UNIT, WORK_YIELD, workYieldOf } from "./rules.js";
+import { ACHIEVEMENT_YIELD, CITY_BUILDINGS, WORK_TOKENS_PER_UNIT, WORK_YIELD, workYieldOf } from "./rules.js";
+import { missingOf } from "./city-map.js";
 import { changesOfCommit } from "./harvest.js";
 import { commitContexts } from "./commit-evidence.js";
 import { createsTile, rootOf, roundsOf, sessionIndex } from "./research.js";
@@ -141,10 +142,15 @@ export async function ingestIncome(ledger, { activities = [], activateAt } = {})
 }
 
 /**
- * 公開的共用城市讀取模型：只有庫存與工作進度，沒有工地。
- * 各 space 讀到的是同一份資料（同一個帳本），所以切 repo 或重開 herdr 庫存都一樣。
+ * 公開的共用城市讀取模型：庫存、工作進度與唯一的建設目標。
+ * 各 space 讀到的是同一份資料（同一個帳本），所以切 repo 或重開 herdr 庫存與預定地都一樣。
+ * `plan.missing` 是配方減掉現在庫存的差額（還沒支付任何材料），給「備料中」用。
  */
 export function readSharedCity(state = {}) {
+  const plan = state.plan
+    ? { ...state.plan, costs: { ...state.plan.costs }, cells: (state.plan.cells ?? []).map((cell) => ({ ...cell })) }
+    : null;
+  if (plan) plan.missing = missingOf(plan.costs, state.resources);
   return {
     schema: 1,
     city: {
@@ -152,9 +158,31 @@ export function readSharedCity(state = {}) {
       name: "共用城市",
       resources: Object.fromEntries(Object.keys(WORK_YIELD).map((key) => [key, Number(state.resources?.[key] ?? 0)])),
       work: { tokens: Number(state.work?.tokens ?? 0), unitTokens: WORK_TOKENS_PER_UNIT },
+      plan,
     },
   };
+}
 
+/**
+ * 指定建設目標（#25）：選一棟建築與錨點，整片占地成為唯一的預定地。不動庫存——缺料也能先指定，
+ * 備齊之後才支付（#26）。兩個視窗同時送出時由帳本的前提檢查裁決：最多一個生效，另一個整筆被拒，
+ * 不會留下半片占地；opId 綁住建築與錨點，同一處重送是重播，不同處才是第二個目標。
+ */
+export async function placePlan(ledger, { building, x, y, at } = {}) {
+  const def = CITY_BUILDINGS[building];
+  const when = Number.isFinite(Number(at)) ? Number(at) : Date.now();
+  return ledger.submit(() => ({
+    opId: `plan:${ledger.cityId}:${building}:${x},${y}:${when}`,
+    kind: "plan",
+    at: when,
+    cityId: ledger.cityId,
+    building,
+    x,
+    y,
+    w: def?.footprint.w ?? 0,
+    h: def?.footprint.h ?? 0,
+    costs: { ...(def?.costs ?? {}) },
+  }));
 }
 
 /**

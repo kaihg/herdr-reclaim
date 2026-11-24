@@ -5,8 +5,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { CityLedger, cityDir } from "../core/ledger.js";
 import { ingestScenario } from "../core/ingest.js";
-import { ACHIEVEMENT_YIELD, RECIPES, WORK_TOKENS_PER_UNIT, WORK_YIELD } from "../core/rules.js";
-import { SHARED_CITY_ID, ingestAchievements, ingestIncome, readSharedCity, sharedCityDir } from "../core/shared-city.js";
+import { ACHIEVEMENT_YIELD, CITY_BUILDINGS, RECIPES, WORK_TOKENS_PER_UNIT, WORK_YIELD } from "../core/rules.js";
+import { SHARED_CITY_ID, ingestAchievements, ingestIncome, placePlan, readSharedCity, sharedCityDir } from "../core/shared-city.js";
+import { legalSites, revealedCells, siteCheck, terrainAt } from "../core/city-map.js";
 import { createFileIo } from "./fs-io.js";
 
 const REPO_A = "/tmp/reclaim-23-a/.git";
@@ -428,5 +429,221 @@ describe("明確成果的額外收成（#24）", () => {
     });
     // 連基本收入也不發：這不是互動工作（與 #23 同一條判準）。
     expect(stock(await cityAt(headlessDir))).toEqual([0, 0, 0]);
+  });
+});
+
+// ticket #25：選址與預定地。固定地圖（core/city-map.js 的起始揭開區）＋玩家操作寫進實際隔離帳本，
+// 再從公開的共用城市讀取模型核對合法位置、整棟預覽與預定地；不測私有欄位或寫入順序。
+const at = (x, y) => ({ x, y });
+const keysOf = (cells) => cells.map((cell) => `${cell.x},${cell.y}`).sort();
+const problemsOf = (preview) => preview.cells.map((cell) => cell.problem).filter(Boolean);
+
+/** 每一筆下令都像玩家在某個視窗按下「預定這裡」：帶自己的時間。 */
+let clock = 0;
+const order = (ledger, building, { x, y }) => placePlan(ledger, { building, x, y, at: T(900_000 + ++clock) });
+
+/**
+ * 會在 journal 寫入前互相等待的兩個 IO：兩個視窗讀到同一份狀態才各自寫，真的撞在一起。
+ * 另一邊沒有跟上時最多等 2 秒就放行（回歸時是「競爭沒成立」的失敗，不是整個測試卡住）。
+ */
+function racingIos() {
+  let armed = false;
+  let waiting = 0;
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const beforeWrite = async (file) => {
+    if (!armed || !file.includes("/journal/")) return;
+    waiting += 1;
+    if (waiting === 2) { armed = false; release(); }
+    await Promise.race([gate, new Promise((resolve) => setTimeout(resolve, 2_000))]);
+  };
+  return { ios: [createFileIo({ beforeWrite }), createFileIo({ beforeWrite })], arm: () => { armed = true; } };
+}
+
+describe("選址與預定地（#25）", () => {
+  test("起始揭開區可以隔一格蓋市場；不同占地的建築各有自己的合法位置；過往工作不影響選址", async () => {
+    const dir = root("start-area");
+    const ledger = await sharedLedger(dir);
+    const fresh = readSharedCity(await ledger.state()).city;
+
+    // 城鎮中心是 (0..1, 0..1)；市場 2×2 放在 (3..4, 0..1)，中間隔著 x = 2 那一行空地。
+    expect(CITY_BUILDINGS.market.footprint).toEqual({ w: 2, h: 2 });
+    expect(keysOf(legalSites(fresh, "market"))).toContain("3,0");
+    const market = siteCheck(fresh, "market", at(3, 0));
+    expect(market.ok).toBe(true);
+    expect(keysOf(market.cells)).toEqual(["3,0", "3,1", "4,0", "4,1"]);
+
+    // 1×1 的民居可以貼著揭開區的邊（右邊一格就是迷霧），2×2 的市場不行：合法位置依占地而定。
+    const houses = keysOf(legalSites(fresh, "house"));
+    const markets = keysOf(legalSites(fresh, "market"));
+    expect(houses).toContain("4,0");
+    expect(markets).not.toContain("4,0");
+    expect(houses.length).toBeGreaterThan(markets.length);
+    // 每一個合法位置的整棟占地都在已揭開的土地上。
+    const revealed = revealedCells(fresh);
+    for (const site of legalSites(fresh, "market")) {
+      expect(siteCheck(fresh, "market", site).cells.every((cell) => revealed.has(`${cell.x},${cell.y}`))).toBe(true);
+    }
+
+    // 不同專案、不同對話的工作入帳之後，選址還是同一張地圖：不依 session 配地、不另占格。
+    await settle(ledger, [
+      activity({ sessionId: "a", events: round(REPO_A, T(0), T(60_000), [usageEvent(T(1_000), "a1", TEN_K, { sessionId: "a" })]) }),
+      activity({ sessionId: "b", events: round(REPO_B, T(70_000), T(90_000), [usageEvent(T(71_000), "b1", TEN_K, { sessionId: "b" })]) }),
+    ]);
+    const worked = await cityAt(dir);
+    expect(stock(worked)).toEqual(times(2));
+    expect(worked.plan).toBeNull();
+    expect(keysOf(legalSites(worked, "market"))).toEqual(markets);
+    expect(keysOf(legalSites(worked, "house"))).toEqual(houses);
+  });
+
+  test("整棟占地落在草地、疏林、碎石就合法；一角碰到深水、峭壁、迷霧、城鎮中心或預定地整棟都不能放", async () => {
+    const dir = root("footprint");
+    const ledger = await sharedLedger(dir);
+    const city = readSharedCity(await ledger.state()).city;
+
+    // 疏林與碎石混合的 2×2：跟草地一樣合法。
+    const mixed = siteCheck(city, "library", at(1, -3));
+    expect(new Set(mixed.cells.map((cell) => cell.terrain))).toEqual(new Set(["scrub", "rubble"]));
+    expect(mixed.ok).toBe(true);
+
+    // 只有一角不合法：其他三格都是可建的空地。
+    const corners = [
+      [at(-2, -3), "water"],
+      [at(3, -2), "cliff"],
+      [at(3, 3), "fog"],
+      [at(-1, -1), "center"],
+    ];
+    for (const [anchor, problem] of corners) {
+      const preview = siteCheck(city, "library", anchor);
+      expect(preview.ok).toBe(false);
+      expect(problemsOf(preview)).toEqual([problem]);
+      // 迷霧裡的地形還沒揭開：預覽不洩漏它是什麼地。
+      if (problem === "fog") expect(preview.cells.find((cell) => cell.problem === "fog").terrain).toBeNull();
+      const result = await order(ledger, "library", anchor);
+      expect(result.status).toBe("rejected");
+      expect(result.reason).toBe(`site_${problem}`);
+    }
+    expect((await cityAt(dir)).plan).toBeNull(); // 被拒的下令不留任何占地
+
+    // 已有預定地：碰到它一角的位置也不能放（同時也因為一次只能有一個目標）。
+    expect((await order(ledger, "market", at(3, 0))).status).toBe("applied");
+    const planned = await cityAt(dir);
+    const touching = siteCheck(planned, "house", at(3, 0));
+    expect(problemsOf(touching)).toEqual(["plan"]);
+    expect(problemsOf(siteCheck(planned, "library", at(2, -1)))).toEqual(["plan"]);
+    expect(keysOf(legalSites(planned, "house"))).not.toContain("4,1");
+  });
+
+  test("預覽與實際下令一致：預覽合法的位置下令成功，預覽不合法的位置下令被拒且不留占地", async () => {
+    for (const building of Object.keys(CITY_BUILDINGS)) {
+      const rejectDir = root(`agree-${building}`);
+      const rejecter = await sharedLedger(rejectDir);
+      const city = readSharedCity(await rejecter.state()).city;
+      const legal = new Set(keysOf(legalSites(city, building)));
+      expect(legal.size).toBeGreaterThan(0);
+      for (let x = -5; x <= 6; x++) {
+        for (let y = -5; y <= 6; y++) {
+          const preview = siteCheck(city, building, at(x, y));
+          expect(preview.ok).toBe(legal.has(`${x},${y}`));
+          if (preview.ok) continue;
+          const result = await order(rejecter, building, at(x, y));
+          expect(result.status).toBe("rejected");
+          expect(result.reason).toBe(`site_${problemsOf(preview)[0]}`);
+        }
+      }
+      expect((await cityAt(rejectDir)).plan).toBeNull();
+      // 合法的每一處都真的下得了令（各自在一座新城，因為一次只能有一個目標）。
+      for (const key of legal) {
+        const [x, y] = key.split(",").map(Number);
+        const acceptDir = root(`accept-${building}`);
+        const result = await order(await sharedLedger(acceptDir), building, at(x, y));
+        expect(result.status).toBe("applied");
+        const plan = (await cityAt(acceptDir)).plan;
+        expect(keysOf(plan.cells)).toEqual(keysOf(siteCheck(city, building, at(x, y)).cells));
+      }
+    }
+  });
+
+  test("缺料時指定位置：整片占地保留、庫存不預扣；換 space、重開與 checkpoint 後仍是同一個目標", async () => {
+    const dir = root("short-of-stock");
+    const ledger = await sharedLedger(dir);
+    await settle(ledger, [
+      activity({ sessionId: "a", events: round(REPO_A, T(0), T(60_000), [usageEvent(T(1_000), "a1", TEN_K, { sessionId: "a" })]) }),
+    ]);
+    const before = await cityAt(dir);
+    expect(stock(before)).toEqual(times(1));
+    const costs = CITY_BUILDINGS.library.costs;
+    expect(Object.entries(costs).some(([key, need]) => before.resources[key] < need)).toBe(true);
+
+    expect((await order(ledger, "library", at(-1, 2))).status).toBe("applied");
+    const reserved = await cityAt(dir);
+    expect(stock(reserved)).toEqual(times(1)); // 庫存不預扣
+    expect(reserved.plan).toMatchObject({ building: "library", label: CITY_BUILDINGS.library.label, x: -1, y: 2, costs });
+    expect(keysOf(reserved.plan.cells)).toEqual(["-1,2", "-1,3", "0,2", "0,3"]);
+    // 還缺多少：配方減掉現在的庫存（不會是負數）。
+    expect(reserved.plan.missing).toEqual(Object.fromEntries(Object.entries(costs)
+      .map(([key, need]) => [key, Math.max(0, need - reserved.resources[key])])
+      .filter(([, amount]) => amount > 0)));
+
+    // 之後的工作照常進倉庫，不被預定地吃掉；一次只有一個目標，第二個下令被拒。
+    await settle(ledger, [
+      activity({ sessionId: "a", events: round(REPO_A, T(0), T(60_000), [usageEvent(T(1_000), "a1", TEN_K, { sessionId: "a" })]) }),
+      activity({ sessionId: "b", events: round(REPO_B, T(70_000), T(90_000), [usageEvent(T(71_000), "b1", TEN_K, { sessionId: "b" })]) }),
+    ]);
+    expect(stock(await cityAt(dir))).toEqual(times(2));
+    const second = await order(ledger, "house", at(3, 0));
+    expect(second).toMatchObject({ status: "rejected", reason: "plan_exists" });
+
+    // 另一個 space（另一個帳本實例）、重開、做 checkpoint 之後：同一個目標、同一片占地。
+    const otherSpace = await cityAt(dir);
+    expect(otherSpace.plan).toEqual((await cityAt(dir)).plan);
+    const reopened = await sharedLedger(dir);
+    await reopened.checkpoint();
+    const afterCheckpoint = await cityAt(dir);
+    expect(afterCheckpoint.plan).toEqual(otherSpace.plan);
+    expect(stock(afterCheckpoint)).toEqual(times(2));
+    expect(siteCheck(afterCheckpoint, "house", at(0, 3)).ok).toBe(false);
+  });
+
+  test("兩個視窗同時送出目標：最多一個生效，未成功的位置不殘留占地", async () => {
+    const cases = [
+      { name: "apart", a: ["market", at(3, 0)], b: ["library", at(-1, 2)] },
+      { name: "overlap", a: ["market", at(3, 0)], b: ["house", at(4, 1)] },
+    ];
+    for (const { name, a, b } of cases) {
+      const dir = root(`race-${name}`);
+      const { ios, arm } = racingIos();
+      const [windowA, windowB] = await Promise.all(ios.map((io) => sharedLedger(dir, { io })));
+      arm();
+      const results = await Promise.all([order(windowA, ...a), order(windowB, ...b)]);
+      const won = results.filter((result) => result.status === "applied");
+      expect(won).toHaveLength(1);
+      const lost = results.find((result) => result.status !== "applied");
+      expect(lost.reason).toBe("plan_exists");
+      // 兩個視窗確實撞在一起：輸的那一邊是重讀之後才被拒。
+      expect(lost.attempts).toBeGreaterThan(1);
+
+      const city = await cityAt(dir);
+      const [winner, loser] = results[0].status === "applied" ? [a, b] : [b, a];
+      expect(city.plan).toMatchObject({ building: winner[0], ...winner[1] });
+      expect(keysOf(city.plan.cells)).toEqual(keysOf(siteCheck({ plan: null }, winner[0], winner[1]).cells));
+      expect(stock(city)).toEqual([0, 0, 0]);
+      // 輸家的位置沒有殘留占地：預定地只有贏家那一片，輸家自己那幾格（如果不在贏家占地裡）
+      // 仍是空地；重疊的情況由上一行的「預定地＝贏家整棟占地」保證沒有多出來的格子。
+      const winnerCells = new Set(keysOf(city.plan.cells));
+      const leftover = siteCheck(city, loser[0], loser[1]).cells.filter((cell) => !winnerCells.has(`${cell.x},${cell.y}`));
+      if (name === "apart") expect(leftover.length).toBeGreaterThan(0);
+      for (const cell of leftover) expect(cell.problem).toBeNull();
+    }
+  });
+
+  test("固定地圖的地形：起始區的格子都看得到地形，迷霧外也有確定的地形（重算一樣）", () => {
+    expect(terrainAt(at(0, 0))).toBe("grass");
+    expect(terrainAt(at(-2, -3))).toBe("water");
+    expect(terrainAt(at(4, -2))).toBe("cliff");
+    expect(terrainAt(at(1, -3))).toBe("scrub");
+    expect(terrainAt(at(2, -2))).toBe("rubble");
+    for (const [x, y] of [[12, -7], [-30, 41], [5, 5]]) expect(terrainAt(at(x, y))).toBe(terrainAt(at(x, y)));
   });
 });

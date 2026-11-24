@@ -13,6 +13,7 @@ import { h_flex, v_flex } from "gpui-base";
 
 import { CENTER, CENTER_CELLS, MAP_RADIUS, cellAtEvent, contentSize, keyOf, originInContent, projectTile } from "../core/grid.js";
 import { GROUND_MOCK, PLOT_DIAMOND, buildingOf, buildingPolygons, factionStyle, groundOf, legendGroups } from "./assets.js";
+import { TERRAIN, terrainAt } from "../core/city-map.js";
 
 const LOCAL = { left: 0, top: 0 };
 /** 靜態底層快取：key 只有幾何（半徑與格大小），值是不可變的原生路徑。 */
@@ -141,6 +142,13 @@ function basePaths(radius, tile) {
 /** 已揭開的格子（少數）：每次重繪重建一條路徑。 */
 function stroked(cells, tile, origin, dash) {
   const builder = dash ? PathBuilder.stroke(1).dash_array(dash) : PathBuilder.stroke(1);
+  for (const spot of cells) builder.add_polygon(diamondPoints(spot, tile, origin)).close();
+  return builder.build();
+}
+
+/** 一整片格子填成同一個顏色（已揭開的土地把迷霧的斜線蓋掉，露出來的是地面）。 */
+function filled(cells, tile, origin) {
+  const builder = PathBuilder.fill();
   for (const spot of cells) builder.add_polygon(diamondPoints(spot, tile, origin)).close();
   return builder.build();
 }
@@ -295,4 +303,107 @@ function cellName(entry) {
   const name = typeof entry.sessionName === "string" ? Array.from(entry.sessionName.trim()) : [];
   if (!name.length) return String(entry.rootSessionId).slice(0, 8);
   return name.length > 7 ? `${name.slice(0, 6).join("")}…` : name.join("");
+}
+
+// ---- 共用城市的地圖（#25）
+
+/**
+ * 共用城市的地圖：固定地形、已揭開的土地、唯一的預定地，以及選址時的合法位置與整棟預覽。
+ * 只有已揭開的格子收點擊（迷霧裡不能選址）；每一格自己收事件，命中同樣回到地面菱形。
+ *
+ * `legal` 是選好建築之後全部合法錨點；`preview` 是 `siteCheck` 的結果——預覽與下令共用同一份
+ * 判準，所以畫成綠色的整片占地就是下令會成功的那一片。
+ */
+export function sharedMapView({
+  revealed, plan, legal = [], preview = null, selected = null, theme: t, tile, camera,
+  radius = MAP_RADIUS, onPick, onPan, viewport = null,
+}) {
+  const origin = originInContent(radius, tile);
+  const base = basePaths(radius, tile);
+  const planCells = new Set((plan?.cells ?? []).map((cell) => keyOf(cell)));
+  const previewCells = new Map((preview?.cells ?? []).map((cell) => [keyOf(cell), cell]));
+  const legalAnchors = new Set(legal.map((site) => keyOf(site)));
+  const points = localDiamond(tile);
+  const cells = [];
+  const open = [];
+  for (let x = -radius; x <= radius; x++) {
+    for (let y = -radius; y <= radius; y++) {
+      const spot = { x, y };
+      const key = keyOf(spot);
+      if (!revealed.has(key)) continue;
+      open.push(spot);
+      const marked = previewCells.get(key);
+      const terrain = marked?.terrain ?? terrainAt(spot);
+      const blocked = marked?.problem != null;
+      const fill = marked
+        ? Background.solid(t[blocked ? "blocked" : "done"]).opacity(0.42)
+        : planCells.has(key)
+          ? Background.solid(t.accent).opacity(0.22)
+          : Background.solid(t[TERRAIN[terrain]?.token] ?? t.raised).opacity(0.5);
+      const outline = marked
+        ? PathBuilder.stroke(1.5).add_polygon(points).close().build()
+        : planCells.has(key)
+          ? stroked([LOCAL_CELL], tile, LOCAL, [4, 3])
+          : legalAnchors.has(key)
+            ? stroked([LOCAL_CELL], tile, LOCAL, [2, 4])
+            : stroked([LOCAL_CELL], tile, LOCAL);
+      const outlineColor = marked
+        ? t[blocked ? "blocked" : "done"]
+        : planCells.has(key) ? t.accent
+        : legalAnchors.has(key) ? t.accent
+        : selected && selected.x === x && selected.y === y ? t.accent
+        : TERRAIN[terrain]?.buildable === false ? t[TERRAIN[terrain].token] ?? t.border : t.border;
+      cells.push(cellBox(spot, tile, origin, radius, onPick, camera).children([
+        tilePath(fillPath(points), fill, tile),
+        tilePath(outline, outlineColor, tile),
+      ]));
+    }
+  }
+  // 預覽伸進迷霧的那一角：不揭開地形，只把「這一格不能放」畫出來（不建立點擊區）。
+  const veil = [];
+  for (const cell of previewCells.values()) {
+    if (revealed.has(keyOf(cell))) continue;
+    const spot = projectTile(cell, tile);
+    veil.push(div()
+      .absolute()
+      .left(camera.x + origin.left + spot.left)
+      .top(camera.y + origin.top + spot.top)
+      .w(tile.w)
+      .h(tile.h)
+      .children([
+        tilePath(fillPath(localDiamond(tile)), Background.solid(t.blocked).opacity(0.35), tile),
+        tilePath(PathBuilder.stroke(1.5).add_polygon(localDiamond(tile)).close().build(), t.blocked, tile),
+      ]));
+  }
+  const size = contentSize(radius, tile);
+  const children = [
+    fullPath(base.fog, Background.pattern_slash(t.dim, 1, 4), size, camera),
+    // 已揭開的土地先蓋掉迷霧的斜線：揭開就是看得到地面，不是隔著霧看。
+    fullPath(filled(open, tile, origin), t.background, size, camera),
+    fullPath(base.outline, t.border, size, camera),
+    ...centerBlock({ center: { ...CENTER, label: "城鎮中心" } }, t, tile, origin, radius, onPick, camera),
+    ...cells,
+    ...veil,
+  ];
+  // 預定地的標籤掛在錨點那一格（沒有事件，不擋點擊）。
+  if (plan) {
+    const spot = projectTile({ x: plan.x, y: plan.y }, tile);
+    children.push(div()
+      .absolute()
+      .left(Math.max(0, Math.min(camera.x + origin.left + spot.left - tile.w / 2, (viewport?.width ?? size.width) - tile.w * 2)))
+      .top(camera.y + origin.top + spot.top + Math.round(tile.h * 0.6))
+      .w(tile.w * 2)
+      .text_center()
+      .text_size(labelSize(tile))
+      .text_color(t.accent)
+      .child(`預定·${plan.label}`));
+  }
+  return div()
+    .id("map")
+    .size_full()
+    .relative()
+    .overflow_hidden()
+    .bg(t.background)
+    .on_scroll_wheel((event, cx) => onPan(event.delta, cx))
+    .child(div().id("map-view").relative().size_full().children(children));
 }

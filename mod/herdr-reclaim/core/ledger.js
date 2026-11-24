@@ -32,7 +32,8 @@ import { BlobStore } from "./blobs.js";
 import { byteLen, canonicalJson, hashText } from "./bytes.js";
 import { casWrite, rejectUnlessConflict } from "./cas.js";
 import { PrefixIndex } from "./pages.js";
-import { ACHIEVEMENT_YIELD, BOOST_POINTS_PER_PARCHMENT, CLEAR_POINTS, RECIPES, RESEARCH_TOKENS_PER_PARCHMENT, RESOURCES, RULES_VERSION, LEGACY_TRADE_GIVE, WORK_TOKENS_PER_UNIT, affordable, tradeTerms, workYieldOf } from "./rules.js";
+import { ACHIEVEMENT_YIELD, BOOST_POINTS_PER_PARCHMENT, CITY_BUILDINGS, CLEAR_POINTS, RECIPES, RESEARCH_TOKENS_PER_PARCHMENT, RESOURCES, RULES_VERSION, LEGACY_TRADE_GIVE, WORK_TOKENS_PER_UNIT, affordable, tradeTerms, workYieldOf } from "./rules.js";
+import { siteCheck } from "./city-map.js";
 import { historyRecordOf } from "./history.js";
 
 export { byteLen, hashText };
@@ -149,6 +150,7 @@ const zeroResources = () => Object.fromEntries(RESOURCES.map((key) => [key, 0]))
  * `research.tokens` 是這座城還沒換成羊皮卷的研究進度（餘數，§7.4）；
  * `work.tokens` 是共用城市（#23）還沒換成建材的有效工作進度（餘數）；
  * `market` 分開記錄市集轉入與轉出，跟 commit 的直接發放分開（§11）。
+ * `plan` 是共用城市唯一的建設目標（#25）：建築、錨點與整片占地；沒有目標時是 null。
  */
 export function emptyState(cityId) {
   return {
@@ -165,6 +167,7 @@ export function emptyState(cityId) {
     resources: zeroResources(),
     research: { tokens: 0 },
     work: { tokens: 0, since: null },
+    plan: null,
     market: { in: zeroResources(), out: zeroResources() },
   };
 }
@@ -542,6 +545,44 @@ export const KINDS = {
         state.resources[name] = Number(state.resources[name] ?? 0) + Number(amount);
       }
       for (const claim of entry.claims ?? []) state.claims.set(claimKey(entry.cityId, claim), entry.journalSeq);
+    },
+  },
+
+  /**
+   * 建設目標（#25）：玩家選定建築與錨點，整片占地成為唯一的預定地。這筆**不動庫存**——
+   * 材料夠不夠是備料與施工（#26）的事，缺料時照樣可以先指定位置。
+   *
+   * 前提：一次只有一個目標；建築、占地與配方要與規則表相符；每一格都必須已揭開、可建且
+   * 沒有被別的建築或預定地占用（判準與畫面預覽同一個 `siteCheck`）。碰不到任何一格的
+   * 第二個目標因此整筆被拒，不留下半片占地。
+   */
+  plan: {
+    precheck(state, op) {
+      if (op.cityId !== state.cityId) return "wrong_city";
+      if (state.plan) return "plan_exists";
+      const def = CITY_BUILDINGS[op.building];
+      if (!def) return "unknown_building";
+      if (Number(op.w) !== def.footprint.w || Number(op.h) !== def.footprint.h) return "footprint_mismatch";
+      if (!sameCosts(op.costs, def.costs)) return "recipe_mismatch";
+      const preview = siteCheck(state, op.building, { x: op.x, y: op.y });
+      const blocked = preview.cells.find((cell) => cell.problem);
+      return blocked ? `site_${blocked.problem}` : null;
+    },
+    apply(state, entry) {
+      const def = CITY_BUILDINGS[entry.building];
+      state.plan = {
+        building: entry.building,
+        label: def.label,
+        x: entry.x,
+        y: entry.y,
+        w: entry.w,
+        h: entry.h,
+        costs: { ...entry.costs },
+        cells: siteCheck({ plan: null }, entry.building, { x: entry.x, y: entry.y }).cells
+          .map((cell) => ({ x: cell.x, y: cell.y })),
+        at: Number(entry.at),
+        rulesVersion: entry.rulesVersion,
+      };
     },
   },
 
@@ -1003,6 +1044,7 @@ export class CityLedger {
       resources: state.resources,
       research: state.research,
       work: state.work,
+      plan: state.plan,
       market: state.market,
       // 每一組索引的內容摘要（固定 6 個 16 進位字串；不隨資料量成長）。
       digests: Object.fromEntries(Object.entries(built).map(([part, result]) => [part, result.digest])),
@@ -1102,6 +1144,7 @@ export class CityLedger {
       state.resources = manifest.resources ?? state.resources;
       state.research = manifest.research ?? state.research;
       state.work = manifest.work ?? state.work;
+      state.plan = manifest.plan ?? state.plan;
       state.market = manifest.market ?? state.market;
       return { state, segment: manifest.segment };
     } catch (error) {

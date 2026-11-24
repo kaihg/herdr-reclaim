@@ -9,8 +9,13 @@
 
 export const UI_SCHEMA = 1;
 
+/** 畫面顯示哪一座地圖：舊版各城的指揮桌，或共用城市（#25 的選址發生在共用城市的地圖上）。 */
+export const VIEW_REPO = "repo";
+export const VIEW_SHARED = "shared";
+const viewOf = (ui) => (ui?.view === VIEW_SHARED ? VIEW_SHARED : VIEW_REPO);
+
 export function emptyUi() {
-  return { schema: UI_SCHEMA, selections: {}, dev: false, hooks: {} };
+  return { schema: UI_SCHEMA, selections: {}, dev: false, hooks: {}, view: VIEW_REPO };
 }
 
 export function parseUi(text) {
@@ -19,7 +24,7 @@ export function parseUi(text) {
     const data = JSON.parse(text);
     if (!data || typeof data !== "object" || !data.selections || typeof data.selections !== "object") return emptyUi();
     const hooks = data.hooks && typeof data.hooks === "object" ? data.hooks : {};
-    return { schema: UI_SCHEMA, selections: data.selections, dev: data.dev === true, hooks };
+    return { schema: UI_SCHEMA, selections: data.selections, dev: data.dev === true, hooks, view: viewOf(data) };
   } catch {
     return emptyUi(); // 壞掉的 UI 檔不影響城鎮，回到預設選取
   }
@@ -32,6 +37,11 @@ export function withSelection(ui, cityId, selection) {
 /** 開發模式（顯示工程資訊）也是畫面自己的狀態，跟選取放在同一個檔案。 */
 export function withDev(ui, dev) {
   return { ...ui, schema: UI_SCHEMA, dev: dev === true };
+}
+
+/** 切換地圖（舊城／共用城市）：畫面自己的狀態，跟選取一起放在 ui.json。 */
+export function withView(ui, view) {
+  return { ...ui, schema: UI_SCHEMA, view: viewOf({ view }) };
 }
 
 /** 使用者對「這座城要不要開自動收成」的回答（目前只記「先不要」，不再重複詢問）。 */

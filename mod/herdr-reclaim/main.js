@@ -25,11 +25,12 @@ import { hostIo } from "./core/host-io.js";
 import { CasConflict, CityLedger, cityDir } from "./core/ledger.js";
 import { hooksStatus, installHooks, removeHooks } from "./core/hooks.js";
 import { RESEARCH_TOKENS_PER_PARCHMENT, RESOURCE_LABELS, RULES_VERSION } from "./core/rules.js";
-import { defaultSelection, parseUi, resolveSelection, selectionOf, serializeUi, withDev, withHookChoice, withSelection } from "./core/selection.js";
+import { VIEW_REPO, VIEW_SHARED, defaultSelection, parseUi, resolveSelection, selectionOf, serializeUi, withDev, withHookChoice, withSelection, withView } from "./core/selection.js";
 import { QUOTA_REFRESH_MS, QUOTA_SOURCE, claimQuotaAttempt, parseQuotaReport } from "./core/quota-source.js";
 import { quotaView, readQuotaView } from "./core/quota-view.js";
 import { CLEAR_POINTS, emptyCity, expeditionGroups, formatResearch, mergeActivities, readTown, readTownFromLedger, selectionDetail, tileLabel } from "./core/town.js";
-import { SHARED_CITY_ID, ingestAchievements, ingestIncome, readSharedCity, sharedCityDir } from "./core/shared-city.js";
+import { SHARED_CITY_ID, ingestAchievements, ingestIncome, placePlan, readSharedCity, sharedCityDir } from "./core/shared-city.js";
+import { TERRAIN, cityBuildings, legalSites, missingOf, revealedCells, siteCheck, terrainAt } from "./core/city-map.js";
 import { cityForFolders } from "./core/space-city.js";
 import { firstExpedition } from "./scenarios/first-expedition.js";
 import {
@@ -40,7 +41,7 @@ import { historyPanel } from "./ui/history.js";
 import { harvestPanel } from "./ui/harvests.js";
 import { DOCK_H, buildPanel, dockBar, marketPanel } from "./ui/dock.js";
 import { dockState, maxTrade, normalizeTrade, setTradeFrom, setTradeTo, stepTrade, tradePreview } from "./core/dock.js";
-import { mapView } from "./ui/map.js";
+import { mapView, sharedMapView } from "./ui/map.js";
 import { stageCounts, stageOf } from "./ui/assets.js";
 import { factionTag, guildBlock, investmentSection, quotaSection } from "./ui/standing.js";
 
@@ -81,6 +82,28 @@ const COMMIT_REASON_LABELS = {
 
 /** 操作失敗時的一行訊息（§7.6 的三種操作）。 */
 const ECONOMY_LABELS = { boost: "加速", build: "蓋房", trade: "市集" };
+
+/** 選址被拒的原因（帳本的前提檢查）：畫面上只翻成人看得懂的一句話。 */
+const SITE_PROBLEMS = {
+  fog: "迷霧", water: "深水", cliff: "峭壁", center: "城鎮中心", plan: "預定地", unknown_building: "未知建築",
+};
+const PLAN_REASONS = {
+  plan_exists: "已經有一個建設目標",
+  unknown_building: "未知的建築種類",
+  footprint_mismatch: "占地與規則表不符",
+  recipe_mismatch: "配方與規則表不符",
+  site_fog: "有一角還在迷霧裡",
+  site_water: "有一角是深水",
+  site_cliff: "有一角是峭壁",
+  site_center: "有一角是城鎮中心",
+  site_plan: "有一角是預定地",
+};
+const costsText = (costs = {}) => Object.entries(costs)
+  .map(([key, amount]) => `${RESOURCE_LABELS[key]} ${amount}`).join("・");
+const missingText = (missing = {}) => {
+  const text = Object.entries(missing).map(([key, amount]) => `${RESOURCE_LABELS[key]} ${amount}`).join("・");
+  return text || "材料已齊（施工接續在 #26）";
+};
 
 const clamp = (min, value, max) => Math.max(min, Math.min(max, value));
 
@@ -464,6 +487,10 @@ export default class Town extends View {
     this.harvestOpen = false;
     this.dockPanel = null;
     this.trade = null;
+    // 共用城市（#25）：地圖顯示哪一座城、正在選哪一種建築、預覽哪一個錨點。
+    this.view = VIEW_REPO;
+    this.picking = null;
+    this.preview = null;
     this.historyState = historyOpened();
     this.historyInput = InputState.new({ placeholder: "搜尋日期、城、session、commit 或成果路徑" });
     // 三條送出查詢的路都走同一個狀態機：輸入框的 submit 事件、Enter／Return 的 keydown，
@@ -492,9 +519,10 @@ export default class Town extends View {
           this.town = await loadTown(this.io);
           this.ui = parseUi(await this.io.read(uiPath()));
           if (first) this.devMode = this.ui.dev;
+          if (first) this.view = this.ui.view;
           // 畫面顯示哪一座城由目前的 space 決定（見 syncCity）；這裡只讓已選的遠征／格子
           // 在帳本變動後仍然有效（不在了就退回那座城的預設）。
-          if (this.selection && !this.selection.cityId.startsWith("placeholder:")) this.selection = resolveSelection(this.town, this.selection, this.selection.cityId);
+          if (this.view === VIEW_REPO && this.selection && !this.selection.cityId.startsWith("placeholder:")) this.selection = resolveSelection(this.town, this.selection, this.selection.cityId);
           this.note = null;
         } catch (error) {
           this.town = null;
@@ -813,6 +841,13 @@ export default class Town extends View {
     if (this.town?.quotas?.snapshot !== undefined) this.town.quotas = quotaView(this.town.quotas.snapshot);
     const started = Date.now();
     const t = theme();
+    // 共用城市（#25）與舊版各城的地圖是兩個畫面：選址發生在共用城市上，但舊城在正式切換前
+    // 仍然可用（#22：舊資料的轉換另行規劃），頂欄按鈕切換、選擇存在 ui.json。
+    if (this.view === VIEW_SHARED) {
+      const root = this.renderShared(t, cx);
+      this.finishMeasure(started);
+      return root;
+    }
     const city = this.syncCity();
     if (!city) {
       // 沒有城時也看得到未解析的活動（§4：不當成非 git，活動資料保留、可以重試）。
@@ -893,6 +928,354 @@ export default class Town extends View {
     this.metrics.pending = null;
     if (!pending || !this.metrics.samples[pending.kind]) return;
     this.metrics.samples[pending.kind] = recordSample(this.metrics.samples[pending.kind], Math.max(0, built - pending.at));
+  }
+
+  // ---- 共用城市（#25）：庫存、選址、整棟預覽與唯一的預定地
+
+  /**
+   * 切換地圖。`ui.json` 記住選擇（跟選取、開發模式同一個檔案），重開 herdr 還在同一張圖。
+   * 換圖時清掉未完成的選址與相機：兩張圖的座標系不同（舊城跟著 space 走，共用城市固定）。
+   */
+  setView(view, cx) {
+    this.view = view === VIEW_SHARED ? VIEW_SHARED : VIEW_REPO;
+    this.picking = null;
+    this.preview = null;
+    this.dockPanel = null;
+    // 兩張圖的座標系不同：相機、錨點與待處理的焦點都是上一張圖的，換圖時一起清掉。
+    // `syncedCityId` 也重設，切回舊城時才會從 ui.json 還原那一座城的選取（不是共用城市的格子）。
+    this.camera = null;
+    this.anchorCell = null;
+    this.focusCell = null;
+    this.mapArea = null;
+    this.syncedCityId = null;
+    this.ui = withView(this.ui ?? parseUi(null), this.view);
+    if (this.io) updateUi(this.io, (ui) => withView(ui, this.view)).catch(() => {});
+    cx.notify();
+  }
+
+  renderShared(t, cx) {
+    const shared = this.town?.shared?.city ?? null;
+    if (!shared) {
+      return v_flex()
+        .id("root")
+        .size_full()
+        .items_center()
+        .justify_center()
+        .gap(8)
+        .bg(t.canvas)
+        .text_color(t.muted)
+        .child(div().child(this.note ?? "共用城市還沒啟用：先開一個互動的 agent session，讓本機的工作進帳。"))
+        .child(hookButton("回舊城地圖", t, (cx2) => this.setView(VIEW_REPO, cx2)));
+    }
+    const zoom = zoomFactor();
+    const width = (this.rootSize.width || 940 * zoom) / zoom;
+    const height = (this.rootSize.height || 560 * zoom) / zoom;
+    const leftW = Math.round(clamp(MIN_LEFT_W, width * 0.19, MAX_LEFT_W));
+    const rightW = Math.round(clamp(MIN_RIGHT_W, width * 0.26, MAX_RIGHT_W));
+    // 共用城市沒有底部動作列：庫存常駐頂欄，選址在左側與地圖上完成。
+    const mapArea = { width: Math.max(80, width - leftW - rightW), height: Math.max(80, height - TOP_H) };
+    return v_flex()
+      .id("root")
+      .size_full()
+      .bg(t.canvas)
+      .text_size(12.5)
+      .text_color(t.foreground)
+      .on_size_change((size, cx2) => {
+        if (size.width === this.rootSize.width && size.height === this.rootSize.height) return;
+        this.rootSize = size;
+        cx2.notify();
+      })
+      .children([
+        this.sharedTopBar(shared, t, leftW, rightW, width),
+        h_flex().flex_1().min_h(0).children([
+          this.sharedPanel(shared, t, cx, leftW),
+          div()
+            .flex_1()
+            .min_w(0)
+            .h_full()
+            .relative()
+            .child(this.sharedMap(shared, t, cx, mapArea))
+            .when(this.metricsOpen && this.devMode, (element) => element.child(this.metricsPanel(t)))
+            .when(this.toast !== null, (element) => element.child(this.toastView(t))),
+          this.sharedDetail(shared, t, rightW, cx),
+        ]),
+      ]);
+  }
+
+  /** 頂欄：共用倉庫、工作進度與唯一的建設目標；右側是切回舊城與其他全域操作。 */
+  sharedTopBar(shared, t, leftW, rightW, width) {
+    const blockW = Math.round(clamp(96, rightW * 0.62, 176));
+    const centerW = Math.max(60, width - leftW - blockW - 52);
+    const stacked = centerW < 430;
+    const stock = h_flex()
+      .gap(10)
+      .items_center()
+      .child(div().text_size(10).text_color(t.dim).child("共用倉庫"))
+      .children(RESOURCES.filter((resource) => resource.key in shared.resources)
+        .map((resource) => resourceChip(resource, shared.resources[resource.key], t)));
+    const work = h_flex()
+      .gap(6)
+      .items_center()
+      .child(div().text_size(10).text_color(t.dim).child("工作"))
+      .child(div().text_size(12.5).child(`${shared.work.tokens}/${shared.work.unitTokens}`));
+    const target = div().text_size(10).text_color(t.muted).truncate().child(shared.plan
+      ? `建設目標：${shared.plan.label} (${shared.plan.x}, ${shared.plan.y})`
+      : "沒有建設目標：只累積庫存");
+    const center = stacked
+      ? v_flex().flex_1().min_w(0).overflow_hidden().gap(2).child(stock).child(work).child(target)
+      : h_flex().flex_1().min_w(0).overflow_hidden().items_center().justify_center().gap(14).child(stock).child(work).child(target);
+    return h_flex()
+      .id("top")
+      .flex_none()
+      .h(TOP_H)
+      .px(14)
+      .gap(12)
+      .items_center()
+      .bg(t.chrome)
+      .border_b(1)
+      .border_color(t.border)
+      .children([
+        v_flex()
+          .w(leftW)
+          .flex_none()
+          .overflow_hidden()
+          .child(div().text_size(10).text_color(t.dim).child("共用城市"))
+          .child(div().text_size(stacked ? 13 : 17).font_semibold().truncate().child(shared.name)),
+        center,
+        v_flex()
+          .w(blockW)
+          .flex_none()
+          .overflow_hidden()
+          .items_end()
+          .gap(3)
+          .child(h_flex().flex_wrap().gap(6).items_center().children([
+            hookButton("舊城地圖", t, (cx2) => this.setView(VIEW_REPO, cx2)),
+            hookButton("更新額度", t, (cx2) => this.refreshQuotas(cx2, { manual: true })),
+            hookButton(this.devMode ? "開發模式 ✓" : "開發模式", t, (cx2) => this.toggleDev(cx2)),
+          ])),
+      ]);
+  }
+
+  /** 左側：建設目標的狀態與可選的建築（占地、配方、還缺多少）。 */
+  sharedPanel(shared, t, cx, width) {
+    const plan = shared.plan;
+    return v_flex()
+      .id("city-panel")
+      .w(width)
+      .flex_none()
+      .min_h(0)
+      .gap(6)
+      .p(10)
+      .overflow_y_scrollbar()
+      .bg(t.chrome)
+      .border_r(1)
+      .border_color(t.border)
+      .children([
+        div().text_size(10).text_color(t.dim).child("建設目標（一次一項）"),
+        div().text_size(13).font_semibold().truncate().child(plan ? `預定：${plan.label}` : "選一棟建築"),
+        div().text_size(9).text_color(t.muted).child(plan
+          ? `位置 (${plan.x}, ${plan.y})、占地 ${plan.w}×${plan.h}；還缺 ${missingText(plan.missing)}`
+          : "選好建築後，地圖會標出全部合法位置；點一格看整棟預覽，再按「預定這裡」。"),
+        ...cityBuildings().map((building) => this.buildingCard(shared, building, t, cx)),
+        div().text_size(9).text_color(t.dim)
+          .child("草地、疏林、碎石地可以蓋；深水、峭壁與迷霧不行。預覽與下令用同一條規則。"),
+      ]);
+  }
+
+  /** 一種建築：點下去進入選址；已有預定地時只說明「一次一項」。 */
+  buildingCard(shared, building, t, cx) {
+    const selected = this.picking === building.name;
+    const locked = Boolean(shared.plan);
+    const missing = missingOf(building.costs, shared.resources);
+    const affordable = Object.keys(missing).length === 0;
+    return v_flex()
+      .id(`building-${building.name}`)
+      .w_full()
+      .flex_none()
+      .gap(2)
+      .p(7)
+      .rounded(6)
+      .cursor_pointer()
+      .bg(selected ? t.selected : t.surface)
+      .border(1)
+      .border_color(selected ? t.accent : t.border)
+      .hover((style) => style.bg(selected ? t.selected : t.hover))
+      .on_click((_event, cx2) => this.pickBuilding(shared, building.name, cx2))
+      .children([
+        div().text_size(11.5).text_color(locked && !selected ? t.dim : t.foreground)
+          .child(`${building.label}　${building.footprint.w}×${building.footprint.h}`),
+        div().text_size(9).text_color(t.muted).truncate().child(costsText(building.costs)),
+        div().text_size(9).text_color(affordable ? t.done : t.muted)
+          .child(affordable ? "材料已齊" : `還缺 ${missingText(missing)}`),
+      ]);
+  }
+
+  /** 選一種建築開始選址；已有預定地時不能換（一次只有一個目標）。 */
+  pickBuilding(shared, building, cx) {
+    if (shared.plan) {
+      this.showToast(`已經預定 ${shared.plan.label} (${shared.plan.x}, ${shared.plan.y})：一次只有一個建設目標`, cx);
+      return;
+    }
+    this.picking = this.picking === building ? null : building;
+    this.preview = null;
+    cx.notify();
+  }
+
+  /**
+   * 共用城市的地圖：相機與舊城同一套（固定格大小、雙軸捲動、選取帶進畫面）。
+   * 選址中點一格是「預覽整棟」；沒在選址時點一格只是看那一格的地形。
+   */
+  sharedMap(shared, t, cx, area) {
+    const tile = tileSize(area);
+    const size = contentSize(MAP_RADIUS, tile);
+    const anchor = this.focusCell ?? this.anchorCell ?? { x: 0.5, y: 0.5 };
+    const resized = area.width !== this.mapArea?.width || area.height !== this.mapArea?.height;
+    const moved = this.focusCell || !this.camera || this.camera.cityId !== SHARED_CITY_ID || resized;
+    if (moved) {
+      this.anchorCell = anchor;
+      this.camera = { cityId: SHARED_CITY_ID, ...cameraFor(anchor, area, MAP_RADIUS, tile) };
+    }
+    this.viewport = area;
+    this.mapArea = { width: area.width, height: area.height };
+    this.camera = { ...this.camera, ...clampCamera(this.camera, size, area) };
+    this.focusCell = null;
+    // 一次只有一個目標：別的視窗先預定了，這裡的預覽就一併收起，不顯示下得了令的樣子。
+    const selecting = !shared.plan && Boolean(this.picking);
+    return sharedMapView({
+      revealed: revealedCells(shared),
+      plan: shared.plan,
+      legal: selecting ? legalSites(shared, this.picking) : [],
+      preview: selecting && this.preview ? siteCheck(shared, this.picking, this.preview) : null,
+      selected: this.selection?.cityId === SHARED_CITY_ID ? this.selection : null,
+      theme: t,
+      tile,
+      camera: this.camera,
+      viewport: area,
+      onPick: ({ x, y }, cx2) => this.pickSite(x, y, cx2),
+      onPan: (delta, cx2) => {
+        if (!this.camera) return;
+        this.camera = { ...this.camera, ...panCamera(this.camera, delta, size, area) };
+        cx2.notify();
+      },
+    });
+  }
+
+  /**
+   * 點一格：選址中是整棟預覽，否則只是看那一格。`cellBox` 的命中會把方框的角落換算成鄰格，
+   * 所以這裡再確認一次：迷霧裡的格子不接受點擊，也不回報它的地形。
+   */
+  pickSite(x, y, cx) {
+    const shared = this.town?.shared?.city;
+    if (!shared || !revealedCells(shared).has(`${x},${y}`)) return;
+    this.mark("pick");
+    if (!shared.plan && this.picking) {
+      this.preview = { x, y };
+      cx.notify();
+      return;
+    }
+    this.selection = { kind: "site", cityId: SHARED_CITY_ID, x, y };
+    cx.notify();
+  }
+
+  /** 右側：整棟預覽與「預定這裡」；沒有預覽時顯示預定地或選取格的地形。 */
+  sharedDetail(shared, t, width, cx) {
+    const preview = !shared.plan && this.picking && this.preview ? siteCheck(shared, this.picking, this.preview) : null;
+    const plan = shared.plan;
+    const spot = this.selection?.cityId === SHARED_CITY_ID && this.selection.kind === "site" ? this.selection : null;
+    return v_flex()
+      .id("detail")
+      .w(width)
+      .flex_none()
+      .min_h(0)
+      .gap(9)
+      .p(10)
+      .overflow_y_scrollbar()
+      .bg(t.chrome)
+      .border_l(1)
+      .border_color(t.border)
+      .children([
+        div().text_size(10).text_color(t.dim).child(preview ? "整棟預覽" : "選址與預定地"),
+        ...(preview ? this.previewSection(preview, t, cx) : (plan ? this.planSection(plan, t) : this.spotSection(shared, spot, t))),
+        ...(this.devMode ? [
+          div().text_size(9).text_color(t.dim)
+            .child(`已揭開 ${revealedCells(shared).size} 格 · 預定地 ${plan ? 1 : 0} 項 · 帳本 ${SHARED_CITY_ID}`),
+        ] : []),
+        this.note ? div().text_size(9).text_color(t.muted).child(this.note) : null,
+      ].filter(Boolean));
+  }
+
+  previewSection(preview, t, cx) {
+    return [
+      div().text_size(14).font_semibold().child(`${preview.label} (${preview.x}, ${preview.y})`),
+      h_flex().gap(6).items_center()
+        .child(statusBadge(preview.ok ? "可以放" : "不能放", t))
+        .child(div().text_size(10).text_color(t.muted).child(preview.ok ? "整片占地都在可建的土地上" : "整棟都不能放")),
+      ...preview.cells.map((cell) => h_flex().gap(6).items_center()
+        .child(div().text_size(9).text_color(t.dim).child(`(${cell.x}, ${cell.y})`))
+        .child(div().text_size(10).text_color(cell.problem ? t.blocked : t.muted)
+          .child(cell.problem ? SITE_PROBLEMS[cell.problem] ?? cell.problem : TERRAIN[cell.terrain]?.label ?? "迷霧"))),
+      preview.ok ? hookButton("預定這裡", t, (cx2) => this.submitPlan(preview, cx2)) : null,
+      hookButton("取消選址", t, (cx2) => {
+        this.preview = null;
+        cx2.notify();
+      }),
+    ].filter(Boolean);
+  }
+
+  planSection(plan, t) {
+    return [
+      div().text_size(14).font_semibold().child(`預定：${plan.label}`),
+      h_flex().gap(6).items_center().child(statusBadge("預定地", t))
+        .child(div().text_size(10).text_color(t.muted).child(`(${plan.x}, ${plan.y})、占地 ${plan.w}×${plan.h}`)),
+      fieldRow({ label: "配方", value: costsText(plan.costs) }, t),
+      fieldRow({ label: "還缺", value: missingText(plan.missing) }, t),
+      div().text_size(9).text_color(t.muted).child("整片占地已經保留，庫存沒有預扣；材料備齊才支付並開工（施工接續在 #26）。"),
+    ];
+  }
+
+  spotSection(shared, spot, t) {
+    if (!spot) return [div().text_size(10).text_color(t.muted).child("點地圖上一格看地形；選好建築後點一格就是整棟預覽。")];
+    const terrain = revealedCells(shared).has(`${spot.x},${spot.y}`) ? terrainAt(spot) : null;
+    return [
+      div().text_size(14).font_semibold().child(`(${spot.x}, ${spot.y})`),
+      fieldRow({ label: "地形", value: terrain ? TERRAIN[terrain]?.label ?? terrain : "迷霧" }, t),
+      div().text_size(9).text_color(t.muted).child(
+        this.picking ? "這一格是整棟占地的左上角：在地圖點它就會顯示預覽。" : "選一棟建築之後，這裡會列出整棟占地的判斷。",
+      ),
+      ...(shared.plan ? [div().text_size(9).text_color(t.dim).child(`目前唯一的目標是 ${shared.plan.label} (${shared.plan.x}, ${shared.plan.y})。`)] : []),
+    ];
+  }
+
+  /**
+   * 下令：寫進共用帳本的 plan entry。成功就重讀共用城市（庫存與預定地），失敗只回報原因；
+   * 被拒的下令不寫任何東西，所以另一個視窗搶先時這裡不會留下半片占地。
+   */
+  submitPlan(preview, cx) {
+    const startedAt = Date.now();
+    const { building, x, y, label } = preview;
+    cx.spawn(async (cx2) => {
+      let text;
+      try {
+        const ledger = await new CityLedger({
+          io: this.io,
+          dir: sharedCityDir(adapterRoot(appHome())),
+          cityId: SHARED_CITY_ID,
+        }).open();
+        const result = await placePlan(ledger, { building, x, y, at: Date.now() });
+        if (result.status === "applied" || result.status === "duplicate") {
+          this.town = await refreshTown(this.io, this.town);
+          this.picking = null;
+          this.preview = null;
+          text = `已預定：${label} (${x}, ${y})`;
+        } else {
+          text = `沒有預定：${PLAN_REASONS[result.reason] ?? result.reason}`;
+        }
+      } catch (error) {
+        text = `預定失敗：${error}`;
+      }
+      this.metrics.pending = { kind: "action", at: startedAt };
+      this.showToast(text, cx2);
+    });
   }
 
   // ---- 上方：城鎮庫存與主要行會（§9、§14.1）
@@ -1098,6 +1481,7 @@ export default class Town extends View {
           .children(guildBlock(city, this.town?.quotas, t))
           .child(h_flex().flex_wrap().gap(6).items_center().children([
             ...(city === this.placeholder ? [] : [this.hookToggle(city, t)]),
+            hookButton("共用城市", t, (cx2) => this.setView(VIEW_SHARED, cx2)),
             hookButton("更新額度", t, (cx2) => this.refreshQuotas(cx2, { manual: true })),
             hookButton(this.devMode ? "開發模式 ✓" : "開發模式", t, (cx2) => this.toggleDev(cx2)),
           ]))
