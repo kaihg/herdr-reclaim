@@ -1089,15 +1089,7 @@ export default class Town extends View {
         div().text_size(13).font_semibold().child(`${shown.length} 格土地`),
         div().text_size(9).text_color(t.muted).truncate().child(summary || "還沒有土地"),
         ...this.hookBanner(city, t),
-        // 來源不明與未解析是診斷資訊：一般只看到狀態與數量，原因、sha、cwd 在開發模式才展開。
-        ...(city.unharvestedCommits?.length ? [
-          h_flex().gap(5).items_center().child(statusBadge("來源不明", t))
-            .child(div().text_size(9).text_color(t.dim).child(
-              this.devMode ? "不發資源、無人工補領" : `${city.unharvestedCommits.length} 筆`,
-            )),
-          ...(this.devMode ? city.unharvestedCommits.map((commit) => div().text_size(9).text_color(t.muted).truncate()
-            .child(`⚑ ${commit.sha.slice(0, 8)} · ${COMMIT_REASON_LABELS[commit.reason] ?? commit.reason}`)) : []),
-        ] : []),
+        // 未解析是診斷資訊：一般只看到狀態與數量，cwd 在開發模式才展開。
         ...(unresolved.length ? [
           h_flex().gap(5).items_center().child(statusBadge("未解析", t))
             .child(div().text_size(9).text_color(t.dim).child(`${unresolved.length} 筆活動`)),
@@ -1114,6 +1106,13 @@ export default class Town extends View {
         ...live.map((tile) => this.expeditionCard(city, tile, t, cx)),
         ...(live.length ? [] : [div().text_size(10).text_color(t.muted).child("目前沒有掛著的 agent")]),
         ...this.historySection(city, history, t, cx),
+        // 來源不明是工程資訊：只在開發模式顯示，放在資訊欄底部（含 sha 與原因）。
+        ...(this.devMode && city.unharvestedCommits?.length ? [
+          h_flex().gap(5).items_center().child(statusBadge("來源不明", t))
+            .child(div().text_size(9).text_color(t.dim).child(`${city.unharvestedCommits.length} 筆 · 不發資源、無人工補領`)),
+          ...city.unharvestedCommits.map((commit) => div().text_size(9).text_color(t.muted).truncate()
+            .child(`⚑ ${commit.sha.slice(0, 8)} · ${COMMIT_REASON_LABELS[commit.reason] ?? commit.reason}`)),
+        ] : []),
       ]);
   }
 
