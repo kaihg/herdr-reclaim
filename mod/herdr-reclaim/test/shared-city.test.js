@@ -208,6 +208,34 @@ describe("共用城市的基本收入（#23）", () => {
     expect(stock(await cityAt(dir))).toEqual(times(2));
   });
 
+  test("同一來源的用量被修正：以最後一份快照為準，缺欄位的早期快照不會讓整回合落空", async () => {
+    const dir = root("correction");
+    const ledger = await sharedLedger(dir);
+    const key = { sessionId: "claude", sourceKey: "anthropic#msg-1" };
+    const corrected = activity({
+      sessionId: "claude",
+      events: round(REPO_A, T(0), T(60_000), [
+        usageEvent(T(1_000), "msg-1", { inputNonCache: 100, unknownFields: ["output"] }, { ...key, provider: "anthropic" }),
+        usageEvent(T(2_000), "msg-1", TEN_K, { ...key, provider: "anthropic" }),
+      ]),
+    });
+    await settle(ledger, [corrected]);
+    expect(stock(await cityAt(dir))).toEqual(times(1));
+
+    // 重播同一份紀錄不再入帳；最後一份快照仍是未知時，整回合仍不結算。
+    await settle(await sharedLedger(dir), [corrected]);
+    expect(stock(await cityAt(dir))).toEqual(times(1));
+    const stillUnknown = activity({
+      sessionId: "claude2",
+      events: round(REPO_A, T(100_000), T(160_000), [
+        usageEvent(T(101_000), "msg-2", TEN_K, { sessionId: "claude2", sourceKey: "anthropic#msg-2", provider: "anthropic" }),
+        usageEvent(T(102_000), "msg-2", { ...TEN_K, unknownFields: ["output"] }, { sessionId: "claude2", sourceKey: "anthropic#msg-2", provider: "anthropic" }),
+      ]),
+    });
+    await settle(await sharedLedger(dir), [stillUnknown]);
+    expect(stock(await cityAt(dir))).toEqual(times(1));
+  });
+
   test("啟用邊界：啟用前已結束的舊城歷史不重發，之後的工作照常入帳", async () => {
     const dir = root("boundary");
     const ledger = await sharedLedger(dir);

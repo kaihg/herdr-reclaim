@@ -57,16 +57,21 @@ export function planIncome({ activities = [], cityId = SHARED_CITY_ID, claims = 
       // 啟用邊界：共用城市從第一次啟用那一刻起計收入，之前已結束的舊城歷史不重發（#22：
       // 舊城資料的轉換另行規劃，這張票不授權把既有歷史倒進新帳本）。
       if (since != null && Number(round.closeAt) < Number(since)) continue;
+      // 同一把來源 key 在回合內可能被修正多次（例如 Claude 的 PreCompact 缺欄位快照 → 完整快照 →
+      // Stop）：以最後一份為準，再判斷未知欄位與 token，與 adapter「修正保留 sourceKey、最後一份
+      // 快照為準」的約定一致。事件已依 eventSeq 排序，後到的覆蓋先到的。
+      const latest = new Map();
+      for (const event of round.usage) {
+        for (const [provider, usage] of Object.entries(event.usage ?? {})) latest.set(sourceKeyOf(record, event, provider, usage), usage);
+      }
       const sources = [];
       let unknown = false;
-      for (const event of round.usage) {
-        for (const [provider, usage] of Object.entries(event.usage ?? {})) {
-          // 用量未知的回合整回合不結算（與研究同一條規則）：不發不該給的建材，重播結果也一樣。
-          if (Array.isArray(usage.unknownFields) && usage.unknownFields.length > 0) { unknown = true; continue; }
-          const tokens = Number(usage.inputNonCache ?? 0) + Number(usage.output ?? 0);
-          if (tokens <= 0) continue; // cache read／write 不算工作
-          sources.push({ key: sourceKeyOf(record, event, provider, usage), tokens });
-        }
+      for (const [key, usage] of latest) {
+        // 用量未知的回合整回合不結算（與研究同一條規則）：不發不該給的建材，重播結果也一樣。
+        if (Array.isArray(usage.unknownFields) && usage.unknownFields.length > 0) { unknown = true; continue; }
+        const tokens = Number(usage.inputNonCache ?? 0) + Number(usage.output ?? 0);
+        if (tokens <= 0) continue; // cache read／write 不算工作
+        sources.push({ key, tokens });
       }
       if (unknown) continue;
       // 同一個回合內重複回報的來源只算一次；已入帳的來源不再算。
