@@ -1132,6 +1132,7 @@ export default class Town extends View {
         div().text_size(11.5).text_color(locked && !selected ? t.dim : t.foreground)
           .child(`${building.label}　${building.footprint.w}×${building.footprint.h}`),
         div().text_size(9).text_color(t.muted).truncate().child(costsText(building.costs)),
+        div().text_size(9).text_color(t.muted).child(`完工揭開 ${building.reveal} 格`),
         div().text_size(9).text_color(affordable ? t.done : t.muted)
           .child(affordable ? "材料已齊" : `還缺 ${missingText(missing)}`),
       ]);

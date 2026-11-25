@@ -175,12 +175,13 @@ export function missingOf(costs = {}, resources = {}) {
     .filter(([, amount]) => amount > 0));
 }
 
-/** 建築清單（畫面左側）：種類、標籤、占地與配方，順序就是帳本規則表的順序。 */
+/** 建築清單（畫面左側）：種類、標籤、占地、配方與完工揭開半徑，順序就是帳本規則表的順序。 */
 export function cityBuildings() {
   return Object.entries(CITY_BUILDINGS).map(([name, def]) => ({
     name,
     label: def.label,
     footprint: { ...def.footprint },
     costs: { ...def.costs },
+    reveal: Number(def.reveal ?? 0),
   }));
 }

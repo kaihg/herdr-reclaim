@@ -870,3 +870,102 @@ describe("備料、施工與完工（#26）", () => {
     expect((await cityAt(dir)).plan).toMatchObject({ building: "house", x: target.x, y: target.y, stage: "reserved" });
   });
 });
+
+// ticket #27：哨站。同樣從相同的起始地圖與同一個邊緣位置出發，在兩座各自隔離的帳本裡分別蓋
+// 普通建築與哨站，揭圖結果都從重新打開的帳本經公開讀取模型比較。
+describe("哨站揭開較大範圍（#27）", () => {
+  /** 在一座新城的邊緣 (4, 0) 走完預定 → 備料 → 施工 → 完工，回傳每個階段重開帳本讀到的城市。 */
+  async function buildAtEdge(name, building) {
+    const dir = root(name);
+    const ledger = await sharedLedger(dir);
+    const start = await cityAt(dir);
+    expect(siteCheck(start, building, at(4, 0)).ok).toBe(true);
+    expect((await order(ledger, building, at(4, 0))).status).toBe("applied");
+    const reserved = await cityAt(dir);
+    // 研究一直做到開工為止（每單位木 3、石 2、鐵 1），途中每一步都還在備料。
+    let units = 0;
+    let reading = reserved;
+    while (reading.plan.stage === "reserved") {
+      units += 1;
+      await settle(ledger, [research("a", REPO_A, units, T(1_000_000))]);
+      reading = await cityAt(dir);
+    }
+    // 開工就是材料到齊的那一輪：開工後再看工期，不看牆上時鐘。
+    await advanceConstruction(await sharedLedger(dir), { now: reading.plan.completesAt });
+    const done = await cityAt(dir);
+    return { dir, ledger, start, reserved, constructing: reading, done, units };
+  }
+
+  test("哨站在已揭開的邊緣預定：保留占地、缺料不扣、備齊才一次付清；預定與施工都不揭圖", async () => {
+    const { dir, ledger, start, reserved, constructing, done, units } = await buildAtEdge("outpost-flow", "outpost");
+    const startKeys = revealedCells(start);
+    // (4, 0) 右邊一格起就是迷霧：這是邊緣位置。
+    expect(startKeys.has("5,0")).toBe(false);
+
+    // 預定：整片占地保留給哨站，庫存沒有動，也沒有揭開任何土地。
+    expect(reserved.plan).toMatchObject({ building: "outpost", x: 4, y: 0, stage: "reserved" });
+    expect(reserved.plan.missing).toEqual(CITY_BUILDINGS.outpost.costs);
+    expect(stock(reserved)).toEqual([0, 0, 0]);
+    expect(problemsOf(siteCheck(reserved, "house", at(4, 0)))).toEqual(["plan"]);
+    expect(revealedCells(reserved)).toEqual(startKeys);
+
+    // 備料：八單位工作只收到木 24，還差木材 1；第九單位到齊才付清整份配方（木 25、石 15、鐵 5）。
+    expect(units).toBe(9);
+    expect(constructing.plan.stage).toBe("building");
+    expect(stock(constructing)).toEqual([2, 3, 4]);
+    expect(revealedCells(constructing)).toEqual(startKeys);
+
+    // 完工：哨站啟用，土地揭開；重開、重送工作、再推進、checkpoint 都不重扣、不重蓋。
+    expect(done.plan).toBeNull();
+    expect(done.buildings.map((b) => [b.building, b.x, b.y])).toEqual([["outpost", 4, 0]]);
+    expect(stock(done)).toEqual([2, 3, 4]);
+    const reopened = await sharedLedger(dir);
+    await settle(reopened, [research("a", REPO_A, units, T(1_000_000))]);
+    await advanceConstruction(reopened, { now: done.buildings[0].completedAt + MINUTE });
+    await reopened.checkpoint();
+    expect(await cityAt(dir)).toEqual(done);
+    expect(ledger.cityId).toBe(SHARED_CITY_ID);
+  });
+
+  test("同一張起始地圖、同一個邊緣位置：哨站完工後永久揭開的土地比普通建築大，且涵蓋普通建築揭開的全部", async () => {
+    const house = await buildAtEdge("edge-house", "house");
+    const outpost = await buildAtEdge("edge-outpost", "outpost");
+    expect(revealedCells(house.start)).toEqual(revealedCells(outpost.start));
+
+    const byHouse = revealedCells(house.done);
+    const byOutpost = revealedCells(outpost.done);
+    for (const key of byHouse) expect(byOutpost.has(key)).toBe(true);
+    expect(byOutpost.size).toBeGreaterThan(byHouse.size);
+
+    // 永久：重開帳本、checkpoint 之後揭開的土地不變。
+    await (await sharedLedger(outpost.dir)).checkpoint();
+    expect(revealedCells(await cityAt(outpost.dir))).toEqual(byOutpost);
+  });
+
+  test("重開城市後，哨站才揭開的合法占地可直接預定下一棟；揭開的深水、峭壁仍不能放，沒有另外取得土地的步驟", async () => {
+    const house = await buildAtEdge("next-house", "house");
+    const outpost = await buildAtEdge("next-outpost", "outpost");
+    const byHouse = revealedCells(house.done);
+    const city = await cityAt(outpost.dir);
+    const onlyOutpost = [...revealedCells(city)].filter((key) => !byHouse.has(key)).map((key) => {
+      const [x, y] = key.split(",").map(Number);
+      return { x, y };
+    });
+
+    // 不可建的地景：哨站揭開了，但仍是深水或峭壁，整棟都不能放，下令也被拒。
+    const blocked = onlyOutpost.filter((cell) => !TERRAIN_BUILDABLE.has(terrainAt(cell)));
+    expect(blocked.length).toBeGreaterThan(0);
+    for (const cell of blocked) {
+      expect(problemsOf(siteCheck(city, "house", cell))).toEqual([terrainAt(cell)]);
+      expect(await order(await sharedLedger(outpost.dir), "house", cell)).toMatchObject({ status: "rejected", reason: `site_${terrainAt(cell)}` });
+    }
+
+    // 合法的新土地：普通建築揭不到、哨站揭得到，在重開的城市直接預定。
+    const fresh = legalSites(city, "house").filter((site) => !byHouse.has(`${site.x},${site.y}`));
+    expect(fresh.length).toBeGreaterThan(0);
+    for (const site of fresh) expect(TERRAIN_BUILDABLE.has(terrainAt(site))).toBe(true);
+    const target = fresh[0];
+    expect((await order(await sharedLedger(outpost.dir), "house", target)).status).toBe("applied");
+    expect((await cityAt(outpost.dir)).plan).toMatchObject({ building: "house", x: target.x, y: target.y, stage: "reserved" });
+  });
+});

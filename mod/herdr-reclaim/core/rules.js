@@ -10,7 +10,8 @@
 //   5  ticket #24 明確成果的額外收成：每個歸屬確定、帶來新內容的 commit 另收木 3、石 2、鐵 1
 //   6  ticket #25 共用城市的建築占地與配方（市場、書庫、工坊、民居）；選址不動庫存
 //   7  ticket #26 共用城市的工期與完工揭開半徑；備齊自動開工、到期完工
-export const RULES_VERSION = 7;
+//   8  ticket #27 哨站：沿用選址、備料與施工，完工揭開比一般建築更大片的土地
+export const RULES_VERSION = 8;
 
 /** 庫存裡的資源種類；羊皮卷同時是市集商品與加速材料（§11）。 */
 export const RESOURCES = ["wood", "stone", "iron", "parchment"];
@@ -63,6 +64,7 @@ export const CITY_BUILDINGS = {
   workshop: { label: "工坊", footprint: { w: 2, h: 1 }, costs: { wood: 30, iron: 5 }, buildMs: 5 * 60_000, reveal: 2 },
   market: { label: "市場", footprint: { w: 2, h: 2 }, costs: { wood: 40, stone: 20 }, buildMs: 8 * 60_000, reveal: 2 },
   library: { label: "書庫", footprint: { w: 2, h: 2 }, costs: { wood: 20, stone: 20, iron: 5 }, buildMs: 8 * 60_000, reveal: 2 },
+  outpost: { label: "哨站", footprint: { w: 1, h: 1 }, costs: { wood: 25, stone: 15, iron: 5 }, buildMs: 6 * 60_000, reveal: 5 },
 };
 
 /** 庫存足以支付完整配方（§7.6：市集與畫面只列這些）。 */
