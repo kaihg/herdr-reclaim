@@ -105,6 +105,18 @@ mod 以 `find` 列活動檔，成功寫 journal 後按 epoch 寫 ack，並用 `w
 bun test mod/herdr-reclaim
 ```
 
+三層，越前面越便宜：
+
+| 檔案 | 釘住什麼 | 需要視窗 |
+| --- | --- | --- |
+| `test/*.test.js`（core） | 帳本、規則、命中、額度 | 否 |
+| `test/view.test.js` | 畫面上是哪些字、按下按鈕與地圖格之後的狀態、pane 變窄時左右欄寬 | 否 |
+| `test/pipeline.test.js` | 真的帳本 → 載入 → 畫面；選建築 → 點合法格 → 預定這裡真的寫進帳本 | 否 |
+
+`test/view-harness.js` 用 `mock.module` 換掉 `gpui-kit`、`gpui-base`、`herdr`，把 render 樹
+當資料走（子節點、文字、事件處理器）。事件處理器是普通的函式，呼叫它就等於按下，不用合成
+指標事件；檔案 API 換成 node fs，CAS 語意與真的 host 相同（`casConflictOf` 那條接縫）。
+
 ## 載入與檢查
 
 ```sh
@@ -117,31 +129,26 @@ herdr-app check mod/herdr-reclaim      # 載入一次並渲染，通過才算沒
 
 `check` 期間 `checking()` 為 true，mod 只渲染固定情境，不去動使用者的檔案。
 
-## 在真的 herdr 裡驗證
+## 視覺報告（人只看這一份）
 
 ```sh
-H=/tmp/herdr-reclaim-verify/home
-mkdir -p "$H/mods"; rsync -a --exclude '*.d.ts' --exclude jsconfig.json mod/herdr-reclaim/ "$H/mods/herdr-reclaim/"
-printf '{"frame.welcomed":"finished"}\n' > "$H/shared.json"   # 不然會跳歡迎畫面
-HERDR_APP_HOME="$H" nohup herdr-app >/dev/null 2>&1 &
-HERDR_APP_HOME="$H" herdr-app do pane.split '{"direction":"right","mod":"herdr-reclaim"}'
-HERDR_APP_HOME="$H" herdr-app shot /tmp/herdr-reclaim-shot.png
-HERDR_APP_HOME="$H" herdr-app do pane.close '{"pane":"<pane id>"}'
-HERDR_APP_HOME="$H" herdr-app do window.close '{}'
+tools/ui-report.sh            # 測試＋check＋三個寬度的截圖 → report.html
 ```
 
-驗證完看一下 `$H/data/herdr-reclaim/`：第一次開會出現 `shared/head.json`、`shared/journal/0.json`、
-`shared/blobs/*.json`、`shared/acks/*` 與 `ui.json`，**不會**出現舊版的 `cities/`；關掉再開同一份
-journal（位元組不變）重建出同一座城。
+報告裡有 `bun test`、`herdr-app check` 的輸出與預設／加寬／縮窄三張圖。它在**自己的 app home
+與自己的 herdr-core**（`XDG_CONFIG_HOME`）裡開一個 space、拉出 mod pane，收尾關 space、關視窗、
+停掉那顆 core；不動正在用的 Herdr，也不在別人的 space 開 pane。
 
-注意：`HERDR_APP_HOME` 只隔離 layouts／mods／settings；spaces、tabs 與 panes 由該機器的
-herdr-core 保管，所以開 pane 會動到共用工作區，驗證完記得 `pane.close` 收乾淨
-（不要建新的 space／tab，也不要動既有的 terminal）。
+截圖失敗（螢幕鎖定、app 起不來）只會讓那一列標成「視覺未驗」，報告照樣產出；`bun test` 或
+`check` 失敗才回非 0。像素不是 gate：時間文字、動畫每一輪都不同，圖只給人看排版與截斷。
+報告目錄的 `home/data/herdr-reclaim/` 就是那一次的資料：第一次開會出現 `shared/head.json`、
+`shared/journal/0.json`、`shared/blobs/*.json`、`shared/acks/*` 與 `ui.json`，**不會**出現舊版的
+`cities/`；關掉再開同一份 journal（位元組不變）重建出同一座城。
 
-### 點得到才算走過：真實滑鼠點擊
+### 真的要在視窗裡點（少見）
 
-`herdr-app` 沒有對 mod 畫面的點擊指令，`check` 也跑不完非同步鏈，所以「選建築 → 點合法位置 →
-預定這裡」這幾步要用真實指標事件。做法：
+一般驗收不需要：選建築、點合法位置、預定這裡已經由 `test/pipeline.test.js` 在 bun 裡跑完，
+而且斷言的是帳本，不是畫面。只有要確認「真實指標事件在這台機器上的行為」時才需要下面這套：
 
 ```sh
 HERDR_APP_HOME="$H" herdr-app do window.maximize '{}'   # 讓驗證視窗到最前面（再按一次會還原）
