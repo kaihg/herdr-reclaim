@@ -9,7 +9,8 @@
 //   4  ticket #23 共用城市的基本收入：每 10,000 個有效 token 收木 3、石 2、鐵 1
 //   5  ticket #24 明確成果的額外收成：每個歸屬確定、帶來新內容的 commit 另收木 3、石 2、鐵 1
 //   6  ticket #25 共用城市的建築占地與配方（市場、書庫、工坊、民居）；選址不動庫存
-export const RULES_VERSION = 6;
+//   7  ticket #26 共用城市的工期與完工揭開半徑；備齊自動開工、到期完工
+export const RULES_VERSION = 7;
 
 /** 庫存裡的資源種類；羊皮卷同時是市集商品與加速材料（§11）。 */
 export const RESOURCES = ["wood", "stone", "iron", "parchment"];
@@ -53,13 +54,15 @@ export const RECIPES = {
 
 /**
  * #25：共用城市的建築表——占地是整片土地（不是屋頂大小），配方是備齊後才一次支付的完整材料。
+ * #26：`buildMs` 是開工到完工的工期，`reveal` 是完工後往占地外揭開幾格（切比雪夫距離）。
+ * 配方與工期只看建築種類，不看占地上是草地、疏林還是碎石（試玩參數）。
  * 這張表只給共用城市用；舊版各城的配方（`RECIPES`）照舊，兩邊不互相改寫。
  */
 export const CITY_BUILDINGS = {
-  house: { label: "民居", footprint: { w: 1, h: 1 }, costs: { wood: 20, stone: 10 } },
-  workshop: { label: "工坊", footprint: { w: 2, h: 1 }, costs: { wood: 30, iron: 5 } },
-  market: { label: "市場", footprint: { w: 2, h: 2 }, costs: { wood: 40, stone: 20 } },
-  library: { label: "書庫", footprint: { w: 2, h: 2 }, costs: { wood: 20, stone: 20, iron: 5 } },
+  house: { label: "民居", footprint: { w: 1, h: 1 }, costs: { wood: 20, stone: 10 }, buildMs: 3 * 60_000, reveal: 2 },
+  workshop: { label: "工坊", footprint: { w: 2, h: 1 }, costs: { wood: 30, iron: 5 }, buildMs: 5 * 60_000, reveal: 2 },
+  market: { label: "市場", footprint: { w: 2, h: 2 }, costs: { wood: 40, stone: 20 }, buildMs: 8 * 60_000, reveal: 2 },
+  library: { label: "書庫", footprint: { w: 2, h: 2 }, costs: { wood: 20, stone: 20, iron: 5 }, buildMs: 8 * 60_000, reveal: 2 },
 };
 
 /** 庫存足以支付完整配方（§7.6：市集與畫面只列這些）。 */

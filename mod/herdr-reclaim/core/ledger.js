@@ -138,6 +138,11 @@ export const tileKey = (cityId, x, y) => `${cityId}@@${x},${y}`;
 export const tileId = (cityId, rootSessionId, generation) => `${cityId}@@${rootSessionId}@@${generation ?? 1}`;
 /** §7.3 的城級去重鍵：同一座城同一份成果只發一次。 */
 export const claimKey = (cityId, claim) => `${cityId}@@${claim}`;
+/**
+ * 共用城市一個建設目標的身分（#26）：建築、錨點與下令時間。開工與完工都綁這把鍵，
+ * 所以同一個目標只開工一次、完工一次；之後在同一處再預定同一種建築是另一個目標。
+ */
+export const planKey = (plan) => `${plan.building}:${plan.x},${plan.y}:${plan.at}`;
 export const activityKey = (record) => `${record.sessionId}@@${record.writerEpoch ?? ""}`;
 /** 座標分塊的名字（32×32 格）。 */
 export const chunkName = (x, y) => `${Math.floor(x / CHUNK_SIDE)},${Math.floor(y / CHUNK_SIDE)}`;
@@ -148,9 +153,11 @@ const zeroResources = () => Object.fromEntries(RESOURCES.map((key) => [key, 0]))
  * 空狀態。`tiles`／`activities` 的順序就是 journal 的附加順序，重播結果因此可重現。
  * `opSeqs`／`claims` 是索引（§13.2）；`currentGen` 是每支遠征的現役 generation。
  * `research.tokens` 是這座城還沒換成羊皮卷的研究進度（餘數，§7.4）；
- * `work.tokens` 是共用城市（#23）還沒換成建材的有效工作進度（餘數）；
+ * `work.tokens` 是共用城市（#23）還沒換成建材的有效工作進度（餘數）；`work.stockedAt` 是入庫
+ * 建材裡最晚的那一筆的時間（#26：材料到齊不會早於它，開工從這裡起算）；
  * `market` 分開記錄市集轉入與轉出，跟 commit 的直接發放分開（§11）。
  * `plan` 是共用城市唯一的建設目標（#25）：建築、錨點與整片占地；沒有目標時是 null。
+ * 開工之後（#26）多出 `startedAt`／`buildMs`／`completesAt`。`buildings` 是共用城市已完工的建築。
  */
 export function emptyState(cityId) {
   return {
@@ -166,8 +173,9 @@ export function emptyState(cityId) {
     claims: new Map(),
     resources: zeroResources(),
     research: { tokens: 0 },
-    work: { tokens: 0, since: null },
+    work: { tokens: 0, since: null, stockedAt: null },
     plan: null,
+    buildings: [],
     market: { in: zeroResources(), out: zeroResources() },
   };
 }
@@ -212,6 +220,18 @@ export function addTile(state, tile) {
   const current = state.currentGen.get(key) ?? 0;
   if ((tile.generation ?? 1) > current) state.currentGen.set(key, tile.generation ?? 1);
   return tile;
+}
+
+/**
+ * 共用倉庫入庫（收入與成果加成共用）：加上 entry 帶的建材，並記下入庫建材裡最晚的時間。
+ * 晚到的較早工作不會把它往回拉，所以用它起算的開工不會早於任何一筆被用掉的材料。
+ */
+function stockUp(state, entry) {
+  for (const [name, amount] of Object.entries(entry.resources ?? {})) {
+    state.resources[name] = Number(state.resources[name] ?? 0) + Number(amount);
+  }
+  const at = Number(entry.at);
+  if (Number.isFinite(at) && !(Number(state.work.stockedAt) >= at)) state.work.stockedAt = at;
 }
 
 /**
@@ -517,9 +537,7 @@ export const KINDS = {
     apply(state, entry) {
       const total = Number(state.work.tokens ?? 0) + Number(entry.tokens);
       state.work.tokens = total % WORK_TOKENS_PER_UNIT;
-      for (const [name, amount] of Object.entries(entry.resources ?? {})) {
-        state.resources[name] = Number(state.resources[name] ?? 0) + Number(amount);
-      }
+      stockUp(state, entry);
       for (const source of entry.sources ?? []) state.claims.set(claimKey(entry.cityId, source), entry.journalSeq);
     },
   },
@@ -541,9 +559,7 @@ export const KINDS = {
       return null;
     },
     apply(state, entry) {
-      for (const [name, amount] of Object.entries(entry.resources ?? {})) {
-        state.resources[name] = Number(state.resources[name] ?? 0) + Number(amount);
-      }
+      stockUp(state, entry);
       for (const claim of entry.claims ?? []) state.claims.set(claimKey(entry.cityId, claim), entry.journalSeq);
     },
   },
@@ -583,6 +599,67 @@ export const KINDS = {
         at: Number(entry.at),
         rulesVersion: entry.rulesVersion,
       };
+    },
+  },
+
+  /**
+   * 開工（#26）：預定地的材料備齊時由城市自動送出，一次付清預定時的完整配方，從 `at` 起算工期。
+   * 一個建設目標只開工一次：opId 綁住目標（`planKey`），兩個視窗同時達標、重開或重播都只扣一次。
+   * 工期只看建築種類（規則表），不看占地上的植被或碎石。
+   */
+  construct: {
+    precheck(state, op) {
+      if (op.cityId !== state.cityId) return "wrong_city";
+      const plan = state.plan;
+      if (!plan || planKey(plan) !== op.plan) return "no_plan";
+      if (plan.startedAt != null) return "already_started";
+      if (!sameCosts(op.costs, plan.costs)) return "recipe_mismatch";
+      if (Number(op.buildMs) !== CITY_BUILDINGS[plan.building]?.buildMs) return "duration_mismatch";
+      if (!(Number(op.at) >= Number(plan.at))) return "before_plan";
+      if (!affordable(plan.costs, state.resources)) return "insufficient_resources";
+      return null;
+    },
+    apply(state, entry) {
+      for (const [key, amount] of Object.entries(entry.costs ?? {})) {
+        state.resources[key] = Number(state.resources[key] ?? 0) - Number(amount);
+      }
+      const startedAt = Number(entry.at);
+      state.plan = { ...state.plan, startedAt, buildMs: Number(entry.buildMs), completesAt: startedAt + Number(entry.buildMs) };
+    },
+  },
+
+  /**
+   * 完工（#26）：工期到了就把建設目標變成一棟啟用中的建築，預定地交還給城市（沒有下一個目標）。
+   * `at` 是開工時間加工期，不是看到完工的那一刻，所以晚開畫面不改變完工時間。`reveal` 是規則表
+   * 當時的揭開半徑，跟著 entry 存進建築，調整規則不改寫已揭開的土地。不支付、也不選下一棟。
+   */
+  complete: {
+    precheck(state, op) {
+      if (op.cityId !== state.cityId) return "wrong_city";
+      const plan = state.plan;
+      if (!plan || planKey(plan) !== op.plan) return "no_plan";
+      if (plan.startedAt == null) return "not_started";
+      if (Number(op.at) !== Number(plan.completesAt)) return "completion_mismatch";
+      if (Number(op.reveal) !== CITY_BUILDINGS[plan.building]?.reveal) return "reveal_mismatch";
+      return null;
+    },
+    apply(state, entry) {
+      const plan = state.plan;
+      state.buildings.push({
+        building: plan.building,
+        label: plan.label,
+        x: plan.x,
+        y: plan.y,
+        w: plan.w,
+        h: plan.h,
+        cells: plan.cells.map((cell) => ({ x: cell.x, y: cell.y })),
+        costs: { ...plan.costs },
+        reveal: Number(entry.reveal),
+        startedAt: plan.startedAt,
+        completedAt: Number(entry.at),
+        rulesVersion: entry.rulesVersion,
+      });
+      state.plan = null;
     },
   },
 
@@ -1045,6 +1122,9 @@ export class CityLedger {
       research: state.research,
       work: state.work,
       plan: state.plan,
+      // 共用城市的建築會一直增加：清單放內容檔（可切塊），manifest 只留固定長度的雜湊；
+      // 沒有建築（舊版各城一律如此）就不寫內容檔。
+      buildings: state.buildings.length > 0 ? (await this.blobs.putValue(state.buildings)).hash : null,
       market: state.market,
       // 每一組索引的內容摘要（固定 6 個 16 進位字串；不隨資料量成長）。
       digests: Object.fromEntries(Object.entries(built).map(([part, result]) => [part, result.digest])),
@@ -1145,6 +1225,7 @@ export class CityLedger {
       state.research = manifest.research ?? state.research;
       state.work = manifest.work ?? state.work;
       state.plan = manifest.plan ?? state.plan;
+      state.buildings = manifest.buildings ? await this.blobs.getValue(manifest.buildings) : state.buildings;
       state.market = manifest.market ?? state.market;
       return { state, segment: manifest.segment };
     } catch (error) {

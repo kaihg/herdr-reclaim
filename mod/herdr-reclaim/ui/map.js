@@ -13,7 +13,7 @@ import { h_flex, v_flex } from "gpui-base";
 
 import { CENTER, CENTER_CELLS, MAP_RADIUS, cellAtEvent, contentSize, keyOf, originInContent, projectTile } from "../core/grid.js";
 import { GROUND_MOCK, PLOT_DIAMOND, buildingOf, buildingPolygons, factionStyle, groundOf, legendGroups } from "./assets.js";
-import { TERRAIN, terrainAt } from "../core/city-map.js";
+import { TERRAIN, groundAt } from "../core/city-map.js";
 
 const LOCAL = { left: 0, top: 0 };
 /** 靜態底層快取：key 只有幾何（半徑與格大小），值是不可變的原生路徑。 */
@@ -305,21 +305,23 @@ function cellName(entry) {
   return name.length > 7 ? `${name.slice(0, 6).join("")}…` : name.join("");
 }
 
-// ---- 共用城市的地圖（#25）
+// ---- 共用城市的地圖（#25、#26）
 
 /**
- * 共用城市的地圖：固定地形、已揭開的土地、唯一的預定地，以及選址時的合法位置與整棟預覽。
- * 只有已揭開的格子收點擊（迷霧裡不能選址）；每一格自己收事件，命中同樣回到地面菱形。
+ * 共用城市的地圖：固定地形、已揭開的土地、唯一的建設目標、已完工的建築，以及選址時的合法位置
+ * 與整棟預覽。只有已揭開的格子收點擊（迷霧裡不能選址）；每一格自己收事件，命中同樣回到地面菱形。
  *
- * `legal` 是選好建築之後全部合法錨點；`preview` 是 `siteCheck` 的結果——預覽與下令共用同一份
- * 判準，所以畫成綠色的整片占地就是下令會成功的那一片。
+ * 三個階段畫法不同：預定地是強調色虛線（地面仍是原本的地形）；施工中是工作色虛線＋工地（植被、
+ * 碎石讓位）；完工是完成色實線＋建築。`legal` 是選好建築之後全部合法錨點；`preview` 是 `siteCheck`
+ * 的結果——預覽與下令共用同一份判準，所以畫成綠色的整片占地就是下令會成功的那一片。
  */
 export function sharedMapView({
-  revealed, plan, legal = [], preview = null, selected = null, theme: t, tile, camera,
+  revealed, plan, buildings = [], legal = [], preview = null, selected = null, theme: t, tile, camera,
   radius = MAP_RADIUS, onPick, onPan, viewport = null,
 }) {
   const origin = originInContent(radius, tile);
   const base = basePaths(radius, tile);
+  const city = { plan, buildings };
   const planCells = new Set((plan?.cells ?? []).map((cell) => keyOf(cell)));
   const previewCells = new Map((preview?.cells ?? []).map((cell) => [keyOf(cell), cell]));
   const legalAnchors = new Set(legal.map((site) => keyOf(site)));
@@ -333,30 +335,41 @@ export function sharedMapView({
       if (!revealed.has(key)) continue;
       open.push(spot);
       const marked = previewCells.get(key);
-      const terrain = marked?.terrain ?? terrainAt(spot);
+      const ground = groundAt(city, spot);
+      const terrain = marked?.terrain ?? ground;
       const blocked = marked?.problem != null;
       const fill = marked
         ? Background.solid(t[blocked ? "blocked" : "done"]).opacity(0.42)
-        : planCells.has(key)
-          ? Background.solid(t.accent).opacity(0.22)
-          : Background.solid(t[TERRAIN[terrain]?.token] ?? t.raised).opacity(0.5);
+        : ground === "building"
+          ? Background.solid(t.done).opacity(0.3)
+          : ground === "site"
+            ? Background.pattern_slash(t.working, 1, 5)
+            : planCells.has(key)
+              ? Background.solid(t.accent).opacity(0.22)
+              : Background.solid(t[TERRAIN[terrain]?.token] ?? t.raised).opacity(0.5);
       const outline = marked
         ? PathBuilder.stroke(1.5).add_polygon(points).close().build()
-        : planCells.has(key)
-          ? stroked([LOCAL_CELL], tile, LOCAL, [4, 3])
-          : legalAnchors.has(key)
-            ? stroked([LOCAL_CELL], tile, LOCAL, [2, 4])
-            : stroked([LOCAL_CELL], tile, LOCAL);
+        : ground === "building"
+          ? PathBuilder.stroke(1.5).add_polygon(points).close().build()
+          : planCells.has(key)
+            ? stroked([LOCAL_CELL], tile, LOCAL, [4, 3])
+            : legalAnchors.has(key)
+              ? stroked([LOCAL_CELL], tile, LOCAL, [2, 4])
+              : stroked([LOCAL_CELL], tile, LOCAL);
       const outlineColor = marked
         ? t[blocked ? "blocked" : "done"]
+        : ground === "building" ? t.done
+        : ground === "site" ? t.working
         : planCells.has(key) ? t.accent
         : legalAnchors.has(key) ? t.accent
         : selected && selected.x === x && selected.y === y ? t.accent
         : TERRAIN[terrain]?.buildable === false ? t[TERRAIN[terrain].token] ?? t.border : t.border;
+      const done = ground === "building" ? buildings.find((building) => building.cells.some((cell) => keyOf(cell) === key)) : null;
       cells.push(cellBox(spot, tile, origin, radius, onPick, camera).children([
         tilePath(fillPath(points), fill, tile),
+        done ? buildingMark(buildingOf({ building: { recipe: done.building } }), tile, t.done) : null,
         tilePath(outline, outlineColor, tile),
-      ]));
+      ].filter(Boolean)));
     }
   }
   // 預覽伸進迷霧的那一角：不揭開地形，只把「這一格不能放」畫出來（不建立點擊區）。
@@ -385,18 +398,24 @@ export function sharedMapView({
     ...cells,
     ...veil,
   ];
-  // 預定地的標籤掛在錨點那一格（沒有事件，不擋點擊）。
-  if (plan) {
-    const spot = projectTile({ x: plan.x, y: plan.y }, tile);
-    children.push(div()
+  // 預定地／工地與完工建築的標籤掛在錨點那一格（沒有事件，不擋點擊）。
+  const label = (anchor, text, color) => {
+    const spot = projectTile(anchor, tile);
+    return div()
       .absolute()
       .left(Math.max(0, Math.min(camera.x + origin.left + spot.left - tile.w / 2, (viewport?.width ?? size.width) - tile.w * 2)))
       .top(camera.y + origin.top + spot.top + Math.round(tile.h * 0.6))
       .w(tile.w * 2)
       .text_center()
       .text_size(labelSize(tile))
-      .text_color(t.accent)
-      .child(`預定·${plan.label}`));
+      .text_color(color)
+      .child(text);
+  };
+  for (const building of buildings) children.push(label(building, building.label, t.done));
+  if (plan) {
+    children.push(plan.stage === "building"
+      ? label(plan, `施工·${plan.label}`, t.working)
+      : label(plan, `預定·${plan.label}`, t.accent));
   }
   return div()
     .id("map")

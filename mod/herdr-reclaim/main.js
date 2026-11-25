@@ -29,8 +29,8 @@ import { VIEW_REPO, VIEW_SHARED, defaultSelection, parseUi, resolveSelection, se
 import { QUOTA_REFRESH_MS, QUOTA_SOURCE, claimQuotaAttempt, parseQuotaReport } from "./core/quota-source.js";
 import { quotaView, readQuotaView } from "./core/quota-view.js";
 import { CLEAR_POINTS, emptyCity, expeditionGroups, formatResearch, mergeActivities, readTown, readTownFromLedger, selectionDetail, tileLabel } from "./core/town.js";
-import { SHARED_CITY_ID, ingestAchievements, ingestIncome, placePlan, readSharedCity, sharedCityDir } from "./core/shared-city.js";
-import { TERRAIN, cityBuildings, legalSites, missingOf, revealedCells, siteCheck, terrainAt } from "./core/city-map.js";
+import { SHARED_CITY_ID, advanceConstruction, ingestAchievements, ingestIncome, placePlan, readSharedCity, sharedCityDir } from "./core/shared-city.js";
+import { TERRAIN, cityBuildings, groundAt, legalSites, missingOf, revealedCells, siteCheck } from "./core/city-map.js";
 import { cityForFolders } from "./core/space-city.js";
 import { firstExpedition } from "./scenarios/first-expedition.js";
 import {
@@ -85,7 +85,7 @@ const ECONOMY_LABELS = { boost: "加速", build: "蓋房", trade: "市集" };
 
 /** 選址被拒的原因（帳本的前提檢查）：畫面上只翻成人看得懂的一句話。 */
 const SITE_PROBLEMS = {
-  fog: "迷霧", water: "深水", cliff: "峭壁", center: "城鎮中心", plan: "預定地", unknown_building: "未知建築",
+  fog: "迷霧", water: "深水", cliff: "峭壁", center: "城鎮中心", building: "已有建築", plan: "預定地", unknown_building: "未知建築",
 };
 const PLAN_REASONS = {
   plan_exists: "已經有一個建設目標",
@@ -96,13 +96,35 @@ const PLAN_REASONS = {
   site_water: "有一角是深水",
   site_cliff: "有一角是峭壁",
   site_center: "有一角是城鎮中心",
+  site_building: "有一角已有建築",
   site_plan: "有一角是預定地",
 };
 const costsText = (costs = {}) => Object.entries(costs)
   .map(([key, amount]) => `${RESOURCE_LABELS[key]} ${amount}`).join("・");
 const missingText = (missing = {}) => {
   const text = Object.entries(missing).map(([key, amount]) => `${RESOURCE_LABELS[key]} ${amount}`).join("・");
-  return text || "材料已齊（施工接續在 #26）";
+  return text || "材料已齊";
+};
+/** 施工時間的顯示：當天只寫時刻，跨日才加日期（本機時區）。 */
+const clockText = (at) => {
+  const time = new Date(at);
+  const hm = `${String(time.getHours()).padStart(2, "0")}:${String(time.getMinutes()).padStart(2, "0")}`;
+  return time.toDateString() === new Date().toDateString() ? hm : `${time.getMonth() + 1}/${time.getDate()} ${hm}`;
+};
+/** 地面（`groundAt`）的標籤：工地與建築不是地形，另外說。 */
+const groundLabel = (ground) => (ground === "site" ? "工地" : ground === "building" ? "建築" : TERRAIN[ground]?.label ?? ground);
+/** 唯一建設目標的一行摘要（頂欄、提示）：施工中說何時完工，備料中說還在等材料。 */
+const planLine = (plan) => (plan.stage === "building"
+  ? `施工中：${plan.label} (${plan.x}, ${plan.y})・${clockText(plan.completesAt)} 完工`
+  : `建設目標：${plan.label} (${plan.x}, ${plan.y})・備料中`);
+/** 共用城市地圖的半徑：至少 MAP_RADIUS，涵蓋全部已揭開的格子，再多一圈迷霧當邊界。 */
+const sharedRadius = (revealed) => {
+  let reach = 0;
+  for (const key of revealed) {
+    const [x, y] = key.split(",").map(Number);
+    reach = Math.max(reach, Math.abs(x), Math.abs(y));
+  }
+  return Math.max(MAP_RADIUS, reach + 1);
 };
 
 const clamp = (min, value, max) => Math.max(min, Math.min(max, value));
@@ -202,6 +224,11 @@ async function retryUnresolvedActivities(activities) {
     }));
     return { ...record, events };
   }));
+}
+
+/** 共用城市的帳本（ADR-0001）：放在 `shared/`，所有 space 開的是同一份。 */
+function openShared(io) {
+  return new CityLedger({ io, dir: sharedCityDir(adapterRoot(appHome())), cityId: SHARED_CITY_ID }).open();
 }
 
 async function loadTown(io) {
@@ -317,11 +344,7 @@ async function loadTown(io) {
   });
   // 共用城市（#23、ADR-0001）：所有專案的工作進同一座城、同一個倉庫。舊版各城帳本照舊，
   // 共用帳本另外放在 `shared/`；活動用帳本保存的那一份（`stored`），adapter 的快照會被 compact。
-  const shared = await new CityLedger({
-    io,
-    dir: sharedCityDir(adapterRoot(appHome())),
-    cityId: SHARED_CITY_ID,
-  }).open();
+  const shared = await openShared(io);
   await shared.maybeCheckpoint();
   await ingestIncome(shared, { activities: mergeActivities([...stored, ...activities]) });
   // 明確成果的額外收成（#24）：歸屬確定的 commit 另外發一份；遠端合併不可能有歸屬，
@@ -332,6 +355,9 @@ async function loadTown(io) {
     remoteMerges: new Set([...remoteMerges.values()].flatMap((set) => [...set])),
     diffForCommit,
   });
+  // 備料與施工（#26）：材料到齊的那一筆收成已在入帳時開工；這裡補上工期已到的完工
+  // （關著 herdr 的那段時間也算工期），完工之後只存料。
+  await advanceConstruction(shared, { now: Date.now() });
   return { ...town, shared: readSharedCity(await shared.state()) };
 }
 /**
@@ -380,11 +406,7 @@ async function refreshTown(io, previous) {
     ...(previous?.quotas ? { quotas: quotaView(previous.quotas.snapshot) } : {}),
   });
   // 共用倉庫只重讀（入帳在完整重載時做）：操作之後畫面立刻看到同一份庫存。
-  const shared = await new CityLedger({
-    io,
-    dir: sharedCityDir(adapterRoot(appHome())),
-    cityId: SHARED_CITY_ID,
-  }).open();
+  const shared = await openShared(io);
   return { ...town, shared: readSharedCity(await shared.state()) };
 }
 /**
@@ -524,6 +546,7 @@ export default class Town extends View {
           // 在帳本變動後仍然有效（不在了就退回那座城的預設）。
           if (this.view === VIEW_REPO && this.selection && !this.selection.cityId.startsWith("placeholder:")) this.selection = resolveSelection(this.town, this.selection, this.selection.cityId);
           this.note = null;
+          this.scheduleCompletion(cx);
         } catch (error) {
           this.town = null;
           this.note = `城鎮帳本讀取失敗：${error}`;
@@ -767,6 +790,7 @@ export default class Town extends View {
       try {
         this.town = await loadTown(this.io);
         this.note = null;
+        this.scheduleCompletion(cx2);
       } catch (error) {
         this.note = `城鎮讀取失敗：${error}`;
       }
@@ -1019,7 +1043,7 @@ export default class Town extends View {
       .child(div().text_size(10).text_color(t.dim).child("工作"))
       .child(div().text_size(12.5).child(`${shared.work.tokens}/${shared.work.unitTokens}`));
     const target = div().text_size(10).text_color(t.muted).truncate().child(shared.plan
-      ? `建設目標：${shared.plan.label} (${shared.plan.x}, ${shared.plan.y})`
+      ? planLine(shared.plan)
       : "沒有建設目標：只累積庫存");
     const center = stacked
       ? v_flex().flex_1().min_w(0).overflow_hidden().gap(2).child(stock).child(work).child(target)
@@ -1059,6 +1083,7 @@ export default class Town extends View {
   /** 左側：建設目標的狀態與可選的建築（占地、配方、還缺多少）。 */
   sharedPanel(shared, t, cx, width) {
     const plan = shared.plan;
+    const building = plan?.stage === "building";
     return v_flex()
       .id("city-panel")
       .w(width)
@@ -1072,10 +1097,12 @@ export default class Town extends View {
       .border_color(t.border)
       .children([
         div().text_size(10).text_color(t.dim).child("建設目標（一次一項）"),
-        div().text_size(13).font_semibold().truncate().child(plan ? `預定：${plan.label}` : "選一棟建築"),
-        div().text_size(9).text_color(t.muted).child(plan
-          ? `位置 (${plan.x}, ${plan.y})、占地 ${plan.w}×${plan.h}；還缺 ${missingText(plan.missing)}`
-          : "選好建築後，地圖會標出全部合法位置；點一格看整棟預覽，再按「預定這裡」。"),
+        div().text_size(13).font_semibold().truncate().child(plan ? `${building ? "施工中" : "預定"}：${plan.label}` : "選一棟建築"),
+        div().text_size(9).text_color(t.muted).child(!plan
+          ? "選好建築後，地圖會標出全部合法位置；點一格看整棟預覽，再按「預定這裡」。"
+          : building
+            ? `位置 (${plan.x}, ${plan.y})、占地 ${plan.w}×${plan.h}；配方已支付，${clockText(plan.completesAt)} 完工`
+            : `位置 (${plan.x}, ${plan.y})、占地 ${plan.w}×${plan.h}；還缺 ${missingText(plan.missing)}，備齊自動開工`),
         ...cityBuildings().map((building) => this.buildingCard(shared, building, t, cx)),
         div().text_size(9).text_color(t.dim)
           .child("草地、疏林、碎石地可以蓋；深水、峭壁與迷霧不行。預覽與下令用同一條規則。"),
@@ -1113,7 +1140,7 @@ export default class Town extends View {
   /** 選一種建築開始選址；已有預定地時不能換（一次只有一個目標）。 */
   pickBuilding(shared, building, cx) {
     if (shared.plan) {
-      this.showToast(`已經預定 ${shared.plan.label} (${shared.plan.x}, ${shared.plan.y})：一次只有一個建設目標`, cx);
+      this.showToast(`${planLine(shared.plan)}：一次只有一個建設目標`, cx);
       return;
     }
     this.picking = this.picking === building ? null : building;
@@ -1124,16 +1151,19 @@ export default class Town extends View {
   /**
    * 共用城市的地圖：相機與舊城同一套（固定格大小、雙軸捲動、選取帶進畫面）。
    * 選址中點一格是「預覽整棟」；沒在選址時點一格只是看那一格的地形。
+   * 地圖範圍跟著揭開的土地長（至少 MAP_RADIUS，外面多留一圈迷霧）：完工揭開的土地一定畫得出來、點得到。
    */
   sharedMap(shared, t, cx, area) {
+    const revealed = revealedCells(shared);
+    const radius = sharedRadius(revealed);
     const tile = tileSize(area);
-    const size = contentSize(MAP_RADIUS, tile);
+    const size = contentSize(radius, tile);
     const anchor = this.focusCell ?? this.anchorCell ?? { x: 0.5, y: 0.5 };
     const resized = area.width !== this.mapArea?.width || area.height !== this.mapArea?.height;
-    const moved = this.focusCell || !this.camera || this.camera.cityId !== SHARED_CITY_ID || resized;
+    const moved = this.focusCell || !this.camera || this.camera.cityId !== SHARED_CITY_ID || this.camera.radius !== radius || resized;
     if (moved) {
       this.anchorCell = anchor;
-      this.camera = { cityId: SHARED_CITY_ID, ...cameraFor(anchor, area, MAP_RADIUS, tile) };
+      this.camera = { cityId: SHARED_CITY_ID, radius, ...cameraFor(anchor, area, radius, tile) };
     }
     this.viewport = area;
     this.mapArea = { width: area.width, height: area.height };
@@ -1142,8 +1172,10 @@ export default class Town extends View {
     // 一次只有一個目標：別的視窗先預定了，這裡的預覽就一併收起，不顯示下得了令的樣子。
     const selecting = !shared.plan && Boolean(this.picking);
     return sharedMapView({
-      revealed: revealedCells(shared),
+      revealed,
+      radius,
       plan: shared.plan,
+      buildings: shared.buildings,
       legal: selecting ? legalSites(shared, this.picking) : [],
       preview: selecting && this.preview ? siteCheck(shared, this.picking, this.preview) : null,
       selected: this.selection?.cityId === SHARED_CITY_ID ? this.selection : null,
@@ -1194,11 +1226,11 @@ export default class Town extends View {
       .border_l(1)
       .border_color(t.border)
       .children([
-        div().text_size(10).text_color(t.dim).child(preview ? "整棟預覽" : "選址與預定地"),
+        div().text_size(10).text_color(t.dim).child(preview ? "整棟預覽" : "選址與建設"),
         ...(preview ? this.previewSection(preview, t, cx) : (plan ? this.planSection(plan, t) : this.spotSection(shared, spot, t))),
         ...(this.devMode ? [
           div().text_size(9).text_color(t.dim)
-            .child(`已揭開 ${revealedCells(shared).size} 格 · 預定地 ${plan ? 1 : 0} 項 · 帳本 ${SHARED_CITY_ID}`),
+            .child(`已揭開 ${revealedCells(shared).size} 格 · 建築 ${shared.buildings.length} 棟 · 目標 ${plan ? plan.stage : "無"} · 帳本 ${SHARED_CITY_ID}`),
         ] : []),
         this.note ? div().text_size(9).text_color(t.muted).child(this.note) : null,
       ].filter(Boolean));
@@ -1223,32 +1255,45 @@ export default class Town extends View {
   }
 
   planSection(plan, t) {
+    const building = plan.stage === "building";
     return [
-      div().text_size(14).font_semibold().child(`預定：${plan.label}`),
-      h_flex().gap(6).items_center().child(statusBadge("預定地", t))
+      div().text_size(14).font_semibold().child(`${building ? "施工中" : "預定"}：${plan.label}`),
+      h_flex().gap(6).items_center().child(statusBadge(building ? "施工中" : "預定地", t))
         .child(div().text_size(10).text_color(t.muted).child(`(${plan.x}, ${plan.y})、占地 ${plan.w}×${plan.h}`)),
       fieldRow({ label: "配方", value: costsText(plan.costs) }, t),
-      fieldRow({ label: "還缺", value: missingText(plan.missing) }, t),
-      div().text_size(9).text_color(t.muted).child("整片占地已經保留，庫存沒有預扣；材料備齊才支付並開工（施工接續在 #26）。"),
+      ...(building
+        ? [
+          fieldRow({ label: "開工", value: clockText(plan.startedAt) }, t),
+          fieldRow({ label: "完工", value: clockText(plan.completesAt) }, t),
+          div().text_size(9).text_color(t.muted).child("配方已一次付清；完工就啟用並揭開附近的土地，之後只存料，不會自動蓋下一棟。"),
+        ]
+        : [
+          fieldRow({ label: "還缺", value: missingText(plan.missing) }, t),
+          div().text_size(9).text_color(t.muted).child("整片占地已經保留，庫存沒有預扣；材料備齊就自動支付並開工，不用回來按。"),
+        ]),
     ];
   }
 
   spotSection(shared, spot, t) {
     if (!spot) return [div().text_size(10).text_color(t.muted).child("點地圖上一格看地形；選好建築後點一格就是整棟預覽。")];
-    const terrain = revealedCells(shared).has(`${spot.x},${spot.y}`) ? terrainAt(spot) : null;
+    const ground = revealedCells(shared).has(`${spot.x},${spot.y}`) ? groundAt(shared, spot) : null;
+    const done = ground === "building"
+      ? shared.buildings.find((building) => building.cells.some((cell) => cell.x === spot.x && cell.y === spot.y))
+      : null;
     return [
       div().text_size(14).font_semibold().child(`(${spot.x}, ${spot.y})`),
-      fieldRow({ label: "地形", value: terrain ? TERRAIN[terrain]?.label ?? terrain : "迷霧" }, t),
+      fieldRow({ label: "地面", value: ground ? groundLabel(ground) : "迷霧" }, t),
+      ...(done ? [fieldRow({ label: "建築", value: `${done.label}（${clockText(done.completedAt)} 完工）` }, t)] : []),
       div().text_size(9).text_color(t.muted).child(
         this.picking ? "這一格是整棟占地的左上角：在地圖點它就會顯示預覽。" : "選一棟建築之後，這裡會列出整棟占地的判斷。",
       ),
-      ...(shared.plan ? [div().text_size(9).text_color(t.dim).child(`目前唯一的目標是 ${shared.plan.label} (${shared.plan.x}, ${shared.plan.y})。`)] : []),
+      ...(shared.plan ? [div().text_size(9).text_color(t.dim).child(`目前唯一的目標：${planLine(shared.plan)}。`)] : []),
     ];
   }
 
   /**
-   * 下令：寫進共用帳本的 plan entry。成功就重讀共用城市（庫存與預定地），失敗只回報原因；
-   * 被拒的下令不寫任何東西，所以另一個視窗搶先時這裡不會留下半片占地。
+   * 下令：寫進共用帳本的 plan entry；庫存已經夠就同一刻開工（#26）。成功就重讀共用城市，失敗只
+   * 回報原因；被拒的下令不寫任何東西，所以另一個視窗搶先時這裡不會留下半片占地。
    */
   submitPlan(preview, cx) {
     const startedAt = Date.now();
@@ -1256,17 +1301,14 @@ export default class Town extends View {
     cx.spawn(async (cx2) => {
       let text;
       try {
-        const ledger = await new CityLedger({
-          io: this.io,
-          dir: sharedCityDir(adapterRoot(appHome())),
-          cityId: SHARED_CITY_ID,
-        }).open();
-        const result = await placePlan(ledger, { building, x, y, at: Date.now() });
+        const result = await placePlan(await openShared(this.io), { building, x, y, at: Date.now() });
         if (result.status === "applied" || result.status === "duplicate") {
           this.town = await refreshTown(this.io, this.town);
           this.picking = null;
           this.preview = null;
-          text = `已預定：${label} (${x}, ${y})`;
+          const plan = this.town.shared?.city?.plan;
+          text = plan?.stage === "building" ? `材料已齊，開工：${label} (${x}, ${y})` : `已預定：${label} (${x}, ${y})`;
+          this.scheduleCompletion(cx2);
         } else {
           text = `沒有預定：${PLAN_REASONS[result.reason] ?? result.reason}`;
         }
@@ -1275,6 +1317,34 @@ export default class Town extends View {
       }
       this.metrics.pending = { kind: "action", at: startedAt };
       this.showToast(text, cx2);
+    });
+  }
+
+  /**
+   * 施工中就在完工時間到時推進一次（#26）：不必有新的活動或玩家操作，城市自己完工。
+   * 同一個完工時間只排一次；別的視窗先完工也沒關係，帳本只收一筆完工。
+   */
+  scheduleCompletion(cx) {
+    const plan = this.town?.shared?.city?.plan;
+    if (plan?.stage !== "building" || this.completionAt === plan.completesAt) return;
+    this.completionAt = plan.completesAt;
+    cx.timer.after(Math.max(0, plan.completesAt - Date.now()) + 250, (cx2) => this.finishConstruction(cx2));
+  }
+
+  finishConstruction(cx) {
+    // 這一次排程已經觸發：還沒完工（例如時鐘被往回調）時，下面的 scheduleCompletion 會重新排一次。
+    this.completionAt = null;
+    cx.spawn(async (cx2) => {
+      try {
+        const { completed } = await advanceConstruction(await openShared(this.io), { now: Date.now() });
+        const before = this.town?.shared?.city?.plan;
+        this.town = await refreshTown(this.io, this.town);
+        if (completed.status === "applied" && before) this.showToast(`${before.label} (${before.x}, ${before.y}) 完工，附近的土地揭開了`, cx2);
+        this.scheduleCompletion(cx2);
+      } catch (error) {
+        this.note = `完工推進失敗：${error}`;
+      }
+      cx2.notify();
     });
   }
 

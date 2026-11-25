@@ -17,15 +17,15 @@ herdr 的開墾城鎮 mod。這個資料夾是 mod 本體：一個「遠征指�
 | `ui/standing.js` | 主要行會、額度與派系的畫面（上方那條、右側投入區、中央的行會人力清單） |
 | `core/grid.js` | 邏輯座標、BFS 選地與 3/4 投影（投影與規則分開） |
 | `core/space-city.js` | 目前的 space 對應哪一座城：用資料夾（repo 與 worktree checkout）比對，切換 space 城就跟著換 |
-| `core/shared-city.js` | 共用城市（#23、#25）：所有專案的工作累積到同一座城、一個倉庫；唯一的建設目標寫在帳本。工作來源只決定「是不是有效工作」，不分城、不換庫存 |
-| `core/city-map.js` | 共用城市的地圖（#25）：固定地形、起始揭開區、建築占地與選址判準；預覽與帳本前提檢查共用同一個 `siteCheck` |
+| `core/shared-city.js` | 共用城市（#23–#26）：所有專案的工作累積到同一座城、一個倉庫；唯一的建設目標寫在帳本，備料到齊自動開工、工期到了完工（`advanceConstruction`）。工作來源只決定「是不是有效工作」，不分城、不換庫存 |
+| `core/city-map.js` | 共用城市的地圖（#25、#26）：固定地形、起始揭開區、完工建築的揭開範圍、建築占地與選址判準；預覽與帳本前提檢查共用同一個 `siteCheck`，`groundAt` 給畫面看工地與建築 |
 | `core/host-io.js` | 儲存介面的 host 適配層：herdr 的原生 CAS 衝突 → `CasConflict`（見下） |
 | `core/selection.js` | 選取狀態的保存（不是城的帳本；見下） |
 | `scenarios/first-expedition.js` | `herdr-app check` 與固定情境測試用資料；正式 runtime 不拿它入帳 |
 | `test/town.test.js` | 固定情境測試：只斷言可觀察的城鎮狀態 |
 | `test/restore.test.js` | 帳本重建的城 ＝ 直接重播的城；重開、重播、checkpoint 都一樣 |
 | `test/omp-adapter.test.js` | OMP 固定活動事件 → journal → 公開城鎮讀取模型；驗證用量來源去重與 root/child 歸戶 |
-| `test/shared-city.test.js` | 共用城市：跨專案、長短對話、換 provider 與重播只入帳一次；成果加成只發一次；選址的合法位置、整棟預覽、缺料預定與多視窗爭用目標 |
+| `test/shared-city.test.js` | 共用城市：跨專案、長短對話、換 provider 與重播只入帳一次；成果加成只發一次；選址的合法位置、整棟預覽、缺料預定與多視窗爭用目標；只靠研究備齊自動開工、到期完工、多視窗與重播不重扣不重蓋、疏林碎石同價、完工才揭開 |
 | `test/history.test.js` | 歷程篩選、撤回／封存世代跳轉、未解析活動與可重建索引 |
 | `../omp-extension/herdr-reclaim.test.ts` | 驅動 extension 生命週期事件，驗證互動／child／fork／resume 與 ack compact |
 | `test/ledger.test.js` | 儲存層：完成依據、故障重試、CAS 競爭、換段、ack |

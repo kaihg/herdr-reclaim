@@ -6,13 +6,14 @@ import path from "node:path";
 import { CityLedger, cityDir } from "../core/ledger.js";
 import { ingestScenario } from "../core/ingest.js";
 import { ACHIEVEMENT_YIELD, CITY_BUILDINGS, RECIPES, WORK_TOKENS_PER_UNIT, WORK_YIELD } from "../core/rules.js";
-import { SHARED_CITY_ID, ingestAchievements, ingestIncome, placePlan, readSharedCity, sharedCityDir } from "../core/shared-city.js";
-import { legalSites, revealedCells, siteCheck, terrainAt } from "../core/city-map.js";
+import { SHARED_CITY_ID, advanceConstruction, ingestAchievements, ingestIncome, placePlan, readSharedCity, sharedCityDir } from "../core/shared-city.js";
+import { groundAt, legalSites, revealedCells, siteCheck, terrainAt } from "../core/city-map.js";
 import { createFileIo } from "./fs-io.js";
 
 const REPO_A = "/tmp/reclaim-23-a/.git";
 const REPO_B = "/tmp/reclaim-23-b/.git";
 const AT = 1_800_000_000_000;
+const TERRAIN_BUILDABLE = new Set(["grass", "scrub", "rubble"]);
 const T = (ms) => AT + ms;
 
 const root = (name) => `/tmp/reclaim-23-shared/${name}-${process.pid}-${Math.random().toString(36).slice(2)}`;
@@ -645,5 +646,227 @@ describe("選址與預定地（#25）", () => {
     expect(terrainAt(at(1, -3))).toBe("scrub");
     expect(terrainAt(at(2, -2))).toBe("rubble");
     for (const [x, y] of [[12, -7], [-30, 41], [5, 5]]) expect(terrainAt(at(x, y))).toBe(terrainAt(at(x, y)));
+  });
+});
+
+// ticket #26：備料、施工與完工。同樣是「固定工作事件＋玩家操作 → 實際隔離帳本 → 公開共用城市」，
+// 每個可見階段（預定、施工、完工）都從重新打開的帳本讀；時間由呼叫端給，不依牆上時鐘。
+const MINUTE = 60_000;
+
+/** 一支只做研究的 session：在 `repo` 連續 n 個回合，每回合正好一單位工作，沒有 commit 或交易。 */
+const research = (sessionId, repo, n, from) => activity({
+  sessionId,
+  events: Array.from({ length: n }, (_, i) => round(repo, from + i * 100_000, from + i * 100_000 + 60_000,
+    [usageEvent(from + i * 100_000 + 1_000, `${sessionId}-${i}`, TEN_K, { sessionId })])).flat(),
+});
+/** 第 i 個研究回合結束的時間（收成入帳的時間）。 */
+const roundEnd = (from, i) => from + i * 100_000 + 60_000;
+
+describe("備料、施工與完工（#26）", () => {
+  test("在 A 預定缺料的書庫，B 只做研究、沒有 commit 或交易：備齊那一刻自動開工，只付一次完整配方", async () => {
+    const dir = root("research-only");
+    const ledger = await sharedLedger(dir);
+    expect((await order(ledger, "library", at(-1, 2))).status).toBe("applied");
+
+    // 書庫要木 20、石 20、鐵 5：九單位工作（木 27、石 18、鐵 9）還缺石材 2。
+    const from = T(1_000_000);
+    await settle(ledger, [research("b", REPO_B, 9, from)]);
+    const waiting = await cityAt(dir);
+    expect(waiting.plan).toMatchObject({ building: "library", stage: "reserved" });
+    expect(waiting.plan.missing).toEqual({ stone: 2 });
+    expect(stock(waiting)).toEqual([27, 18, 9]);
+
+    // 第十單位到齊：同一份配方一次付清，從那個回合結束的時間開工。
+    const ten = research("b", REPO_B, 10, from);
+    await settle(ledger, [ten]);
+    const building = await cityAt(dir);
+    expect(building.plan).toMatchObject({ building: "library", x: -1, y: 2, stage: "building", startedAt: roundEnd(from, 9) });
+    expect(building.plan.completesAt).toBe(roundEnd(from, 9) + CITY_BUILDINGS.library.buildMs);
+    expect(stock(building)).toEqual([10, 0, 5]);
+
+    // 同一份工作重送、重開帳本：不再入帳，也不再扣料。
+    await settle(await sharedLedger(dir), [ten]);
+    expect(stock(await cityAt(dir))).toEqual([10, 0, 5]);
+    expect((await cityAt(dir)).plan.startedAt).toBe(roundEnd(from, 9));
+  });
+
+  test("較早的工作晚到才補齊材料：開工時間是材料真的齊的那一刻，不回溯到那筆較早的工作", async () => {
+    const dir = root("late-arrival");
+    const ledger = await sharedLedger(dir);
+    expect((await order(ledger, "library", at(-1, 2))).status).toBe("applied");
+    // 先入帳：較晚的九單位研究（還缺石材 2）。
+    const late = T(3_000_000);
+    await settle(ledger, [research("b", REPO_B, 9, late)]);
+    // 另一個 space 晚一點才送來一段更早結束的研究：它補齊材料，但書庫用到的是全部十單位。
+    await settle(await sharedLedger(dir), [research("a", REPO_A, 1, T(1_000_000))]);
+    const city = await cityAt(dir);
+    expect(city.plan.stage).toBe("building");
+    expect(city.plan.startedAt).toBe(roundEnd(late, 8));
+    expect(stock(city)).toEqual([10, 0, 5]);
+  });
+
+  test("工期到了才完工：完工立即啟用、預定地交還；之後的工作只增加庫存，不替玩家選或付下一棟", async () => {
+    const dir = root("complete");
+    const ledger = await sharedLedger(dir);
+    expect((await order(ledger, "library", at(-1, 2))).status).toBe("applied");
+    const from = T(1_000_000);
+    await settle(ledger, [research("b", REPO_B, 10, from)]);
+    const { completesAt } = (await cityAt(dir)).plan;
+
+    // 還差一毫秒：仍在施工。
+    await advanceConstruction(await sharedLedger(dir), { now: completesAt - 1 });
+    const early = await cityAt(dir);
+    expect(early.plan.stage).toBe("building");
+    expect(early.buildings).toEqual([]);
+
+    // 隔天才打開畫面：完工時間仍是開工加工期，不是看到的那一刻。
+    await advanceConstruction(await sharedLedger(dir), { now: completesAt + 24 * 60 * MINUTE });
+    const done = await cityAt(dir);
+    expect(done.plan).toBeNull();
+    expect(done.buildings).toHaveLength(1);
+    expect(done.buildings[0]).toMatchObject({ building: "library", label: CITY_BUILDINGS.library.label, x: -1, y: 2, completedAt: completesAt });
+    expect(keysOf(done.buildings[0].cells)).toEqual(["-1,2", "-1,3", "0,2", "0,3"]);
+    expect(stock(done)).toEqual([10, 0, 5]);
+
+    // 繼續研究：庫存累積到足以再蓋一座書庫，也只是存料；沒有新的目標就沒有開工或完工。
+    await settle(ledger, [research("b", REPO_B, 20, from)]);
+    await advanceConstruction(ledger, { now: completesAt + 48 * 60 * MINUTE });
+    const later = await cityAt(dir);
+    expect(stock(later)).toEqual([40, 20, 15]);
+    expect(later.plan).toBeNull();
+    expect(later.buildings).toHaveLength(1);
+  });
+
+  test("庫存已經足夠時下令：同一刻開工，不必等下一筆工作", async () => {
+    const dir = root("direct");
+    const ledger = await sharedLedger(dir);
+    await settle(ledger, [research("a", REPO_A, 10, T(0))]);
+    expect(stock(await cityAt(dir))).toEqual([30, 20, 10]);
+
+    const orderedAt = T(5_000_000);
+    expect((await placePlan(ledger, { building: "library", x: -1, y: 2, at: orderedAt })).status).toBe("applied");
+    const city = await cityAt(dir);
+    expect(city.plan).toMatchObject({ building: "library", stage: "building", startedAt: orderedAt });
+    expect(city.plan.completesAt).toBe(orderedAt + CITY_BUILDINGS.library.buildMs);
+    expect(city.plan.missing).toEqual({});
+    expect(stock(city)).toEqual([10, 0, 5]);
+  });
+
+  test("兩個視窗同時補齊材料、同時看到工期到：只開工一次、只扣一次、只蓋一棟；重開、重播與 checkpoint 後不變", async () => {
+    const dir = root("race-build");
+    const ledger = await sharedLedger(dir);
+    expect((await order(ledger, "library", at(-1, 2))).status).toBe("applied");
+    const from = T(1_000_000);
+    const nine = research("b", REPO_B, 9, from);
+    await settle(ledger, [nine]);
+
+    // 兩個 space 各自結束一個不同的研究回合，任何一個都足以補齊石材：兩筆收入都入帳，書庫只付一次。
+    const later = T(3_000_000);
+    const inA = research("a", REPO_A, 1, later);
+    const inC = research("c", REPO_B, 1, later);
+    const funding = racingIos();
+    const [spaceA, spaceB] = await Promise.all(funding.ios.map((io) => sharedLedger(dir, { io })));
+    funding.arm();
+    const settled = await Promise.all([settle(spaceA, [inA]), settle(spaceB, [inC])]);
+    expect(settled.flatMap((run) => run.results).some((result) => result.attempts > 1)).toBe(true); // 真的撞在一起
+    const building = await cityAt(dir);
+    expect(building.plan.stage).toBe("building");
+    expect(stock(building)).toEqual([13, 2, 6]); // 十一單位工作減一份書庫配方
+
+    // 施工中做 checkpoint：重開後仍是同一個工地、同一個完工時間。
+    await (await sharedLedger(dir)).checkpoint();
+    expect(await cityAt(dir)).toEqual(building);
+
+    // 兩個視窗同時看到工期到了：只有一筆完工。
+    const finishing = racingIos();
+    const [windowA, windowB] = await Promise.all(finishing.ios.map((io) => sharedLedger(dir, { io })));
+    finishing.arm();
+    const results = await Promise.all([windowA, windowB].map((window) => advanceConstruction(window, { now: building.plan.completesAt })));
+    expect(results.filter((result) => result.completed.status === "applied")).toHaveLength(1);
+    const done = await cityAt(dir);
+    expect(done.plan).toBeNull();
+    expect(done.buildings).toHaveLength(1);
+    expect(stock(done)).toEqual([13, 2, 6]);
+
+    // 重開、重送同樣的工作、再推進一次、做 checkpoint：不再入帳、不重扣、不重蓋。
+    const reopened = await sharedLedger(dir);
+    await settle(reopened, [nine, inA, inC]);
+    await advanceConstruction(reopened, { now: building.plan.completesAt + MINUTE });
+    await reopened.checkpoint();
+    expect(await cityAt(dir)).toEqual(done);
+  });
+
+  test("同一種多格建築放在草地或疏林碎石混合地：配方與工期相同；施工時植被碎石讓位，完工後是建築", async () => {
+    // 草地上的書庫：庫存足夠，直接開工。
+    const grassDir = root("grass-library");
+    const grass = await sharedLedger(grassDir);
+    await settle(grass, [research("a", REPO_A, 10, T(0))]);
+    expect(new Set(siteCheck(await cityAt(grassDir), "library", at(-1, 2)).cells.map((cell) => cell.terrain))).toEqual(new Set(["grass"]));
+    await placePlan(grass, { building: "library", x: -1, y: 2, at: T(5_000_000) });
+    const onGrass = await cityAt(grassDir);
+
+    // 疏林與碎石混合地上的書庫：先預定（缺料），再補齊。
+    const mixedDir = root("mixed-library");
+    const mixed = await sharedLedger(mixedDir);
+    const cells = siteCheck(await cityAt(mixedDir), "library", at(1, -3)).cells;
+    expect(new Set(cells.map((cell) => cell.terrain))).toEqual(new Set(["scrub", "rubble"]));
+    await placePlan(mixed, { building: "library", x: 1, y: -3, at: T(-1_000) });
+    const reserved = await cityAt(mixedDir);
+    expect(reserved.plan.stage).toBe("reserved");
+    expect(reserved.plan.costs).toEqual(onGrass.plan.costs);
+    // 預定還沒動工：地面仍是原本的疏林與碎石。
+    expect(cells.map((cell) => groundAt(reserved, cell))).toEqual(cells.map((cell) => cell.terrain));
+
+    await settle(mixed, [research("a", REPO_A, 10, T(0))]);
+    const onMixed = await cityAt(mixedDir);
+    expect(onMixed.plan.stage).toBe("building");
+    expect(stock(onMixed)).toEqual(stock(onGrass));
+    expect(onMixed.plan.completesAt - onMixed.plan.startedAt).toBe(onGrass.plan.completesAt - onGrass.plan.startedAt);
+    // 施工中：整片占地都是工地，看不到原本的植被或碎石。
+    expect(cells.map((cell) => groundAt(onMixed, cell))).toEqual(["site", "site", "site", "site"]);
+
+    await advanceConstruction(mixed, { now: onMixed.plan.completesAt });
+    const built = await cityAt(mixedDir);
+    expect(cells.map((cell) => groundAt(built, cell))).toEqual(["building", "building", "building", "building"]);
+    // 占地外的地形不受影響。
+    expect(groundAt(built, at(3, -3))).toBe(terrainAt(at(3, -3)));
+  });
+
+  test("普通建築完工才揭開附近（預定與施工時不揭）；重開後新揭開的合法位置可直接預定，建築本身占著地", async () => {
+    const dir = root("reveal");
+    const ledger = await sharedLedger(dir);
+    const start = new Set(revealedCells(await cityAt(dir)));
+    expect(start.has("5,0")).toBe(false); // 民居右邊一格起就是迷霧
+
+    // 民居 1×1 放在揭開區的東緣，缺料先預定。
+    expect((await order(ledger, "house", at(4, 0))).status).toBe("applied");
+    expect(revealedCells(await cityAt(dir))).toEqual(start);
+
+    await settle(ledger, [research("a", REPO_A, 7, T(1_000_000))]);
+    const building = await cityAt(dir);
+    expect(building.plan.stage).toBe("building");
+    expect(revealedCells(building)).toEqual(start);
+
+    await advanceConstruction(ledger, { now: building.plan.completesAt });
+    // 重開帳本：完工的民居、揭開的土地都還在。
+    const after = await cityAt(dir);
+    expect(after.buildings.map((b) => [b.building, b.x, b.y])).toEqual([["house", 4, 0]]);
+    const revealed = revealedCells(after);
+    const fresh = [...revealed].filter((key) => !start.has(key)).sort();
+    // 占地往外兩格：x 5..6、y -2..2 是新揭開的土地（原本就看得到的不重算）。
+    expect(fresh).toEqual(["5,-1", "5,-2", "5,0", "5,1", "5,2", "6,-1", "6,-2", "6,0", "6,1", "6,2"].sort());
+
+    // 建築占著它的地：同一格不能再放。
+    const occupied = siteCheck(after, "house", at(4, 0));
+    expect(problemsOf(occupied)).toEqual(["building"]);
+    expect(await order(ledger, "house", at(4, 0))).toMatchObject({ status: "rejected", reason: "site_building" });
+
+    // 新揭開的土地裡，地形合法的位置不必另外取得建造權，直接預定。
+    const newSites = legalSites(after, "house").filter((site) => !start.has(`${site.x},${site.y}`));
+    expect(newSites.length).toBeGreaterThan(0);
+    for (const site of newSites) expect(TERRAIN_BUILDABLE.has(terrainAt(site))).toBe(true);
+    const target = newSites[0];
+    expect((await order(await sharedLedger(dir), "house", target)).status).toBe("applied");
+    expect((await cityAt(dir)).plan).toMatchObject({ building: "house", x: target.x, y: target.y, stage: "reserved" });
   });
 });

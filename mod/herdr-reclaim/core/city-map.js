@@ -55,23 +55,44 @@ export function terrainAt({ x, y }) {
   return hashedTerrain(x, y);
 }
 
-/** 一格是否已揭開：起始區扣掉東北角的迷霧線。之後完工的建築再往外揭（#26）。 */
+/** 一格是否在起始揭開區：起始區扣掉東北角的迷霧線。之後完工的建築再往外揭（`revealedCells`）。 */
 export function isRevealed({ x, y }) {
   return inStartRect(x, y) && x + y <= START.fogLine;
 }
 
 /**
- * 已揭開的格子鍵（`x,y`）。`city` 目前只需要存在即可；之後的揭圖（#26）從這裡長出來，
- * 呼叫端（畫面、預覽、帳本前提）都只透過這一個集合判斷迷霧。
+ * 已揭開的格子鍵（`x,y`）：起始揭開區，加上每棟已完工建築的占地往外 `reveal` 格（#26）。
+ * 預定與施工中都不揭開；揭開之後永久可見，不必另外取得建造權。呼叫端（畫面、預覽、帳本前提）
+ * 都只透過這一個集合判斷迷霧，所以 `city` 可以是帳本狀態或公開的讀取模型（兩者的 `buildings` 同形）。
  */
-export function revealedCells(_city) {
+export function revealedCells(city) {
   const keys = new Set();
   for (let x = START.minX; x <= START.maxX; x++) {
     for (let y = START.minY; y <= START.maxY; y++) {
       if (isRevealed({ x, y })) keys.add(`${x},${y}`);
     }
   }
+  for (const building of city?.buildings ?? []) {
+    const reach = Number(building.reveal ?? 0);
+    for (let x = building.x - reach; x < building.x + building.w + reach; x++) {
+      for (let y = building.y - reach; y < building.y + building.h + reach; y++) keys.add(`${x},${y}`);
+    }
+  }
   return keys;
+}
+
+const keyOf = (cell) => `${cell.x},${cell.y}`;
+const covers = (cells, { x, y }) => (cells ?? []).some((cell) => cell.x === x && cell.y === y);
+
+/**
+ * 一格現在的地面（畫面用）：已完工建築的占地是 `building`，施工中的占地是 `site`——植被與碎石
+ * 在開工時讓位，所以工地看不到原本的疏林或碎石地；預定地還沒動工，仍是原本的地形。
+ * 其餘格子回原本的地形（不看迷霧，迷霧由呼叫端用 `revealedCells` 判斷）。
+ */
+export function groundAt(city, cell) {
+  if ((city?.buildings ?? []).some((building) => covers(building.cells, cell))) return "building";
+  if (city?.plan?.startedAt != null && covers(city.plan.cells, cell)) return "site";
+  return terrainAt(cell);
 }
 
 /** 一棟建築在某個錨點（左上角）佔用的整片格子，順序固定：先 x 再 y。 */
@@ -86,33 +107,46 @@ export function footprintCells(building, { x, y }) {
 }
 
 /**
- * 選址預覽：整片占地的每一格回報地形與「不能放的原因」。
- * 原因只有一種：`fog`（沒揭開，地形不回報）、`water`、`cliff`、`center`（城鎮中心）、
- * `plan`（已經是同一個預定地）。`ok` 是全部格子都沒有原因。
+ * 一座城的選址判準：揭開範圍與占用格只算一次，之後每個錨點共用（`legalSites` 要問上百個錨點）。
+ * 回傳 `(building, anchor) => 預覽`；`siteCheck` 與 `legalSites` 都走這一個函式。
  */
-export function siteCheck(city, building, anchor) {
-  const def = CITY_BUILDINGS[building];
-  if (!def) return { ok: false, building, x: anchor?.x, y: anchor?.y, cells: [], problems: ["unknown_building"] };
+function siteChecker(city) {
   const revealed = revealedCells(city);
-  const planned = new Set((city?.plan?.cells ?? []).map((cell) => `${cell.x},${cell.y}`));
-  const cells = footprintCells(building, anchor).map((cell) => {
-    const key = `${cell.x},${cell.y}`;
-    if (!revealed.has(key)) return { ...cell, terrain: null, problem: "fog" };
-    const terrain = terrainAt(cell);
-    if (!TERRAIN[terrain].buildable) return { ...cell, terrain, problem: terrain };
-    if (isCenterCell(cell)) return { ...cell, terrain, problem: "center" };
-    if (planned.has(key)) return { ...cell, terrain, problem: "plan" };
-    return { ...cell, terrain, problem: null };
-  });
-  const problems = cells.map((cell) => cell.problem).filter(Boolean);
-  return { ok: problems.length === 0, building, label: def.label, x: anchor?.x, y: anchor?.y, cells, problems };
+  const built = new Set((city?.buildings ?? []).flatMap((done) => done.cells.map(keyOf)));
+  const planned = new Set((city?.plan?.cells ?? []).map(keyOf));
+  const check = (building, anchor) => {
+    const def = CITY_BUILDINGS[building];
+    if (!def) return { ok: false, building, x: anchor?.x, y: anchor?.y, cells: [], problems: ["unknown_building"] };
+    const cells = footprintCells(building, anchor).map((cell) => {
+      const key = keyOf(cell);
+      if (!revealed.has(key)) return { ...cell, terrain: null, problem: "fog" };
+      const terrain = terrainAt(cell);
+      if (!TERRAIN[terrain].buildable) return { ...cell, terrain, problem: terrain };
+      if (isCenterCell(cell)) return { ...cell, terrain, problem: "center" };
+      if (built.has(key)) return { ...cell, terrain, problem: "building" };
+      if (planned.has(key)) return { ...cell, terrain, problem: "plan" };
+      return { ...cell, terrain, problem: null };
+    });
+    const problems = cells.map((cell) => cell.problem).filter(Boolean);
+    return { ok: problems.length === 0, building, label: def.label, x: anchor?.x, y: anchor?.y, cells, problems };
+  };
+  return { revealed, check };
 }
 
-/** 全部合法錨點：把已揭開的範圍往外擴一個占地，逐點用 `siteCheck` 判斷（與預覽同一條規則）。 */
+/**
+ * 選址預覽：整片占地的每一格回報地形與「不能放的原因」。
+ * 原因只有一種：`fog`（沒揭開，地形不回報）、`water`、`cliff`、`center`（城鎮中心）、
+ * `building`（已完工的建築）、`plan`（已經是同一個預定地或工地）。`ok` 是全部格子都沒有原因。
+ */
+export function siteCheck(city, building, anchor) {
+  return siteChecker(city).check(building, anchor);
+}
+
+/** 全部合法錨點：把已揭開的範圍往外擴一個占地，逐點用同一個判準判斷（與預覽同一條規則）。 */
 export function legalSites(city, building) {
   const def = CITY_BUILDINGS[building];
   if (!def) return [];
-  const revealed = revealedCells(city);
+  const { revealed, check } = siteChecker(city);
   if (revealed.size === 0) return [];
   const xs = [];
   const ys = [];
@@ -128,7 +162,7 @@ export function legalSites(city, building) {
   const sites = [];
   for (let x = minX; x <= maxX; x++) {
     for (let y = minY; y <= maxY; y++) {
-      if (siteCheck(city, building, { x, y }).ok) sites.push({ x, y });
+      if (check(building, { x, y }).ok) sites.push({ x, y });
     }
   }
   return sites;

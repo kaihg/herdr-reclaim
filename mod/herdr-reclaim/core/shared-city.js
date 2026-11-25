@@ -9,10 +9,10 @@
 // 所有 repo 的工作都進同一個計量器，而且沒有可歸屬 commit 的限制（那是 #24 的額外收成）。
 //
 // 這一票交付「工作 → 基本建材 + 常駐庫存」；明確成果的額外收成是 #24（`ingestAchievements`）。
-// 選址、預定地與自動施工是 #25–#27；舊版各城帳本（`cities/<hash>/`）原封不動：共用帳本放在
-// 別的目錄，不讀也不改它們。
-import { claimKey } from "./ledger.js";
-import { ACHIEVEMENT_YIELD, CITY_BUILDINGS, WORK_TOKENS_PER_UNIT, WORK_YIELD, workYieldOf } from "./rules.js";
+// 選址與預定地是 #25；備料到齊自動開工、到期完工是 #26（`advanceConstruction`）。舊版各城帳本
+// （`cities/<hash>/`）原封不動：共用帳本放在別的目錄，不讀也不改它們。
+import { claimKey, planKey } from "./ledger.js";
+import { ACHIEVEMENT_YIELD, CITY_BUILDINGS, WORK_TOKENS_PER_UNIT, WORK_YIELD, affordable, workYieldOf } from "./rules.js";
 import { missingOf } from "./city-map.js";
 import { changesOfCommit } from "./harvest.js";
 import { commitContexts } from "./commit-evidence.js";
@@ -123,7 +123,7 @@ export async function ingestIncome(ledger, { activities = [], activateAt } = {})
   for (const settlement of settlements) {
     // 收成依「提交當下」的計量器餘數計算（不是單一回合的 token）：CAS 重試時重新讀到最新餘數，
     // 兩個視窗同時提交也不會有人把別人的餘數吃掉。entry 存的是實際發出的建材。
-    results.push(await ledger.submit((current) => ({
+    const result = await ledger.submit((current) => ({
       opId: settlement.opId,
       kind: "income",
       at: settlement.at,
@@ -136,21 +136,74 @@ export async function ingestIncome(ledger, { activities = [], activateAt } = {})
       tokens: settlement.tokens,
       sources: settlement.sources,
       resources: workYieldOf(Number(current.work?.tokens ?? 0) + settlement.tokens),
-    })));
+    }));
+    results.push(result);
+    // 這一筆收成可能剛好補齊預定地的材料：入帳之後立刻檢查，不等畫面推進。
+    if (result.status === "applied") await startIfReady(ledger);
   }
   return { settlements, results };
 }
 
 /**
- * 公開的共用城市讀取模型：庫存、工作進度與唯一的建設目標。
+ * 備料到齊就開工（#26）：有預定地、還沒開工、庫存足以支付預定時的完整配方，才送出一筆 construct。
+ * 開工時間是材料到齊的那一刻：下令時間與入庫建材裡最晚那一筆（`work.stockedAt`）取晚者——晚到的
+ * 較早工作不會讓工期回溯，關著畫面的那段時間也照算。opId 綁住目標，兩個視窗同時達標、重播或重開
+ * 都只扣一次；沒有預定地時什麼都不做——不替玩家選下一棟。
+ */
+async function startIfReady(ledger) {
+  return ledger.submit((current) => {
+    const plan = current.plan;
+    if (!plan || plan.startedAt != null || !affordable(plan.costs, current.resources)) return null;
+    return {
+      opId: `construct:${ledger.cityId}:${planKey(plan)}`,
+      kind: "construct",
+      at: Math.max(Number(plan.at), Number(current.work?.stockedAt ?? plan.at)),
+      cityId: ledger.cityId,
+      plan: planKey(plan),
+      building: plan.building,
+      costs: { ...plan.costs },
+      buildMs: CITY_BUILDINGS[plan.building]?.buildMs,
+    };
+  });
+}
+
+/**
+ * 推進唯一的建設目標（#26）：材料齊了就開工（入帳中斷而漏開的那一筆由這裡補上），工期到了就
+ * 完工。完工的時間是開工加工期，不是 `now`；完工之後只存料，不支付下一棟。
+ * 畫面每次重載與施工計時到期時呼叫；多個視窗同時呼叫只會有一筆開工、一筆完工。
+ */
+export async function advanceConstruction(ledger, { now = Date.now() } = {}) {
+  const started = await startIfReady(ledger);
+  const completed = await ledger.submit((current) => {
+    const plan = current.plan;
+    if (!plan || plan.startedAt == null || Number(plan.completesAt) > Number(now)) return null;
+    return {
+      opId: `complete:${ledger.cityId}:${planKey(plan)}`,
+      kind: "complete",
+      at: Number(plan.completesAt),
+      cityId: ledger.cityId,
+      plan: planKey(plan),
+      building: plan.building,
+      reveal: CITY_BUILDINGS[plan.building]?.reveal,
+    };
+  });
+  return { started, completed };
+}
+
+/**
+ * 公開的共用城市讀取模型：庫存、工作進度、唯一的建設目標與已完工的建築。
  * 各 space 讀到的是同一份資料（同一個帳本），所以切 repo 或重開 herdr 庫存與預定地都一樣。
- * `plan.missing` 是配方減掉現在庫存的差額（還沒支付任何材料），給「備料中」用。
+ * `plan.stage` 是 `reserved`（預定地，備料中）或 `building`（已付料施工中，`completesAt` 完工）；
+ * `plan.missing` 只在備料中有意義：配方減掉現在庫存的差額，開工之後已經付清，是空的。
  */
 export function readSharedCity(state = {}) {
   const plan = state.plan
     ? { ...state.plan, costs: { ...state.plan.costs }, cells: (state.plan.cells ?? []).map((cell) => ({ ...cell })) }
     : null;
-  if (plan) plan.missing = missingOf(plan.costs, state.resources);
+  if (plan) {
+    plan.stage = plan.startedAt != null ? "building" : "reserved";
+    plan.missing = plan.stage === "reserved" ? missingOf(plan.costs, state.resources) : {};
+  }
   return {
     schema: 1,
     city: {
@@ -159,19 +212,24 @@ export function readSharedCity(state = {}) {
       resources: Object.fromEntries(Object.keys(WORK_YIELD).map((key) => [key, Number(state.resources?.[key] ?? 0)])),
       work: { tokens: Number(state.work?.tokens ?? 0), unitTokens: WORK_TOKENS_PER_UNIT },
       plan,
+      buildings: (state.buildings ?? []).map((building) => ({
+        ...building,
+        costs: { ...building.costs },
+        cells: building.cells.map((cell) => ({ ...cell })),
+      })),
     },
   };
 }
 
 /**
- * 指定建設目標（#25）：選一棟建築與錨點，整片占地成為唯一的預定地。不動庫存——缺料也能先指定，
- * 備齊之後才支付（#26）。兩個視窗同時送出時由帳本的前提檢查裁決：最多一個生效，另一個整筆被拒，
- * 不會留下半片占地；opId 綁住建築與錨點，同一處重送是重播，不同處才是第二個目標。
+ * 指定建設目標（#25）：選一棟建築與錨點，整片占地成為唯一的預定地。不預扣庫存——缺料也能先指定；
+ * 下令當下庫存已經夠，就在同一刻開工（#26）。兩個視窗同時送出時由帳本的前提檢查裁決：最多一個
+ * 生效，另一個整筆被拒，不會留下半片占地；opId 綁住建築與錨點，同一處重送是重播，不同處才是第二個目標。
  */
 export async function placePlan(ledger, { building, x, y, at } = {}) {
   const def = CITY_BUILDINGS[building];
   const when = Number.isFinite(Number(at)) ? Number(at) : Date.now();
-  return ledger.submit(() => ({
+  const result = await ledger.submit(() => ({
     opId: `plan:${ledger.cityId}:${building}:${x},${y}:${when}`,
     kind: "plan",
     at: when,
@@ -183,6 +241,8 @@ export async function placePlan(ledger, { building, x, y, at } = {}) {
     h: def?.footprint.h ?? 0,
     costs: { ...(def?.costs ?? {}) },
   }));
+  if (result.status === "applied") await startIfReady(ledger);
+  return result;
 }
 
 /**
@@ -216,7 +276,7 @@ export async function ingestAchievements(ledger, { activities = [], hooks = [], 
     const claims = changesOfCommit(changes).map((unit) => `${context.cityId}|${unit.claim}`)
       .filter((claim) => !state.claims.has(claimKey(ledger.cityId, claim)));
     if (claims.length === 0) continue; // 空 commit、只改排除路徑、或內容已經入帳
-    results.push(await ledger.submit((current) => {
+    const result = await ledger.submit((current) => {
       const fresh = claims.filter((claim) => !current.claims.has(claimKey(ledger.cityId, claim)));
       if (fresh.length === 0) return null;
       return {
@@ -233,7 +293,9 @@ export async function ingestAchievements(ledger, { activities = [], hooks = [], 
         claims: fresh,
         resources: { ...ACHIEVEMENT_YIELD },
       };
-    }));
+    });
+    results.push(result);
+    if (result.status === "applied") await startIfReady(ledger);
   }
   return results;
 }
