@@ -154,5 +154,9 @@ HERDR_APP_HOME="$H" herdr-app shot /tmp/v.png           # 截圖像素與視窗�
   CGWindowList 的第一筆就是最前面那一扇）。
 - 沒有 OCR 時用校準代替：選好建築後點地圖任一格，右側詳情會寫出「建築種類 (x, y)」，兩次點擊就能
   解出 3/4 投影的位移量，之後任何一格都能算出像素位置。
-- Codex 的 computer use（`cua.getApp('dev.herdr.app').click([x, y])`）在同時開著使用者自己的 Herdr
-  視窗時會抓到那一扇（同一個 bundle id），指不到隔離 `HERDR_APP_HOME` 的視窗，所以不用它做驗證。
+- Codex 的 computer use 可以代做這些點擊：`cua.getApp('dev.herdr.app').click([x, y])` 的座標就是截圖像素。
+  三件事會讓它看起來「沒反應」：同一個 bundle id 有兩個 Herdr 在跑時只認得到其中一個（隔離
+  `HERDR_APP_HOME` 的那扇常拿不到）、Herdr 久沒重開時服務會回 `-10005 cgWindowNotFound`、以及
+  它自己讀截圖的文字可能落後一步。重開 Herdr 之後就恢復；成敗一律回到帳本核對，不要只信它讀到的畫面。
+- 委託的做法：在自己的 Herdr 裡用 `hc run --bg --name cu26 codex exec … "<任務>"` 開一個 codex pane，
+  任務寫清楚座標與「不是這個畫面就停下來回報」。它會動真實滑鼠，記得驗證完 `pane.close` 收乾淨。
