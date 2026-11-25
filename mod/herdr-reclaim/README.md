@@ -117,6 +117,8 @@ bun test mod/herdr-reclaim
 當資料走（子節點、文字、事件處理器）。事件處理器是普通的函式，呼叫它就等於按下，不用合成
 指標事件；檔案 API 換成 node fs，CAS 語意與真的 host 相同（`casConflictOf` 那條接縫）。
 
+哪一層證明什麼、什麼不算完成、為什麼不拿截圖當 gate：`docs/agents/verification.md`。
+
 ## 載入與檢查
 
 ```sh

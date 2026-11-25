@@ -39,6 +39,7 @@ sh tools/install.sh
 - 設計提案與決策紀錄：`docs/proposal.md`（當時的提案，不保證與現況一致）。
 - mod 本體與模組說明：`mod/herdr-reclaim/README.md`。
 - 測試：`cd mod/herdr-reclaim && bun test`；mod 檢查：`herdr-app check .`。
+- 視覺報告（測試、`herdr-app check`、三個 pane 寬度）：`tools/ui-report.sh`，跑完開它印出的 `report.html`。它用自己的 app home 與自己的 core，不動正在用的 Herdr。截圖只給人看，不是通過條件；規則見 [`docs/agents/verification.md`](docs/agents/verification.md)。
 - 畫面右上有「開發模式」開關，打開才會顯示工程資訊。
 - 議題在 GitHub Issues。
 

@@ -39,6 +39,7 @@ Everything is under `~/.config/herdr-app/data/herdr-reclaim/`. The ledger is app
 - Design proposal and decision log: `docs/proposal.md` (a snapshot from design time; it may not match the current behavior).
 - Mod internals: `mod/herdr-reclaim/README.md`.
 - Tests: `cd mod/herdr-reclaim && bun test`; mod check: `herdr-app check .`.
+- Visual report (tests, `herdr-app check`, three pane widths): `tools/ui-report.sh`, then open the printed `report.html`. It runs an isolated app and core, so your running Herdr is untouched. Screenshots are for human review, not a pass/fail gate; the rules are in [`docs/agents/verification.md`](docs/agents/verification.md).
 - A "dev mode" toggle in the top bar reveals engineering details.
 - Issues live on GitHub.
 
