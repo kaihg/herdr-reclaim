@@ -119,6 +119,21 @@ bun test mod/herdr-reclaim
 
 哪一層證明什麼、什麼不算完成、為什麼不拿截圖當 gate：`docs/agents/verification.md`。
 
+## 開發迴圈：存檔就重載
+
+herdr 只從自己 home 裡的真實檔案熱重載 mod（symlink 不會），所以開發時同步檔案就好，
+不用重開 app：
+
+```sh
+tools/dev-sync.sh            # check → rsync 到 ~/.config/herdr-app/mods/herdr-reclaim → 印 status 的錯誤
+tools/dev-sync.sh --watch    # 存檔就同步（0.5 秒輪詢，不用多裝 watcher）
+tools/install-dev-hook.sh    # 選用：每次 commit 之後自動同步
+```
+
+先跑 `check` 才同步：改壞的那一版不會蓋掉正在跑的舊版。要最快就加 `--no-check`。
+`--watch` 與 hook 只同步 worktree 現況，不看某一次 commit 的內容；hook 是 opt-in（會動
+`.git/hooks`，可能和其他 hook 管理工具搶檔），移除用 `tools/install-dev-hook.sh --remove`。
+
 ## 載入與檢查
 
 ```sh

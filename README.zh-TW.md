@@ -40,6 +40,7 @@ sh tools/install.sh
 - mod 本體與模組說明：`mod/herdr-reclaim/README.md`。
 - 測試：`cd mod/herdr-reclaim && bun test`；mod 檢查：`herdr-app check .`。
 - 視覺報告（測試、`herdr-app check`、三個 pane 寬度）：`tools/ui-report.sh`，跑完開它印出的 `report.html`。它用自己的 app home 與自己的 core，不動正在用的 Herdr。截圖只給人看，不是通過條件；規則見 [`docs/agents/verification.md`](docs/agents/verification.md)。
+- 開發迴圈：`tools/dev-sync.sh` 把 mod 同步到正在跑的 Herdr，存檔就重載（`--watch` 一直盯著存檔；`tools/install-dev-hook.sh` 可選：每次 commit 後同步）。它先跑 `herdr-app check`，改壞的版本不會蓋掉正在跑的那一版。
 - 畫面右上有「開發模式」開關，打開才會顯示工程資訊。
 - 議題在 GitHub Issues。
 

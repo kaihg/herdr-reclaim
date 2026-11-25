@@ -40,6 +40,7 @@ Everything is under `~/.config/herdr-app/data/herdr-reclaim/`. The ledger is app
 - Mod internals: `mod/herdr-reclaim/README.md`.
 - Tests: `cd mod/herdr-reclaim && bun test`; mod check: `herdr-app check .`.
 - Visual report (tests, `herdr-app check`, three pane widths): `tools/ui-report.sh`, then open the printed `report.html`. It runs an isolated app and core, so your running Herdr is untouched. Screenshots are for human review, not a pass/fail gate; the rules are in [`docs/agents/verification.md`](docs/agents/verification.md).
+- Live dev loop: `tools/dev-sync.sh` copies the mod into your running Herdr and it reloads on save (`--watch` polls for saves; `tools/install-dev-hook.sh` opts into syncing after each commit). It runs `herdr-app check` first, so a broken edit never replaces the working version.
 - A "dev mode" toggle in the top bar reveals engineering details.
 - Issues live on GitHub.
 
