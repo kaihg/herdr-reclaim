@@ -137,3 +137,22 @@ HERDR_APP_HOME="$H" herdr-app do window.close '{}'
 注意：`HERDR_APP_HOME` 只隔離 layouts／mods／settings；spaces、tabs 與 panes 由該機器的
 herdr-core 保管，所以開 pane 會動到共用工作區，驗證完記得 `pane.close` 收乾淨
 （不要建新的 space／tab，也不要動既有的 terminal）。
+
+### 點得到才算走過：真實滑鼠點擊
+
+`herdr-app` 沒有對 mod 畫面的點擊指令，`check` 也跑不完非同步鏈，所以「選建築 → 點合法位置 →
+預定這裡」這幾步要用真實指標事件。做法：
+
+```sh
+HERDR_APP_HOME="$H" herdr-app do window.maximize '{}'   # 讓驗證視窗到最前面（再按一次會還原）
+HERDR_APP_HOME="$H" herdr-app shot /tmp/v.png           # 截圖像素與視窗點數 1:1
+# 用 macOS Vision OCR（VNRecognizeTextRequest，zh-Hant）讀出按鈕文字的位置
+# 用 CGEvent 在螢幕座標（視窗原點 + 截圖座標）按下放開
+```
+
+- 合成點擊只送到最前面的視窗：動手前先確認驗證視窗在最前面（`window.maximize` 會把它帶到最前面；
+  CGWindowList 的第一筆就是最前面那一扇）。
+- 沒有 OCR 時用校準代替：選好建築後點地圖任一格，右側詳情會寫出「建築種類 (x, y)」，兩次點擊就能
+  解出 3/4 投影的位移量，之後任何一格都能算出像素位置。
+- Codex 的 computer use（`cua.getApp('dev.herdr.app').click([x, y])`）在同時開著使用者自己的 Herdr
+  視窗時會抓到那一扇（同一個 bundle id），指不到隔離 `HERDR_APP_HOME` 的視窗，所以不用它做驗證。
