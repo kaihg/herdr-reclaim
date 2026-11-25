@@ -56,6 +56,17 @@ export async function loadCity(io, {
 }
 
 /**
+ * 畫面讀的模型：公開的共用城市放在 `town.shared`（render 與所有操作都從這裡讀，操作之後的
+ * 重讀也是 `{ ...town, shared }`）。`loadCity` 回傳的 `city` 是同一份，這裡只是把它放到畫面
+ * 認得的鍵上；獨立成函式，是因為 main.js 匯入 host API、bun 測不到，形狀不對時整個畫面會
+ * 永遠停在「還沒啟用」，單元測試與 `herdr-app check`（用固定情境）都看不出來。
+ */
+export function townOf(loaded, quotas) {
+  const { city: shared, ...rest } = loaded;
+  return { ...rest, shared, quotas };
+}
+
+/**
  * adapter 磁碟上的活動尾巴 → `activity` entry，並在 entry 成立之後寫 ack（§6.2）。
  *
  * 只送磁碟上的那一份（adapter ack 後會 compact 掉已入帳的事件）；帳本把事件併回舊快照，

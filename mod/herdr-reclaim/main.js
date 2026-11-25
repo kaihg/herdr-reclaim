@@ -14,7 +14,7 @@ import { View, div } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
 import { appHome, checking, exec, home, readTextFile, settings, theme, watchFolder, writeTextFile } from "herdr";
 import { ADAPTER_DIR, activityDir, adapterRoot, loadActivities } from "./core/adapter.js";
-import { loadCity } from "./core/city-load.js";
+import { loadCity, townOf } from "./core/city-load.js";
 import { parseRawDiff, parseReflogEvidence } from "./core/commit-evidence.js";
 import { MAP_RADIUS, cameraFor, clampCamera, contentSize, panCamera } from "./core/grid.js";
 import { hostIo } from "./core/host-io.js";
@@ -211,7 +211,7 @@ async function loadModel(io) {
     return changes;
   };
   const loaded = await loadCity(io, { root, list: listFiles, activities, extraHooks, remoteMerges, diffForCommit });
-  return { ...loaded, quotas: await loadQuotas(io) };
+  return townOf(loaded, await loadQuotas(io));
 }
 
 /**

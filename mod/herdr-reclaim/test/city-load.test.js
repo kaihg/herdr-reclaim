@@ -8,7 +8,7 @@ import { describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { loadCity, repositoriesOf } from "../core/city-load.js";
+import { loadCity, repositoriesOf, townOf } from "../core/city-load.js";
 import { WORK_TOKENS_PER_UNIT, WORK_YIELD } from "../core/rules.js";
 import { revealedCells } from "../core/city-map.js";
 import { createFileIo } from "./fs-io.js";
@@ -71,13 +71,15 @@ const list = async (dir) => {
 };
 
 /**
- * 正式載入；`readSharedCity` 的外層（schema）在測試裡不需要，直接取 `city`。
- * `activateAt` 固定在活動之前：正式 runtime 由第一次啟用的當下決定（之前的歷史不補發），
- * 這裡要驗的是「活動進得來」，不是啟用邊界（那一條在 shared-city.test.js）。
+ * 正式載入，並且經過 main.js 實際使用的 `townOf`：測試讀的就是畫面讀的那個形狀
+ * （`town.shared.city`）。`activateAt` 固定在活動之前：正式 runtime 由第一次啟用的當下決定
+ * （之前的歷史不補發），這裡要驗的是「活動進得來」，不是啟用邊界（那一條在 shared-city.test.js）。
  */
 const load = async (base) => {
   const loaded = await loadCity(createFileIo(), { root: base, list, now: AT + 1_000_000, activateAt: AT - 1_000 });
-  return { ...loaded, city: loaded.city.city };
+  const town = townOf(loaded, null);
+  expect(town.city).toBeUndefined(); // 畫面不讀 `town.city`；讀到 undefined 才不會被誤用
+  return { ...town, city: town.shared.city };
 };
 const stock = (city) => [city.resources.wood, city.resources.stone, city.resources.iron];
 const times = (n) => [WORK_YIELD.wood * n, WORK_YIELD.stone * n, WORK_YIELD.iron * n];
