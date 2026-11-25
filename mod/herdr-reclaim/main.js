@@ -1,8 +1,9 @@
 // herdr-reclaim 的城鎮畫面（#22 之後只有共用城市）：一座城、一個倉庫、一張地圖。
 //
-// 上方是共用庫存、工作進度與唯一的建設目標；左邊是預定地與可選的建築；中間是共用城市的
-// 地圖；右邊是選取格或整棟預覽的詳情。所有專案、space 與 session 的工作都只當成同一座城
-// 的工作來源，不產生任何遠征格，也不讀寫 `cities/` 下的舊帳本。
+// 上方是共用庫存、工作進度與佇列最前面那一項；左邊是建設佇列的摘要與可選的建築；
+// 中間是共用城市的地圖；右邊是整棟預覽或佇列明細（未開工的項目可取消）。
+// 所有專案、space 與 session 的工作都只當成同一座城的工作來源，不產生任何遠征格，
+// 也不讀寫 `cities/` 下的舊帳本。
 //
 // 畫面只讀公開的共用城市讀取模型（core/shared-city.js 的 `readSharedCity`）；正式載入
 // 路徑是 core/city-load.js 的 `loadCity`（活動檔 → 共用帳本 → 讀取模型），開機、watch
@@ -23,7 +24,7 @@ import { quotaView, readQuotaView } from "./core/quota-view.js";
 import { RESOURCE_LABELS, RULES_VERSION } from "./core/rules.js";
 import { parseUi, selectionOf, serializeUi, withDev, withSelection } from "./core/selection.js";
 import {
-  SHARED_CITY_ID, advanceConstruction, placePlan, readSharedCity, sharedCityDir,
+  SHARED_CITY_ID, advanceConstruction, cancelPlan, placePlan, readSharedCity, sharedCityDir,
 } from "./core/shared-city.js";
 import { TERRAIN, cityBuildings, groundAt, legalSites, missingOf, revealedCells, siteCheck } from "./core/city-map.js";
 import { fixedSharedCity } from "./scenarios/shared-city.js";
@@ -49,10 +50,15 @@ const SITE_PROBLEMS = {
   fog: "迷霧", water: "深水", cliff: "峭壁", center: "城鎮中心", building: "已有建築", plan: "預定地", unknown_building: "未知建築",
 };
 const PLAN_REASONS = {
-  plan_exists: "已經有一個建設目標",
+  queue_full: "建設佇列已滿",
+  insufficient_resources: "庫存不足以支付完整配方",
+  already_started: "已經開工，不能取消",
+  no_plan: "佇列裡已經沒有這一項",
   unknown_building: "未知的建築種類",
   footprint_mismatch: "占地與規則表不符",
   recipe_mismatch: "配方與規則表不符",
+  start_mismatch: "開工時刻與規則不符",
+  duration_mismatch: "工期與規則表不符",
   site_fog: "有一角還在迷霧裡",
   site_water: "有一角是深水",
   site_cliff: "有一角是峭壁",
@@ -74,10 +80,30 @@ const clockText = (at) => {
 };
 /** 地面（`groundAt`）的標籤：工地與建築不是地形，另外說。 */
 const groundLabel = (ground) => (ground === "site" ? "工地" : ground === "building" ? "建築" : TERRAIN[ground]?.label ?? ground);
-/** 唯一建設目標的一行摘要（頂欄、提示）：施工中說何時完工，備料中說還在等材料。 */
-const planLine = (plan) => (plan.stage === "building"
-  ? `施工中：${plan.label} (${plan.x}, ${plan.y})・${clockText(plan.completesAt)} 完工`
-  : `建設目標：${plan.label} (${plan.x}, ${plan.y})・備料中`);
+/**
+ * 佇列裡某一項的一行摘要（頂欄、提示）：施工中說何時完工；還沒開工的說還缺什麼，
+ * 不缺口了就是排隊等前一項完工（`startsAt` 是預計開工時刻）。
+ */
+const queueLine = (item) => (item.stage === "building"
+  ? `施工中：${item.label} (${item.x}, ${item.y})・${clockText(item.completesAt)} 完工`
+  : Object.keys(item.missing ?? {}).length > 0
+    ? `備料中：${item.label} (${item.x}, ${item.y})・還缺 ${missingText(item.missing)}`
+    : `排隊中：${item.label} (${item.x}, ${item.y})・${clockText(item.startsAt)} 開工`);
+/**
+ * 現在再加一項時真正可用的庫存：扣掉佇列裡還沒付款的配方。付款只在隊首發生，
+ * 所以這個數字才是「排在隊尾的那一項還要等多少材料」。
+ */
+const poolOf = (shared) => (shared.queue ?? [])
+  .filter((item) => item.stage !== "building")
+  .reduce((pool, item) => {
+    for (const [key, amount] of Object.entries(item.costs ?? {})) pool[key] = Number(pool[key] ?? 0) - Number(amount);
+    return pool;
+  }, { ...shared.resources });
+/** 頂欄那一行：先看佇列最前面那一項（施工中或排第一），都沒有就只存料。 */
+const queueSummary = (city) => {
+  const head = city.queue?.[0];
+  return head ? queueLine(head) : "沒有建設目標：只累積庫存";
+};
 /** 共用城市地圖的半徑：至少 MAP_RADIUS，涵蓋全部已揭開的格子，再多一圈迷霧當邊界。 */
 const sharedRadius = (revealed) => {
   let reach = 0;
@@ -399,9 +425,7 @@ export default class Town extends View {
       .items_center()
       .child(div().text_size(10).text_color(t.dim).child("工作"))
       .child(div().text_size(12.5).child(`${shared.work.tokens}/${shared.work.unitTokens}`));
-    const target = div().text_size(10).text_color(t.muted).truncate().child(shared.plan
-      ? planLine(shared.plan)
-      : "沒有建設目標：只累積庫存");
+    const target = div().text_size(10).text_color(t.muted).truncate().child(queueSummary(shared));
     const center = stacked
       ? v_flex().flex_1().min_w(0).overflow_hidden().gap(2).child(stock).child(work).child(target)
       : h_flex().flex_1().min_w(0).overflow_hidden().items_center().justify_center().gap(14).child(stock).child(work).child(target);
@@ -444,10 +468,10 @@ export default class Town extends View {
       ]);
   }
 
-  /** 左側：建設目標的狀態、可選的建築與額度。 */
+  /** 左側：建設佇列的摘要、可選的建築與額度。佇列明細在右側（可逐項取消）。 */
   sharedPanel(shared, t, cx, width) {
-    const plan = shared.plan;
-    const building = plan?.stage === "building";
+    const queue = shared.queue;
+    const full = queue.length >= shared.queueLimit;
     return v_flex()
       .id("city-panel")
       .w(width)
@@ -460,14 +484,14 @@ export default class Town extends View {
       .border_r(1)
       .border_color(t.border)
       .children([
-        div().text_size(10).text_color(t.dim).child("建設目標（一次一項）"),
-        div().text_size(13).font_semibold().truncate().child(plan ? `${building ? "施工中" : "預定"}：${plan.label}` : "選一棟建築"),
-        div().text_size(9).text_color(t.muted).child(!plan
-          ? "選好建築後，地圖會標出全部合法位置；點一格看整棟預覽，再按「預定這裡」。"
-          : building
-            ? `位置 (${plan.x}, ${plan.y})、占地 ${plan.w}×${plan.h}；配方已支付，${clockText(plan.completesAt)} 完工`
-            : `位置 (${plan.x}, ${plan.y})、占地 ${plan.w}×${plan.h}；還缺 ${missingText(plan.missing)}，備齊自動開工`),
+        div().text_size(10).text_color(t.dim).child(`建設佇列（${queue.length}/${shared.queueLimit}）`),
+        div().text_size(13).font_semibold().truncate().child(queue.length ? queue[0].label : "選一棟建築"),
+        div().text_size(9).text_color(t.muted).child(queue.length
+          ? queueLine(queue[0])
+          : "選好建築後，地圖會標出全部合法位置；點一格看整棟預覽，再按「預定這裡」。"),
         ...cityBuildings().map((building) => this.buildingCard(shared, building, t, cx)),
+        div().text_size(9).text_color(t.dim)
+          .child(full ? "佇列已滿：先讓最前面那一項完工，或取消還沒開工的項目。" : "預定不動庫存：排到隊首、材料備齊才一次付清；還沒開工的項目可以取消。"),
         div().text_size(9).text_color(t.dim)
           .child("草地、疏林、碎石地可以蓋；深水、峭壁與迷霧不行。預覽與下令用同一條規則。"),
         ...this.quotaSection(t),
@@ -476,10 +500,10 @@ export default class Town extends View {
       ]);
   }
 
-  /** 一種建築：點下去進入選址；已有預定地時只說明「一次一項」。 */
+  /** 一種建築：點下去進入選址；佇列滿了才不能選。 */
   buildingCard(shared, building, t, cx) {
     const selected = this.picking === building.name;
-    const locked = Boolean(shared.plan);
+    const locked = shared.queue.length >= shared.queueLimit;
     const missing = missingOf(building.costs, shared.resources);
     const affordable = Object.keys(missing).length === 0;
     return v_flex()
@@ -505,10 +529,10 @@ export default class Town extends View {
       ]);
   }
 
-  /** 選一種建築開始選址；已有預定地時不能換（一次只有一個目標）。 */
+  /** 選一種建築開始選址；佇列滿了才不能選（還在排隊的項目彼此不擋）。 */
   pickBuilding(shared, building, cx) {
-    if (shared.plan) {
-      this.showToast(`${planLine(shared.plan)}：一次只有一個建設目標`, cx);
+    if (shared.queue.length >= shared.queueLimit) {
+      this.showToast(`建設佇列已滿（${shared.queue.length}/${shared.queueLimit}）：先讓最前面那一項完工，或取消還沒開工的一項`, cx);
       return;
     }
     this.picking = this.picking === building ? null : building;
@@ -541,16 +565,13 @@ export default class Town extends View {
     this.mapArea = { width: area.width, height: area.height };
     this.camera = { ...this.camera, ...clampCamera(this.camera, size, area) };
     this.focusCell = null;
-    // 一次只有一個目標：別的視窗先預定了，這裡的預覽就一併收起，不顯示下得了令的樣子。
-    const selecting = !shared.plan && Boolean(this.picking);
+    // 選址只有在佇列已滿時停下（別的視窗搶先扣走材料由帳本裁決，畫面下不了令時只顯示原因）。
+    const selecting = Boolean(this.picking);
     return sharedMapView({
       revealed,
       radius,
-      plan: shared.plan,
+      queue: shared.queue,
       buildings: shared.buildings,
-      legal: selecting ? legalSites(shared, this.picking) : [],
-      preview: selecting && this.preview ? siteCheck(shared, this.picking, this.preview) : null,
-      selected: this.selection?.cityId === SHARED_CITY_ID ? this.selection : null,
       theme: t,
       tile,
       camera: this.camera,
@@ -572,7 +593,7 @@ export default class Town extends View {
     const shared = this.town?.shared?.city;
     if (!shared || !revealedCells(shared).has(`${x},${y}`)) return;
     this.mark("pick");
-    if (!shared.plan && this.picking) {
+    if (this.picking) {
       this.preview = { x, y };
       cx.notify();
       return;
@@ -580,10 +601,9 @@ export default class Town extends View {
     this.select({ kind: "site", cityId: SHARED_CITY_ID, x, y }, cx);
   }
 
-  /** 右側：整棟預覽與「預定這裡」；沒有預覽時顯示預定地或選取格的地形。 */
+  /** 右側：整棟預覽與「預定這裡」；沒有預覽時顯示建設佇列或選取格的地形。 */
   sharedDetail(shared, t, width, cx) {
-    const preview = !shared.plan && this.picking && this.preview ? siteCheck(shared, this.picking, this.preview) : null;
-    const plan = shared.plan;
+    const preview = this.picking && this.preview ? siteCheck(shared, this.picking, this.preview) : null;
     const spot = this.selection?.cityId === SHARED_CITY_ID && this.selection.kind === "site" ? this.selection : null;
     return v_flex()
       .id("detail")
@@ -598,12 +618,19 @@ export default class Town extends View {
       .border_color(t.border)
       .children([
         div().text_size(10).text_color(t.dim).child(preview ? "整棟預覽" : "選址與建設"),
-        ...(preview ? this.previewSection(preview, t, cx) : (plan ? this.planSection(plan, t) : this.spotSection(shared, spot, t))),
+        ...(preview
+          ? this.previewSection(preview, t, shared, cx)
+          : (shared.queue.length ? this.queueSection(shared, t, cx) : this.spotSection(shared, spot, t))),
         this.note ? div().text_size(9).text_color(t.muted).child(this.note) : null,
       ].filter(Boolean));
   }
 
-  previewSection(preview, t, cx) {
+  /** 整棟預覽＋下令：配方、還缺什麼、佇列還有沒有位置，都先講清楚再按「預定這裡」。 */
+  previewSection(preview, t, shared, cx) {
+    const def = cityBuildings().find((building) => building.name === preview.building);
+    const missing = def ? missingOf(def.costs, poolOf(shared)) : {};
+    const ready = Object.keys(missing).length === 0;
+    const room = shared.queue.length < shared.queueLimit;
     return [
       div().text_size(14).font_semibold().child(`${preview.label} (${preview.x}, ${preview.y})`),
       h_flex().gap(6).items_center()
@@ -613,7 +640,12 @@ export default class Town extends View {
         .child(div().text_size(9).text_color(t.dim).child(`(${cell.x}, ${cell.y})`))
         .child(div().text_size(10).text_color(cell.problem ? t.blocked : t.muted)
           .child(cell.problem ? SITE_PROBLEMS[cell.problem] ?? cell.problem : TERRAIN[cell.terrain]?.label ?? "迷霧"))),
-      preview.ok ? chipButton("預定這裡", t, (cx2) => this.submitPlan(preview, cx2)) : null,
+      def ? fieldRow({ label: "配方", value: costsText(def.costs) }, t) : null,
+      def ? div().text_size(9).text_color(ready ? t.done : t.muted)
+        .child(ready ? "排在佇列後面也付得出來：輪到它就開工" : `排在目前佇列之後還缺 ${missingText(missing)}；輪到它才付料`) : null,
+      room ? null : div().text_size(9).text_color(t.blocked)
+        .child(`建設佇列已滿（${shared.queue.length}/${shared.queueLimit}）：先讓最前面那一項完工，或取消還沒開工的一項。`),
+      preview.ok && room ? chipButton("預定這裡", t, (cx2) => this.submitPlan(preview, cx2)) : null,
       chipButton("取消選址", t, (cx2) => {
         this.preview = null;
         cx2.notify();
@@ -621,23 +653,44 @@ export default class Town extends View {
     ].filter(Boolean);
   }
 
-  planSection(plan, t) {
-    const building = plan.stage === "building";
+  /**
+   * 建設佇列：依開工順序逐項列出。施工中的一項顯示開工與完工時刻；
+   * 還沒開工的一項顯示還缺什麼（沿佇列累計）與預計開工時刻，隨時可以取消。
+   */
+  queueSection(shared, t, cx) {
     return [
-      div().text_size(14).font_semibold().child(`${building ? "施工中" : "預定"}：${plan.label}`),
-      h_flex().gap(6).items_center().child(statusBadge(building ? "施工中" : "預定地", t))
-        .child(div().text_size(10).text_color(t.muted).child(`(${plan.x}, ${plan.y})、占地 ${plan.w}×${plan.h}`)),
-      fieldRow({ label: "配方", value: costsText(plan.costs) }, t),
-      ...(building
-        ? [
-          fieldRow({ label: "開工", value: clockText(plan.startedAt) }, t),
-          fieldRow({ label: "完工", value: clockText(plan.completesAt) }, t),
-          div().text_size(9).text_color(t.muted).child("配方已一次付清；完工就啟用並揭開附近的土地，之後只存料，不會自動蓋下一棟。"),
-        ]
-        : [
-          fieldRow({ label: "還缺", value: missingText(plan.missing) }, t),
-          div().text_size(9).text_color(t.muted).child("整片占地已經保留，庫存沒有預扣；材料備齊就自動支付並開工，不用回來按。"),
-        ]),
+      div().text_size(10).text_color(t.dim).child(`建設佇列 ${shared.queue.length}/${shared.queueLimit}`),
+      ...shared.queue.map((item, index) => {
+        const building = item.stage === "building";
+        const missing = Object.keys(item.missing ?? {}).length > 0;
+        return v_flex()
+          .w_full()
+          .flex_none()
+          .gap(2)
+          .p(7)
+          .rounded(6)
+          .bg(t.surface)
+          .border(1)
+          .border_color(building ? t.working : t.border)
+          .children([
+            h_flex().gap(6).items_center()
+              .child(div().text_size(12).font_semibold().child(`#${index + 1} ${item.label}`))
+              .child(statusBadge(building ? "施工中" : missing ? "備料中" : "排隊中", t)),
+            div().text_size(10).text_color(t.muted).child(`(${item.x}, ${item.y})、占地 ${item.w}×${item.h}`),
+            fieldRow({ label: "配方", value: costsText(item.costs) }, t),
+            ...(building
+              ? [
+                fieldRow({ label: "開工", value: clockText(item.startedAt) }, t),
+                fieldRow({ label: "完工", value: clockText(item.completesAt) }, t),
+              ]
+              : [
+                fieldRow({ label: "還缺", value: missing ? missingText(item.missing) : "材料已齊" }, t),
+                // 還缺材料時「預計開工」是不可信的過去時刻：等材料到了才會知道。
+                ...(missing ? [] : [fieldRow({ label: "預計開工", value: clockText(item.startsAt) }, t)]),
+                chipButton("取消", t, (cx2) => this.cancelItem(item, cx2)),
+              ]),
+          ]);
+      }),
     ];
   }
 
@@ -654,13 +707,14 @@ export default class Town extends View {
       div().text_size(9).text_color(t.muted).child(
         this.picking ? "這一格是整棟占地的左上角：在地圖點它就會顯示預覽。" : "選一棟建築之後，這裡會列出整棟占地的判斷。",
       ),
-      ...(shared.plan ? [div().text_size(9).text_color(t.dim).child(`目前唯一的目標：${planLine(shared.plan)}。`)] : []),
+      ...(shared.queue.length ? [div().text_size(9).text_color(t.dim).child(`建設佇列 ${shared.queue.length}/${shared.queueLimit}：${queueLine(shared.queue[0])}。`)] : []),
     ];
   }
 
   /**
-   * 下令：寫進共用帳本的 plan entry；庫存已經夠就同一刻開工（#26）。成功就重讀共用城市，失敗只
-   * 回報原因；被拒的下令不寫任何東西，所以另一個視窗搶先時這裡不會留下半片占地。
+   * 下令：寫進共用帳本的 plan entry，配方當場預扣（ADR 0003）。成功就重讀共用城市，
+   * 失敗只回報原因；被拒的下令不寫任何東西，所以另一個視窗搶先扣走材料或佔位時，
+   * 這裡不會留下半片占地，也不會扣到一半。
    */
   submitPlan(preview, cx) {
     const startedAt = Date.now();
@@ -673,12 +727,34 @@ export default class Town extends View {
           this.town = await this.refreshShared();
           this.picking = null;
           this.preview = null;
-          text = `已預定：${label} (${x}, ${y})`;
+          text = `已預定：${label} (${x}, ${y})；排到隊首、材料備齊才付料開工`;
+          this.scheduleCompletion(cx2);
         } else {
           text = `沒有預定：${PLAN_REASONS[result.reason] ?? result.reason ?? result.status}`;
         }
       } catch (error) {
         text = `預定失敗：${error}`;
+      }
+      this.metrics.pending = { kind: "action", at: startedAt };
+      this.showToast(text, cx2);
+    });
+  }
+
+  /** 取消佇列裡還沒開工的一項：占地與名額交還（那一項還沒付料），帳本只寫一筆 cancel。 */
+  cancelItem(item, cx) {
+    const startedAt = Date.now();
+    cx.spawn(async (cx2) => {
+      let text;
+      try {
+        const result = await cancelPlan(await openShared(this.io), item);
+        if (result.status === "applied" || result.status === "duplicate") {
+          this.town = await this.refreshShared();
+          text = `已取消：${item.label} (${item.x}, ${item.y})`;
+        } else {
+          text = `沒有取消：${PLAN_REASONS[result.reason] ?? result.reason ?? result.status}`;
+        }
+      } catch (error) {
+        text = `取消失敗：${error}`;
       }
       this.metrics.pending = { kind: "action", at: startedAt };
       this.showToast(text, cx2);
@@ -691,23 +767,24 @@ export default class Town extends View {
     return { ...this.town, shared: readSharedCity(state) };
   }
 
-  /** 施工計時：工期到了才完工；同一個完成時刻只排一次。 */
+  /** 施工計時：施工中那一項的完工時刻到了才推進；同一個完成時刻只排一次。 */
   scheduleCompletion(cx) {
-    const plan = this.town?.shared?.city?.plan;
-    if (plan?.stage !== "building" || this.completionAt === plan.completesAt) return;
-    this.completionAt = plan.completesAt;
-    cx.timer.after(Math.max(0, plan.completesAt - Date.now()) + 250, (cx2) => this.finishConstruction(cx2));
+    const building = this.town?.shared?.city?.queue?.find((item) => item.stage === "building");
+    if (!building || this.completionAt === building.completesAt) return;
+    this.completionAt = building.completesAt;
+    cx.timer.after(Math.max(0, building.completesAt - Date.now()) + 250, (cx2) => this.finishConstruction(cx2));
   }
 
+  /** 完工推進：工期到了就完工，下一項接著開工；關著畫面的時間也算（見 `advanceConstruction`）。 */
   finishConstruction(cx) {
     // 這一次排程已經觸發：還沒完工（例如時鐘被往回調）時，下面的 scheduleCompletion 會重新排一次。
     this.completionAt = null;
     cx.spawn(async (cx2) => {
       try {
         const { completed } = await advanceConstruction(await openShared(this.io), { now: Date.now() });
-        const before = this.town?.shared?.city?.plan;
         this.town = await this.refreshShared();
-        if (completed.status === "applied" && before) this.showToast(`${before.label} (${before.x}, ${before.y}) 完工，附近的土地揭開了`, cx2);
+        const last = completed[completed.length - 1];
+        if (last) this.showToast(`${last.label} (${last.x}, ${last.y}) 完工，附近的土地揭開了`, cx2);
         this.scheduleCompletion(cx2);
       } catch (error) {
         this.note = `完工推進失敗：${error}`;
@@ -888,6 +965,8 @@ const STATUS_TOKENS = {
   可以放: "done",
   不能放: "blocked",
   預定地: "accent",
+  排隊中: "accent",
+  備料中: "accent",
   施工中: "working",
 };
 

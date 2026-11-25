@@ -9,7 +9,14 @@
 //   7  ticket #26 共用城市的工期與完工揭開半徑；備齊自動開工、到期完工
 //   8  ticket #27 哨站：沿用選址、備料與施工，完工揭開比一般建築更大片的土地
 //   9  停止 commit 加碼（#28、ADR 0002）：不再產生成果收成；已落帳的照常重播
-export const RULES_VERSION = 9;
+//   10 建設佇列（ADR 0003）：同時多項預定（上限 3）、預定即預扣、未開工可取消退料
+export const RULES_VERSION = 10;
+
+/**
+ * 建設佇列的上限（規則版本 10，試玩參數）：同時最多這麼多項預定（含施工中的那一項）。
+ * 上限只擋新的預定，不會擋完工與取消；佇列的內容寫在帳本裡，重開、換 space 都一樣。
+ */
+export const BUILD_QUEUE_LIMIT = 3;
 
 /** 庫存裡的資源種類。羊皮卷已不再生產（舊玩法移除），保留鍵名讓舊快照重播時不變形。 */
 export const RESOURCES = ["wood", "stone", "iron", "parchment"];

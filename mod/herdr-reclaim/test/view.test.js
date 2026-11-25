@@ -23,14 +23,27 @@ function open() {
 }
 
 describe("固定情境的分區與庫存", () => {
-  test("三個區塊都在，庫存與唯一的目標照模型顯示", () => {
+  test("三個區塊都在，庫存、佇列與施工中的那一項照模型顯示", () => {
     const { tree } = open();
     const screen = text(tree());
     expect(screen).toContain("共用倉庫|12|木材|8|石材|3|鐵料");
-    expect(screen).toContain("建設目標（一次一項）|施工中：哨站");
+    expect(screen).toContain("建設佇列（2/3）");
+    expect(screen).toContain("施工中：哨站");
     expect(screen).toContain("選址與建設");
     // 地圖真的有格子（菱形命中由 core/grid.js 的測試釘住，這裡只確認它們被接到畫面上）。
     expect(mapTiles(tree()).length).toBeGreaterThan(20);
+  });
+
+  test("佇列明細：施工中的一項顯示開工與完工，備料中的一項顯示還缺與取消", () => {
+    const { tree } = open();
+    const screen = text(tree());
+    expect(screen).toContain("#1 哨站");
+    expect(screen).toContain("#2 民居");
+    // 固定情境的庫存 12/8/3 不夠民居的 20/10：排隊中的那一項是備料中，還缺沿佇列累計。
+    expect(screen).toContain("備料中");
+    expect(screen).toContain("還缺|木材 8・石材 2");
+    // 只有還沒開工的那一項有取消按鈕；按鈕文字就是「取消」（施工中的哨站沒有）。
+    expect(text(findByText(tree(), "取消"))).toBe("取消");
   });
 
   test("沒有共用城市時說清楚原因，不是空畫面", () => {
@@ -62,14 +75,23 @@ describe("按下之後", () => {
     expect(selectionOf(town.ui, "shared")).toEqual({ kind: "site", cityId: "shared", x, y });
   });
 
-  test("已經有建設目標時點建築：只給一句提示，不進入選址", () => {
+  test("佇列還沒滿時點建築：進入選址（不用先等前一項蓋完）", () => {
     const { cx, town, tree } = open();
     const card = findById(tree(), "building-house");
     expect(card).not.toBeNull();
     card.handlers.click({}, cx);
+    expect(town.picking).toBe("house");
+    expect(town.toast).toBeNull();
+  });
+
+  test("佇列已滿時點建築：只給一句提示，不進入選址", () => {
+    const { cx, town, tree } = open();
+    const city = town.town.shared.city;
+    city.queueLimit = city.queue.length; // 2/2：滿了
+    const card = findById(tree(), "building-house");
+    card.handlers.click({}, cx);
     expect(town.picking).toBeNull();
-    expect(town.toast?.text).toContain("一次只有一個建設目標");
-    expect(town.toast?.text).toContain("哨站");
+    expect(town.toast?.text).toContain("建設佇列已滿");
   });
 });
 

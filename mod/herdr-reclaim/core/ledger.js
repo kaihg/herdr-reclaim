@@ -23,20 +23,24 @@
 // 唯一完成依據是 journal entry：只有內容檔、沒有 entry 的操作不算完成（§13.1）。
 //
 // **這一版的語意邊界**（#22）：帳本只服務共用城市，entry kind 只有工作啟用邊界、收入、
-// 成果收成、建設目標、開工、完工與活動合併。收成的資源向量由 entry 自己帶（§7.3），
-// 帳本不會自己發明數字。舊版各 repo 城的遠征／收成／研究／市集 entry 已移除，程式不再
-// 讀寫 `cities/`（使用者的舊目錄留在磁碟上，不遷移）。
+// 成果收成、建設佇列（預定、開工、完工、取消）與活動合併。收成的資源向量由 entry 自己帶
+// （§7.3），帳本不會自己發明數字。舊版各 repo 城的遠征／收成／研究／市集 entry 已移除，
+// 程式不再讀寫 `cities/`（使用者的舊目錄留在磁碟上，不遷移）。
 import { BlobStore } from "./blobs.js";
 import { byteLen, canonicalJson, hashText } from "./bytes.js";
 import { casWrite, rejectUnlessConflict } from "./cas.js";
 import { PrefixIndex } from "./pages.js";
-import { CITY_BUILDINGS, RESOURCES, RULES_VERSION, WORK_TOKENS_PER_UNIT, affordable, workYieldOf } from "./rules.js";
-import { siteCheck } from "./city-map.js";
+import { BUILD_QUEUE_LIMIT, CITY_BUILDINGS, RESOURCES, RULES_VERSION, WORK_TOKENS_PER_UNIT, affordable, workYieldOf } from "./rules.js";
+import { footprintCells, siteCheck } from "./city-map.js";
 
 export { byteLen, hashText };
 
-/** 帳本目錄格式的版本（head.json 的 schemaVersion）。 */
-export const SCHEMA = 2;
+/**
+ * 帳本目錄格式的版本（head.json 的 schemaVersion）。3：checkpoint 改存建設佇列（`queue`）；
+ * 版本 2 的 checkpoint 一律當成不完整丟棄，從 journal 從頭重播（舊的 `plan` entry 由
+ * `KINDS.plan` 的 apply 收成佇列的第一項，不需要另外的遷移檔）。
+ */
+export const SCHEMA = 3;
 /** 活動紀錄的格式版本：帳本保存的那一份就是認這個號碼。 */
 export const ACTIVITY_SCHEMA = 1;
 /** 規則表版本（core/rules.js）：每一筆 entry 都存當時的版本（§8.2）。 */
@@ -124,8 +128,8 @@ export function parseSegment(text) {
 /** §7.3 的城級去重鍵：同一座城同一份成果只發一次。 */
 export const claimKey = (cityId, claim) => `${cityId}@@${claim}`;
 /**
- * 共用城市一個建設目標的身分（#26）：建築、錨點與下令時間。開工與完工都綁這把鍵，
- * 所以同一個目標只開工一次、完工一次；之後在同一處再預定同一種建築是另一個目標。
+ * 共用城市一項建設的身分（#26）：建築、錨點與下令時間。開工、完工與取消都綁這把鍵，
+ * 所以同一項只開工一次、完工一次、取消一次；之後在同一處再預定同一種建築是另一項。
  */
 export const planKey = (plan) => `${plan.building}:${plan.x},${plan.y}:${plan.at}`;
 export const activityKey = (record) => `${record.sessionId}@@${record.writerEpoch ?? ""}`;
@@ -136,9 +140,11 @@ const zeroResources = () => Object.fromEntries(RESOURCES.map((key) => [key, 0]))
  * 空狀態。`activities` 的順序就是 journal 的附加順序，重播結果因此可重現；
  * `opSeqs`／`claims` 是索引（§13.2）；
  * `work.tokens` 是共用城市（#23）還沒換成建材的有效工作進度（餘數）；`work.stockedAt` 是入庫
- * 建材裡最晚的那一筆的時間（#26：材料到齊不會早於它，開工從這裡起算）；
- * `plan` 是共用城市唯一的建設目標（#25）：建築、錨點與整片占地；沒有目標時是 null。
- * 開工之後（#26）多出 `startedAt`／`buildMs`／`completesAt`。`buildings` 是共用城市已完工的建築。
+ * 建材裡最晚的一筆的時間——材料是排到隊首才付，所以開工時刻從這裡起算。
+ * `queue` 是共用城市的建設佇列（ADR 0003）：依預定順序排列，同時只施工最前面那一項；
+ * 每一項都有建築、錨點、配方與整片占地，開工時多出 `startedAt`／`buildMs`／`completesAt`。
+ * `paid` 只在舊帳本裡出現（曾有一版在預定時就扣料），新的項目沒有這個欄位。
+ * `buildings` 是共用城市已完工的建築。
  */
 export function emptyState(cityId) {
   return {
@@ -150,7 +156,7 @@ export function emptyState(cityId) {
     claims: new Map(),
     resources: zeroResources(),
     work: { tokens: 0, since: null, stockedAt: null },
-    plan: null,
+    queue: [],
     buildings: [],
   };
 }
@@ -173,6 +179,32 @@ function stockUp(state, entry) {
   }
   const at = Number(entry.at);
   if (Number.isFinite(at) && !(Number(state.work.stockedAt) >= at)) state.work.stockedAt = at;
+}
+
+/** 付料（開工）與舊帳本預扣項目的退款只動庫存：那不是新收入，不能把 `work.stockedAt` 往後推。 */
+function adjust(state, costs, sign) {
+  for (const [key, amount] of Object.entries(costs ?? {})) {
+    state.resources[key] = Number(state.resources[key] ?? 0) + sign * Number(amount);
+  }
+}
+
+/** 佇列裡找目標：開工、完工與取消都綁同一把鍵（`planKey`）。 */
+const queueItemOf = (state, key) => (state.queue ?? []).find((item) => planKey(item) === key) ?? null;
+
+/** 同時只能有一項在施工：佇列裡已經有一項開工，其他的就還沒輪到。 */
+const runningItemOf = (state, except = null) => (state.queue ?? [])
+  .find((item) => item !== except && item.startedAt != null) ?? null;
+
+/**
+ * 這一項的開工時刻：下令時刻、材料到齊時刻與前一項完工時刻取晚者。
+ * - `stockedAt` 是入庫建材裡最晚的一筆：材料是排到隊首才付，所以開工不會早於材料真的到齊。
+ * - `notBefore` 是前一項完工時寫下的下限——完工的項目會離開佇列，不記下來的話，
+ *   下一項會誤以為自己可以從下令時刻開工，等於偷偷跳過前一項的工期。
+ */
+export function startAtOf(state, item) {
+  const stocked = Number(state.work?.stockedAt ?? item.at);
+  const floor = Math.max(Number(item.at), stocked, Number(item.notBefore ?? item.at));
+  return Math.max(floor, Number(runningItemOf(state, item)?.completesAt ?? floor));
 }
 
 /**
@@ -239,17 +271,21 @@ export const KINDS = {
   },
 
   /**
-   * 建設目標（#25）：玩家選定建築與錨點，整片占地成為唯一的預定地。這筆**不動庫存**——
-   * 材料夠不夠是備料與施工（#26）的事，缺料時照樣可以先指定位置。
+   * 建設佇列的一項（#25、ADR 0003）：玩家選定建築與錨點，整片占地成為預定地。
+   * **指定位置不動庫存**——材料夠不夠是備料與施工（#26）的事，缺料時照樣可以先排進佇列，
+   * 排到隊首才一次付清。佇列依預定順序付料，後面的項目不能插隊。
    *
-   * 前提：一次只有一個目標；建築、占地與配方要與規則表相符；每一格都必須已揭開、可建且
-   * 沒有被別的建築或預定地占用（判準與畫面預覽同一個 `siteCheck`）。碰不到任何一格的
-   * 第二個目標因此整筆被拒，不留下半片占地。
+   * 前提：佇列還沒滿；建築、占地與配方要與規則表相符；每一格都必須已揭開、可建且沒有被
+   * 別的建築或佇列中的項目占用（判準與畫面預覽同一個 `siteCheck`）。碰不到任何一格的新項目
+   * 整筆被拒，不留下半片占地。
+   *
+   * `paid` 只會出現在舊帳本裡（曾有一段版本在預定時就扣料）：那些 entry 重播時照樣扣，
+   * `construct` 不再重複收費，取消時全額退回。新的 entry 沒有這個欄位。
    */
   plan: {
     precheck(state, op) {
       if (op.cityId !== state.cityId) return "wrong_city";
-      if (state.plan) return "plan_exists";
+      if (state.queue.length >= BUILD_QUEUE_LIMIT) return "queue_full";
       const def = CITY_BUILDINGS[op.building];
       if (!def) return "unknown_building";
       if (Number(op.w) !== def.footprint.w || Number(op.h) !== def.footprint.h) return "footprint_mismatch";
@@ -260,7 +296,7 @@ export const KINDS = {
     },
     apply(state, entry) {
       const def = CITY_BUILDINGS[entry.building];
-      state.plan = {
+      const item = {
         building: entry.building,
         label: def.label,
         x: entry.x,
@@ -268,72 +304,101 @@ export const KINDS = {
         w: entry.w,
         h: entry.h,
         costs: { ...entry.costs },
-        cells: siteCheck({ plan: null }, entry.building, { x: entry.x, y: entry.y }).cells
-          .map((cell) => ({ x: cell.x, y: cell.y })),
+        cells: footprintCells(entry.building, { x: entry.x, y: entry.y }),
         at: Number(entry.at),
+        paid: entry.paid === true,
         rulesVersion: entry.rulesVersion,
       };
+      if (item.paid) adjust(state, item.costs, -1);
+      state.queue.push(item);
     },
   },
 
   /**
-   * 開工（#26）：預定地的材料備齊時由城市自動送出，一次付清預定時的完整配方，從 `at` 起算工期。
-   * 一個建設目標只開工一次：opId 綁住目標（`planKey`），兩個視窗同時達標、重開或重播都只扣一次。
-   * 工期只看建築種類（規則表），不看占地上的植被或碎石。
+   * 開工（#26）：由城市自動送出。排到隊首、庫存足以支付整份配方時一次付清，從 `at` 起算工期。
+   * 一次只施工一項：佇列裡已經有一項開工時，其他的整筆被拒（`busy`）。
+   * 一個項目只開工一次：opId 綁住項目（`planKey`），兩個視窗同時達標、重開或重播都只算一次；
+   * 已經預扣過的舊版項目不再收費。工期只看建築種類（規則表），不看占地上的植被或碎石。
    */
   construct: {
     precheck(state, op) {
       if (op.cityId !== state.cityId) return "wrong_city";
-      const plan = state.plan;
-      if (!plan || planKey(plan) !== op.plan) return "no_plan";
-      if (plan.startedAt != null) return "already_started";
-      if (!sameCosts(op.costs, plan.costs)) return "recipe_mismatch";
-      if (Number(op.buildMs) !== CITY_BUILDINGS[plan.building]?.buildMs) return "duration_mismatch";
-      if (!(Number(op.at) >= Number(plan.at))) return "before_plan";
-      if (!affordable(plan.costs, state.resources)) return "insufficient_resources";
+      const item = queueItemOf(state, op.plan);
+      if (!item) return "no_plan";
+      if (item.startedAt != null) return "already_started";
+      if (runningItemOf(state, item)) return "busy";
+      if (!sameCosts(op.costs, item.costs)) return "recipe_mismatch";
+      if (Number(op.buildMs) !== CITY_BUILDINGS[item.building]?.buildMs) return "duration_mismatch";
+      if (Number(op.at) !== startAtOf(state, item)) return "start_mismatch";
+      if (!item.paid && !affordable(item.costs, state.resources)) return "insufficient_resources";
       return null;
     },
     apply(state, entry) {
-      for (const [key, amount] of Object.entries(entry.costs ?? {})) {
-        state.resources[key] = Number(state.resources[key] ?? 0) - Number(amount);
+      const item = queueItemOf(state, entry.plan);
+      if (!item.paid) {
+        adjust(state, item.costs, -1);
+        item.paid = true;
       }
-      const startedAt = Number(entry.at);
-      state.plan = { ...state.plan, startedAt, buildMs: Number(entry.buildMs), completesAt: startedAt + Number(entry.buildMs) };
+      item.startedAt = Number(entry.at);
+      item.buildMs = Number(entry.buildMs);
+      item.completesAt = item.startedAt + item.buildMs;
     },
   },
 
   /**
-   * 完工（#26）：工期到了就把建設目標變成一棟啟用中的建築，預定地交還給城市（沒有下一個目標）。
+   * 完工（#26）：工期到了就把這一項變成一棟啟用中的建築，從佇列移除（下一項就輪到它開工）。
    * `at` 是開工時間加工期，不是看到完工的那一刻，所以晚開畫面不改變完工時間。`reveal` 是規則表
-   * 當時的揭開半徑，跟著 entry 存進建築，調整規則不改寫已揭開的土地。不支付、也不選下一棟。
+   * 當時的揭開半徑，跟著 entry 存進建築，調整規則不改寫已揭開的土地。不支付、也不新增項目。
    */
   complete: {
     precheck(state, op) {
       if (op.cityId !== state.cityId) return "wrong_city";
-      const plan = state.plan;
-      if (!plan || planKey(plan) !== op.plan) return "no_plan";
-      if (plan.startedAt == null) return "not_started";
-      if (Number(op.at) !== Number(plan.completesAt)) return "completion_mismatch";
-      if (Number(op.reveal) !== CITY_BUILDINGS[plan.building]?.reveal) return "reveal_mismatch";
+      const item = queueItemOf(state, op.plan);
+      if (!item) return "no_plan";
+      if (item.startedAt == null) return "not_started";
+      if (Number(op.at) !== Number(item.completesAt)) return "completion_mismatch";
+      if (Number(op.reveal) !== CITY_BUILDINGS[item.building]?.reveal) return "reveal_mismatch";
       return null;
     },
     apply(state, entry) {
-      const plan = state.plan;
+      const item = queueItemOf(state, entry.plan);
+      state.queue = state.queue.filter((other) => other !== item);
+      // 下一項最早只能從這一項完工的時刻開工：這一筆就是那個下限。
+      const next = state.queue[0];
+      if (next) next.notBefore = Math.max(Number(next.notBefore ?? next.at), Number(entry.at));
       state.buildings.push({
-        building: plan.building,
-        label: plan.label,
-        x: plan.x,
-        y: plan.y,
-        w: plan.w,
-        h: plan.h,
-        cells: plan.cells.map((cell) => ({ x: cell.x, y: cell.y })),
-        costs: { ...plan.costs },
+        building: item.building,
+        label: item.label,
+        x: item.x,
+        y: item.y,
+        w: item.w,
+        h: item.h,
+        cells: item.cells.map((cell) => ({ x: cell.x, y: cell.y })),
+        costs: { ...item.costs },
         reveal: Number(entry.reveal),
-        startedAt: plan.startedAt,
+        startedAt: item.startedAt,
         completedAt: Number(entry.at),
         rulesVersion: entry.rulesVersion,
       });
-      state.plan = null;
+    },
+  },
+
+  /**
+   * 取消（ADR 0003）：只限還沒開工的項目。那一項還沒付款（材料是排到隊首才付），所以取消
+   * 只是把占地與名額交還，庫存不動；只有舊帳本裡「預定時就扣過料」的項目要全額退回。
+   * 已經開工就不能取消（配方已付、工地已經動土）；取消之後同一處再預定是另一個項目。
+   */
+  cancel: {
+    precheck(state, op) {
+      if (op.cityId !== state.cityId) return "wrong_city";
+      const item = queueItemOf(state, op.plan);
+      if (!item) return "no_plan";
+      return item.startedAt == null ? null : "already_started";
+    },
+    apply(state, entry) {
+      const item = queueItemOf(state, entry.plan);
+      state.queue = state.queue.filter((other) => other !== item);
+      if (item.paid) adjust(state, item.costs, 1);
     },
   },
 
@@ -425,7 +490,11 @@ export class CityLedger {
     return `${this.dir}/acks/${sessionId}/${writerEpoch}.json`;
   }
 
-  /** 第一次開這個帳本時建立 head 與第 0 段；已經有就沿用。 */
+  /**
+   * 第一次開這個帳本時建立 head 與第 0 段；已經有就沿用。
+   * 舊版（schemaVersion < 3）的 head 只改版本號：checkpoint 的載入判準就是這個號碼，
+   * 舊 checkpoint 會在第一次 `rebuild` 時被丟棄、從 journal 重播（見 `loadCheckpoint`）。
+   */
   async open() {
     const headText = await this.io.read(this.headPath());
     if (headText === null) {
@@ -439,6 +508,15 @@ export class CityLedger {
           checkpoint: -1,
         })}\n`,
       );
+    } else {
+      const head = JSON.parse(headText);
+      if (Number(head.schemaVersion) !== SCHEMA) {
+        try {
+          await this.io.write(this.headPath(), `${JSON.stringify({ ...head, schemaVersion: SCHEMA })}\n`, headText);
+        } catch (error) {
+          rejectUnlessConflict(error); // 另一個視窗先升級了：版本號只是標記，不影響讀取
+        }
+      }
     }
     if ((await this.io.read(this.segmentPath(0))) === null) await this.create(this.segmentPath(0), "");
     return this;
@@ -704,7 +782,7 @@ export class CityLedger {
       segment,
       resources: state.resources,
       work: state.work,
-      plan: state.plan,
+      queue: state.queue,
       // 共用城市的建築會一直增加：清單放內容檔（可切塊），manifest 只留固定長度的雜湊；
       // 沒有建築時就不寫內容檔。
       buildings: state.buildings.length > 0 ? (await this.blobs.putValue(state.buildings)).hash : null,
@@ -796,7 +874,7 @@ export class CityLedger {
       for (const [key, packed] of read.activities.entries) state.activities.set(key, await this.unpackRecord(packed));
       state.resources = manifest.resources ?? state.resources;
       state.work = manifest.work ?? state.work;
-      state.plan = manifest.plan ?? state.plan;
+      state.queue = manifest.queue ?? state.queue;
       state.buildings = manifest.buildings ? await this.blobs.getValue(manifest.buildings) : state.buildings;
       return { state, segment: manifest.segment };
     } catch (error) {

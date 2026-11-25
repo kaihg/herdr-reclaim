@@ -85,13 +85,13 @@ const keyOf = (cell) => `${cell.x},${cell.y}`;
 const covers = (cells, { x, y }) => (cells ?? []).some((cell) => cell.x === x && cell.y === y);
 
 /**
- * 一格現在的地面（畫面用）：已完工建築的占地是 `building`，施工中的占地是 `site`——植被與碎石
- * 在開工時讓位，所以工地看不到原本的疏林或碎石地；預定地還沒動工，仍是原本的地形。
- * 其餘格子回原本的地形（不看迷霧，迷霧由呼叫端用 `revealedCells` 判斷）。
+ * 一格現在的地面（畫面用）：已完工建築的占地是 `building`，施工中的那一項是 `site`——植被與
+ * 碎石在開工時讓位，所以工地看不到原本的疏林或碎石地；還在排隊、沒開工的預定地不動地面，
+ * 仍是原本的地形。其餘格子回原本的地形（不看迷霧，迷霧由呼叫端用 `revealedCells` 判斷）。
  */
 export function groundAt(city, cell) {
   if ((city?.buildings ?? []).some((building) => covers(building.cells, cell))) return "building";
-  if (city?.plan?.startedAt != null && covers(city.plan.cells, cell)) return "site";
+  if ((city?.queue ?? []).some((item) => item.startedAt != null && covers(item.cells, cell))) return "site";
   return terrainAt(cell);
 }
 
@@ -109,11 +109,12 @@ export function footprintCells(building, { x, y }) {
 /**
  * 一座城的選址判準：揭開範圍與占用格只算一次，之後每個錨點共用（`legalSites` 要問上百個錨點）。
  * 回傳 `(building, anchor) => 預覽`；`siteCheck` 與 `legalSites` 都走這一個函式。
+ * 占用只看已完工的建築與**整條佇列**（施工中與排隊中的預定地都算），所以佇列裡的兩項不會重疊。
  */
 function siteChecker(city) {
   const revealed = revealedCells(city);
   const built = new Set((city?.buildings ?? []).flatMap((done) => done.cells.map(keyOf)));
-  const planned = new Set((city?.plan?.cells ?? []).map(keyOf));
+  const planned = new Set((city?.queue ?? []).flatMap((item) => (item.cells ?? []).map(keyOf)));
   const check = (building, anchor) => {
     const def = CITY_BUILDINGS[building];
     if (!def) return { ok: false, building, x: anchor?.x, y: anchor?.y, cells: [], problems: ["unknown_building"] };
@@ -136,7 +137,7 @@ function siteChecker(city) {
 /**
  * 選址預覽：整片占地的每一格回報地形與「不能放的原因」。
  * 原因只有一種：`fog`（沒揭開，地形不回報）、`water`、`cliff`、`center`（城鎮中心）、
- * `building`（已完工的建築）、`plan`（已經是同一個預定地或工地）。`ok` 是全部格子都沒有原因。
+ * `building`（已完工的建築）、`plan`（已經在佇列裡：施工中或排隊中的預定地）。`ok` 是全部格子都沒有原因。
  */
 export function siteCheck(city, building, anchor) {
   return siteChecker(city).check(building, anchor);
@@ -168,7 +169,7 @@ export function legalSites(city, building) {
   return sites;
 }
 
-/** 配方還缺多少（>= 0）：預定地顯示「備料中」用，不下令、不預扣。 */
+/** 配方還缺多少（>= 0）：庫存不足時說明還缺什麼；新規則在預定時就付清，只有舊版預定地會用到。 */
 export function missingOf(costs = {}, resources = {}) {
   return Object.fromEntries(Object.entries(costs)
     .map(([key, need]) => [key, Math.max(0, Number(need) - Number(resources?.[key] ?? 0))])

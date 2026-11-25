@@ -25,13 +25,13 @@ async function open() {
   return { cx, town, tree: () => town.render(cx) };
 }
 
-const incomeOp = (tokens) => (state) => ({
-  opId: "income:shared:test",
+const incomeOp = (tokens, id = "test") => (state) => ({
+  opId: `income:shared:${id}`,
   kind: "income",
   at: 1_800_000_000_000,
   cityId: "shared",
   tokens,
-  sources: ["test"],
+  sources: [id],
   resources: workYieldOf(Number(state.work.tokens ?? 0) + tokens),
 });
 
@@ -58,8 +58,15 @@ describe("載入鏈", () => {
 });
 
 describe("選址到下令（真的寫進帳本）", () => {
-  test("點建築 → 點合法的一格 → 預定這裡：帳本多了同一個目標", async () => {
+  test("點建築 → 點合法的一格 → 預定這裡：庫存夠就當場開工、付一次配方", async () => {
+    // 先備料：七單位工作（木 21、石 14、鐵 7）足夠民居的 20/10。
+    const before = await ledgerState(host.home);
+    expect((await submitOp(host.home, incomeOp(70_000, "seed-house"))).status).toBe("applied");
+    const funded = await ledgerState(host.home);
+    expect(funded.resources.wood).toBe(before.resources.wood + 21);
     const { cx, town, tree } = await open();
+    expect(text(tree())).toContain(`共用倉庫|${funded.resources.wood}|木材|${funded.resources.stone}|石材|${funded.resources.iron}|鐵料`);
+
     const card = findById(tree(), "building-house");
     card.handlers.click({}, cx);
     expect(town.picking).toBe("house");
@@ -74,17 +81,67 @@ describe("選址到下令（真的寫進帳本）", () => {
     const preview = text(tree());
     expect(preview).toContain("整棟預覽");
     expect(preview).toContain("可以放");
+    expect(preview).toContain("排在佇列後面也付得出來");
 
     findByText(tree(), "預定這裡").handlers.click({}, cx);
-    const plan = await waitFor(() => town.town?.shared?.city?.plan, {
+    const queue = await waitFor(() => town.town?.shared?.city?.queue?.[0], {
       describe: () => `toast=${town.toast?.text} note=${town.note}`,
     });
-    expect(plan).toMatchObject({ building: "house", label: "民居", x: site.x, y: site.y });
+    expect(queue).toMatchObject({ building: "house", label: "民居", x: site.x, y: site.y, paid: true });
     expect(town.toast?.text).toContain("已預定：民居");
     expect(town.picking).toBeNull();
 
+    // 帳本真的動了：一項預定、配方扣一次、佇列最前面那一項已開工。
     const state = await ledgerState(host.home);
-    expect(state.plan).toMatchObject({ building: "house", x: site.x, y: site.y });
-    expect(text(tree())).toContain("預定：民居");
+    expect(state.queue).toHaveLength(1);
+    expect(state.queue[0]).toMatchObject({ building: "house", x: site.x, y: site.y, paid: true });
+    expect(state.queue[0].startedAt).toBeDefined();
+    expect([state.resources.wood, state.resources.stone]).toEqual([funded.resources.wood - 20, funded.resources.stone - 10]);
+    const after = text(tree());
+    expect(after).toContain("建設佇列（1/3）");
+    expect(after).toContain("#1 民居");
+    expect(after).toContain("施工中");
+  });
+
+  test("庫存不夠也能先排進佇列：帳本不扣料，畫面寫還缺；取消之後乾乾淨淨", async () => {
+    const { cx, town, tree } = await open();
+    const before = await ledgerState(host.home);
+    // 上一支測試留下的庫存只夠再排一項，不夠付第二棟民居（20/10）。
+    expect(before.resources.wood).toBeLessThan(20);
+
+    findByText(tree(), "民居　1×1").handlers.click({}, cx);
+    const site = legalSites(town.town.shared.city, "house")[0];
+    const tile = mapTiles(tree()).find((node) => node.props.id === `map-${site.x}-${site.y}`);
+    tile.handlers.mouseDown.left({ local_position: { x: tile.props.w / 2, y: tile.props.h / 2 }, bounds: {} }, cx);
+    const preview = text(tree());
+    expect(preview).toContain(`排在目前佇列之後還缺`);
+    expect(findByText(tree(), "預定這裡")).not.toBeNull(); // 缺料不擋預定
+
+    findByText(tree(), "預定這裡").handlers.click({}, cx);
+    const queued = await waitFor(() => town.town?.shared?.city?.queue?.[1], {
+      describe: () => `toast=${town.toast?.text} note=${town.note}`,
+    });
+    expect(queued.stage).toBe("queued");
+    expect(queued.paid).not.toBe(true);
+    expect(queued.missing).toEqual({
+      wood: 20 - before.resources.wood,
+      stone: 10 - before.resources.stone,
+    });
+    // 指定位置不動庫存。
+    const placed = await ledgerState(host.home);
+    expect(placed.resources).toEqual(before.resources);
+    expect(placed.queue).toHaveLength(2);
+    expect(text(tree())).toContain("備料中");
+    expect(text(tree())).toContain("還缺");
+
+    // 取消還沒開工的那一項：佇列回到一項，庫存不動。
+    findByText(tree(), "取消").handlers.click({}, cx);
+    await waitFor(() => town.town?.shared?.city?.queue?.length === 1, {
+      describe: () => `toast=${town.toast?.text} note=${town.note}`,
+    });
+    const cancelled = await ledgerState(host.home);
+    expect(cancelled.queue).toHaveLength(1);
+    expect(cancelled.resources).toEqual(before.resources);
+    expect(text(tree())).toContain("建設佇列（1/3）");
   });
 });

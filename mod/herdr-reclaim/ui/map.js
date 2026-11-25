@@ -1,13 +1,13 @@
-// 共用城市的地圖（#25–#27）：固定地形、已揭開的土地、唯一的建設目標、已完工的建築，
+// 共用城市的地圖（#25–#27）：固定地形、已揭開的土地、建設佇列、已完工的建築，
 // 以及選址時的合法位置與整棟預覽。
 //
 // 固定格大小＋原生雙軸捲動；邏輯座標與投影分開（core/grid.js），命中一律回到地面菱形。
 // 只有已揭開的格子收點擊（迷霧裡不能選址）；每一格自己收事件，命中同樣回到地面菱形。
 //
-// 三個階段畫法不同：預定地是強調色虛線（地面仍是原本的地形）；施工中是工作色虛線＋工地
-// （植被、碎石讓位）；完工是完成色實線＋建築。`legal` 是選好建築之後全部合法錨點；
-// `preview` 是 `siteCheck` 的結果——預覽與下令共用同一份判準，所以畫成綠色的整片占地
-// 就是下令會成功的那一片。
+// 佇列裡的每一項都畫出自己的占地：排隊中（還沒開工）是強調色虛線、地面仍是原本的地形；
+// 施工中（同時只有一項）是工作色虛線＋工地（植被、碎石讓位）；完工是完成色實線＋建築。
+// `legal` 是選好建築之後全部合法錨點；`preview` 是 `siteCheck` 的結果——預覽與下令共用
+// 同一份判準，所以畫成綠色的整片占地就是下令會成功的那一片。
 //
 // 效能：整片底層（迷霧填色、全部格線）是**靜態幾何**，快取起來重複使用；已揭開的格子依
 // 樣式聚成幾條路徑（core/map-style.js 決定每一格落哪一桶），每一幀不是一格一條路徑。
@@ -26,12 +26,12 @@ const paintOf = (style, t) => (style.kind === "slash"
   : Background.solid(t[style.token]).opacity(style.opacity));
 
 export function sharedMapView({
-  revealed, plan, buildings = [], legal = [], preview = null, selected = null, theme: t, tile, camera,
+  revealed, queue = [], buildings = [], legal = [], preview = null, selected = null, theme: t, tile, camera,
   radius = MAP_RADIUS, onPick, onPan, viewport = null,
 }) {
   const origin = originInContent(radius, tile);
   const base = basePaths(radius, tile);
-  const layout = mapCells({ revealed, plan, buildings, legal, preview, selected, radius });
+  const layout = mapCells({ revealed, queue, buildings, legal, preview, selected, radius });
   const spotOf = (cell) => projectTile(cell, tile);
   const marks = layout.marks.map((mark) => {
     if (mark.kind === "building") {
@@ -95,10 +95,10 @@ export function sharedMapView({
       .child(text);
   };
   for (const building of buildings) children.push(label(building, building.label, t.done));
-  if (plan) {
-    children.push(plan.stage === "building"
-      ? label(plan, `施工·${plan.label}`, t.working)
-      : label(plan, `預定·${plan.label}`, t.accent));
+  for (const item of queue) {
+    children.push(item.stage === "building"
+      ? label(item, `施工·${item.label}`, t.working)
+      : label(item, `預定·${item.label}`, t.accent));
   }
   return div()
     .id("map")

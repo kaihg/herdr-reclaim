@@ -9,10 +9,11 @@
 // 所有 repo 的工作都進同一個計量器；commit 不再另外加碼（#28、ADR 0002）。
 //
 // 這一票交付「工作 → 基本建材 + 常駐庫存」。
-// 選址與預定地是 #25；備料到齊自動開工、到期完工是 #26（`advanceConstruction`）。#22 之後
-// 程式只讀寫這一本帳本：舊版各城帳本（`cities/<hash>/`）原封不動留在磁碟上，不讀也不改它們。
-import { claimKey, planKey } from "./ledger.js";
-import { CITY_BUILDINGS, WORK_TOKENS_PER_UNIT, WORK_YIELD, affordable, workYieldOf } from "./rules.js";
+// 選址與建設佇列是 #25；預定即預扣、到期完工、未開工可取消是 #26 與 ADR 0003
+// （`advanceConstruction`／`cancelPlan`）。#22 之後程式只讀寫這一本帳本：舊版各城帳本
+// （`cities/<hash>/`）原封不動留在磁碟上，不讀也不改它們。
+import { claimKey, planKey, startAtOf } from "./ledger.js";
+import { BUILD_QUEUE_LIMIT, CITY_BUILDINGS, WORK_TOKENS_PER_UNIT, WORK_YIELD, affordable, workYieldOf } from "./rules.js";
 import { missingOf } from "./city-map.js";
 import { createsTile, rootOf, roundsOf, sessionIndex } from "./research.js";
 
@@ -140,80 +141,115 @@ export async function ingestIncome(ledger, { activities = [], activateAt } = {})
       resources: workYieldOf(Number(current.work?.tokens ?? 0) + settlement.tokens),
     }));
     results.push(result);
-    // 這一筆收成可能剛好補齊預定地的材料：入帳之後立刻檢查，不等畫面推進。
-    if (result.status === "applied") await startIfReady(ledger);
+    // 這一筆收入可能剛好補齊舊版預定地的材料：入帳之後立刻檢查，不等畫面推進。
+    if (result.status === "applied") await startNext(ledger);
   }
   return { settlements, results };
 }
 
 /**
- * 備料到齊就開工（#26）：有預定地、還沒開工、庫存足以支付預定時的完整配方，才送出一筆 construct。
- * 開工時間是材料到齊的那一刻：下令時間與入庫建材裡最晚那一筆（`work.stockedAt`）取晚者——晚到的
- * 較早工作不會讓工期回溯，關著畫面的那段時間也照算。opId 綁住目標，兩個視窗同時達標、重播或重開
- * 都只扣一次；沒有預定地時什麼都不做——不替玩家選下一棟。
+ * 佇列最前面那一項開工（#26、ADR 0003）：庫存足以支付整份配方時才送出一筆 construct，
+ * 一次付清。付款只在隊首發生——後面的項目不能插隊，所以排在前面的項目等的材料不會被後面的
+ * 吃掉。開工時刻交給帳本的 `startAtOf`：下令時刻、材料到齊時刻與前一項完工時刻取晚者。
+ * opId 綁住項目，兩個視窗同時推進、重播或重開都只算一次；沒有項目或材料不夠時什麼都不做。
  */
-async function startIfReady(ledger) {
-  return ledger.submit((current) => {
-    const plan = current.plan;
-    if (!plan || plan.startedAt != null || !affordable(plan.costs, current.resources)) return null;
+async function startNext(ledger) {
+  let picked = null;
+  const result = await ledger.submit((current) => {
+    const item = current.queue?.[0];
+    if (!item || item.startedAt != null) return null;
+    if (!item.paid && !affordable(item.costs, current.resources)) return null;
+    picked = item;
     return {
-      opId: `construct:${ledger.cityId}:${planKey(plan)}`,
+      opId: `construct:${ledger.cityId}:${planKey(item)}`,
       kind: "construct",
-      at: Math.max(Number(plan.at), Number(current.work?.stockedAt ?? plan.at)),
+      at: startAtOf(current, item),
       cityId: ledger.cityId,
-      plan: planKey(plan),
-      building: plan.building,
-      costs: { ...plan.costs },
-      buildMs: CITY_BUILDINGS[plan.building]?.buildMs,
+      plan: planKey(item),
+      building: item.building,
+      costs: { ...item.costs },
+      buildMs: CITY_BUILDINGS[item.building]?.buildMs,
     };
   });
+  return { ...result, item: picked };
 }
 
 /**
- * 推進唯一的建設目標（#26）：材料齊了就開工（入帳中斷而漏開的那一筆由這裡補上），工期到了就
- * 完工。完工的時間是開工加工期，不是 `now`；完工之後只存料，不支付下一棟。
- * 畫面每次重載與施工計時到期時呼叫；多個視窗同時呼叫只會有一筆開工、一筆完工。
+ * 施工中的那一項到期就完工（#26）：完工時間是開工加工期，不是 `now`。
+ * 一次只有一項在施工，所以找的就是佇列裡唯一開工的那一項。
  */
-export async function advanceConstruction(ledger, { now = Date.now() } = {}) {
-  const started = await startIfReady(ledger);
-  const completed = await ledger.submit((current) => {
-    const plan = current.plan;
-    if (!plan || plan.startedAt == null || Number(plan.completesAt) > Number(now)) return null;
+async function completeRunning(ledger, now) {
+  let picked = null;
+  const result = await ledger.submit((current) => {
+    const item = current.queue?.find((entry) => entry.startedAt != null);
+    if (!item || Number(item.completesAt) > Number(now)) return null;
+    picked = item;
     return {
-      opId: `complete:${ledger.cityId}:${planKey(plan)}`,
+      opId: `complete:${ledger.cityId}:${planKey(item)}`,
       kind: "complete",
-      at: Number(plan.completesAt),
+      at: Number(item.completesAt),
       cityId: ledger.cityId,
-      plan: planKey(plan),
-      building: plan.building,
-      reveal: CITY_BUILDINGS[plan.building]?.reveal,
+      plan: planKey(item),
+      building: item.building,
+      reveal: CITY_BUILDINGS[item.building]?.reveal,
     };
   });
+  return { ...result, item: picked };
+}
+
+/**
+ * 推進建設佇列（#26、ADR 0003）：一次只施工一項；前一項完工就把下一項推進到該開工的位置，
+ * 直到沒有新動作。關著畫面的那段時間也算：回來時 `now` 已經過了整條佇列的工期，
+ * 這裡會一次把能開工的開工、能完工的完工。多個視窗同時呼叫只會各有一筆 entry。
+ * `completed` 是這次真的完工的項目（畫面用它顯示「哪一棟完工了」）。
+ */
+export async function advanceConstruction(ledger, { now = Date.now() } = {}) {
+  const started = [];
+  const completed = [];
+  const brief = (item) => ({ building: item.building, label: item.label, x: item.x, y: item.y, at: Number(item.at) });
+  // 每一輪最多開工一項、完工一項；佇列上限就是輪數上限，沒有新動作就停。
+  for (let guard = 0; guard <= BUILD_QUEUE_LIMIT; guard++) {
+    const start = await startNext(ledger);
+    if (start.status === "applied") started.push(brief(start.item));
+    const finish = await completeRunning(ledger, now);
+    if (finish.status === "applied") {
+      completed.push(brief(finish.item));
+      continue;
+    }
+    if (start.status !== "applied") break;
+  }
   return { started, completed };
 }
 
 /**
- * 公開的共用城市讀取模型：庫存、工作進度、唯一的建設目標與已完工的建築。
- * 各 space 讀到的是同一份資料（同一個帳本），所以切 repo 或重開 herdr 庫存與預定地都一樣。
- * `plan.stage` 是 `reserved`（預定地，備料中）或 `building`（已付料施工中，`completesAt` 完工）；
- * `plan.missing` 只在備料中有意義：配方減掉現在庫存的差額，開工之後已經付清，是空的。
+ * 公開的共用城市讀取模型：庫存、工作進度、建設佇列與已完工的建築。
+ * 各 space 讀到的是同一份資料（同一個帳本），所以切 repo 或重開 herdr 庫存與佇列都一樣。
+ * `queue` 依開工順序排列，`stage` 是 `queued`（排隊中，`startsAt` 是預計開工時刻）或
+ * `building`（已開工，`completesAt` 完工）。
+ *
+ * `missing` 沿佇列累計：排在前面的項目會先用掉庫存，所以第二項的「還缺」是扣掉前面幾項配方
+ * 之後的差額，不是「現在庫存夠不夠」。付款只在隊首發生，這個數字就是它還要等多少材料。
  */
 export function readSharedCity(state = {}) {
-  const plan = state.plan
-    ? { ...state.plan, costs: { ...state.plan.costs }, cells: (state.plan.cells ?? []).map((cell) => ({ ...cell })) }
-    : null;
-  if (plan) {
-    plan.stage = plan.startedAt != null ? "building" : "reserved";
-    plan.missing = plan.stage === "reserved" ? missingOf(plan.costs, state.resources) : {};
-  }
+  const pool = Object.fromEntries(Object.entries(state.resources ?? {}).map(([key, amount]) => [key, Number(amount ?? 0)]));
+  const queue = (state.queue ?? []).map((item) => {
+    const copy = { ...item, costs: { ...item.costs }, cells: (item.cells ?? []).map((cell) => ({ ...cell })) };
+    copy.stage = item.startedAt != null ? "building" : "queued";
+    copy.missing = item.startedAt == null ? missingOf(copy.costs, pool) : {};
+    copy.startsAt = copy.stage === "queued" ? startAtOf(state, item) : item.startedAt;
+    // 這一項之後就輪到下一項：排隊中的配方先從池子裡扣掉（已開工的那一項早就付過了）。
+    if (item.startedAt == null) for (const [key, amount] of Object.entries(copy.costs)) pool[key] = Number(pool[key] ?? 0) - Number(amount);
+    return copy;
+  });
   return {
-    schema: 1,
+    schema: 2,
     city: {
       cityId: state.cityId ?? SHARED_CITY_ID,
       name: "共用城市",
       resources: Object.fromEntries(Object.keys(WORK_YIELD).map((key) => [key, Number(state.resources?.[key] ?? 0)])),
       work: { tokens: Number(state.work?.tokens ?? 0), unitTokens: WORK_TOKENS_PER_UNIT },
-      plan,
+      queue,
+      queueLimit: BUILD_QUEUE_LIMIT,
       buildings: (state.buildings ?? []).map((building) => ({
         ...building,
         costs: { ...building.costs },
@@ -224,9 +260,10 @@ export function readSharedCity(state = {}) {
 }
 
 /**
- * 指定建設目標（#25）：選一棟建築與錨點，整片占地成為唯一的預定地。不預扣庫存——缺料也能先指定；
- * 下令當下庫存已經夠，就在同一刻開工（#26）。兩個視窗同時送出時由帳本的前提檢查裁決：最多一個
- * 生效，另一個整筆被拒，不會留下半片占地；opId 綁住建築與錨點，同一處重送是重播，不同處才是第二個目標。
+ * 在佇列尾端預定一項（#25、ADR 0003）：選一棟建築與錨點，整片占地先保留、**不動庫存**；
+ * 排到隊首、庫存足以支付整份配方時才一次付清開工。兩個視窗同時送出時由帳本的前提檢查裁決
+ * （佇列上限、占地），被拒的一邊不會留下半片占地；opId 綁住建築與錨點，同一處重送是重播，
+ * 不同處才是新的項目。預定成功之後立刻推進：佇列本來是空的、材料又夠，這一項就當場開工。
  */
 export async function placePlan(ledger, { building, x, y, at } = {}) {
   const def = CITY_BUILDINGS[building];
@@ -243,7 +280,21 @@ export async function placePlan(ledger, { building, x, y, at } = {}) {
     h: def?.footprint.h ?? 0,
     costs: { ...(def?.costs ?? {}) },
   }));
-  if (result.status === "applied") await startIfReady(ledger);
+  if (result.status === "applied") await startNext(ledger);
   return result;
 }
 
+/**
+ * 取消佇列裡還沒開工的一項（ADR 0003）：那一項還沒付款，所以只是把占地與名額交還，庫存不動
+ * （舊帳本裡預定時就扣過料的項目由帳本全額退回）。
+ * 已開工的項目不能取消（`already_started`）；被拒的取消不寫任何東西，帳本與庫存都不動。
+ */
+export async function cancelPlan(ledger, item) {
+  return ledger.submit(() => ({
+    opId: `cancel:${ledger.cityId}:${planKey(item)}`,
+    kind: "cancel",
+    at: Date.now(),
+    cityId: ledger.cityId,
+    plan: planKey(item),
+  }));
+}

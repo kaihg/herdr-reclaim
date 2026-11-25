@@ -114,7 +114,7 @@ describe("長期共用帳本的容量：兩萬筆收入", () => {
 
       expect(checkpointState.resources).toEqual(journalState.resources);
       expect(checkpointState.work).toEqual(journalState.work);
-      expect(checkpointState.plan).toBeNull();
+      expect(checkpointState.queue).toEqual([]);
       expect(checkpointState.buildings).toEqual([]);
       // 索引的走訪順序跟著 checkpoint 分頁，journal 則是附加順序：比對內容，不比順序。
       expect(Object.fromEntries(checkpointState.opSeqs)).toEqual(Object.fromEntries(journalState.opSeqs));

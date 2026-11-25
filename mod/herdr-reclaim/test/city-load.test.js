@@ -109,7 +109,7 @@ describe("正式載入路徑：活動檔 → 共用城市", () => {
       expect(stock(first.city)).toEqual(times(6));
       expect(first.city.work.tokens).toBe((6 * (7_000 + 3_000)) % WORK_TOKENS_PER_UNIT);
       // 沒有遠征格、沒有預定地、沒有建築：只有共用城市的起始土地。
-      expect(first.city.plan).toBeNull();
+      expect(first.city.queue).toEqual([]);
       expect(first.city.buildings).toEqual([]);
       expect(first.city.tiles).toBeUndefined();
       expect(revealedCells(first.city).size).toBe(63); // 起始 8×8 扣掉東北角的迷霧
@@ -154,11 +154,11 @@ describe("正式載入路徑：活動檔 → 共用城市", () => {
       const ledger = await openShared();
       expect((await placePlan(ledger, { building: "house", x: 4, y: 0, at: AT + 900_000 })).status).toBe("applied");
       const building = await load(base);
-      expect(building.city.plan).toMatchObject({ building: "house", stage: "building" });
+      expect(building.city.queue[0]).toMatchObject({ building: "house", stage: "building" });
 
-      await advanceConstruction(await openShared(), { now: building.city.plan.completesAt });
+      await advanceConstruction(await openShared(), { now: building.city.queue[0].completesAt });
       const done = await load(base);
-      expect(done.city.plan).toBeNull();
+      expect(done.city.queue).toEqual([]);
       expect(done.city.buildings.map((entry) => [entry.building, entry.x, entry.y])).toEqual([["house", 4, 0]]);
       // 完工揭開新土地：正式路徑重讀之後，那一格是看得到的。
       expect(revealedCells(done.city).has("5,0")).toBe(true);
