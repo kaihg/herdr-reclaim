@@ -1,7 +1,7 @@
 # herdr-reclaim（mod）
 
 herdr 的開墾城鎮 mod。這個資料夾是 mod 本體：**一座共用城市**（#22 之後只剩這一個畫面）。
-上方是共用庫存、工作進度與唯一的建設目標，左邊是預定地、可選的建築與舊版記錄器的清理卡，
+上方是共用庫存、工作進度與唯一的建設目標，左邊是預定地與可選的建築，
 中央是共用城市的地圖，右邊是選取格或整棟預覽的詳情。
 
 所有 repo、space 與 session 的工作都只當成同一座城的工作來源：不產生遠征格，也不讀寫
@@ -20,7 +20,6 @@ herdr 的開墾城鎮 mod。這個資料夾是 mod 本體：**一座共用城市
 | `core/provider-stats.js` | 額度回報（S5 形狀）→ 顯示模型；不推算、不補 0 |
 | `core/quota-source.js` | 額度來源（官方 CLI 的 redacted JSON）與全域限流 |
 | `core/quota-view.js` | 額度模型的「現在」重新判定（TTL／resetsAt） |
-| `core/hooks.js` | 舊版 commit 記錄器的一次性清理：列出殘留的 repo、逐一移除並還原原 hook（#28） |
 | `core/grid.js` | 邏輯座標與 3/4 投影（投影與規則分開） |
 | `core/selection.js` | 選取與開發模式的保存（不是帳本；見下） |
 | `core/host-io.js` | 儲存介面的 host 適配層：herdr 的原生 CAS 衝突 → `CasConflict`（見下） |
@@ -35,7 +34,6 @@ herdr 的開墾城鎮 mod。這個資料夾是 mod 本體：**一座共用城市
 | `test/ledger-capacity.test.js` | 長期帳本的容量（20,000 筆收入）：每個檔案 ≤ 256 KiB、checkpoint 查得回每一筆、兩條讀取路徑狀態一致 |
 | `test/codex-adapter.test.js` | 真 Codex adapter：hook → 活動檔（cached input 扣除、未知不補零）、ack compact 後控制狀態不遺失、進共用庫存計量器 |
 | `test/omp-adapter.test.js` | OMP 活動重播：root／fork 算工作、print 不算、child 併進 root、resume 用量去重；ack 後的新尾巴接回 journal；重播不變 |
-| `test/hook-cleanup.test.js` | 舊版記錄器的清理：只列有殘留的 repo、全部移除後記錄器消失、串接的原 hook 內容與權限還原、沒裝的不動 |
 | `test/fs-io.js` | bun 測試用的 fs 後端（說同一種 CAS 語言）；mod 不會載入它 |
 
 領域邏輯完全不碰 host API，所以可以在 bun 下測；只有 `main.js` 匯入 `herdr` 與 `gpui-kit`。
@@ -99,8 +97,7 @@ mod 以 `find` 列活動檔，成功寫 journal 後按 epoch 寫 ack，並用 `w
   的那一筆收成會自動開工並付清配方，工期到了完工並揭開附近土地。重開、重播、兩個視窗同時
   推進都只有一筆開工與一筆完工。
 - 畫面（`main.js`）：上方是共用庫存、工作進度與目標；左側是建築卡（占地、配方、完工揭開
-  幾格）與舊版記錄器的清理卡；中間是地圖（預定地、工地、完工建築、選址預覽）；右側是
-  整棟預覽與「預定這裡」。
+  幾格）；中間是地圖（預定地、工地、完工建築、選址預覽）；右側是整棟預覽與「預定這裡」。
 
 ## 跑測試
 

@@ -24,7 +24,7 @@ sh tools/install.sh
 
 腳本會把 mod 複製到 `~/.config/herdr-app/mods/herdr-reclaim`，把 OMP extension 複製到 `~/.omp/agent/extensions/`，並跑一次 `herdr-app check`。新開的 OMP session 才會載入 extension。
 
-不需要 git hook。舊版曾要求每個 repo 裝記錄器換取 commit 加碼，已經停止；還留著記錄器的 repo，左側會列出並提供一次「全部移除」。
+不需要 git hook。舊版曾要求每個 repo 裝記錄器換取 commit 加碼，已經停止；那些記錄器也已在 2026-11-25 一次性移除。
 
 ## 規則
 
@@ -32,7 +32,7 @@ sh tools/install.sh
 
 ## 資料放在哪
 
-所有資料在 `~/.config/herdr-app/data/herdr-reclaim/`。帳本只增不改，畫面上的城是從 `shared/` 重播出來的。要重設，刪掉 `shared/` 與 `activity/`（建議先備份）。新版 mod 與 adapter 不再讀寫 `cities/`、`commits/`、`sources/`；但 repo 裡還留著的記錄器會在每次 commit 繼續往 `commits/` 寫，直到你在清理卡把它移除。
+所有資料在 `~/.config/herdr-app/data/herdr-reclaim/`。帳本只增不改，畫面上的城是從 `shared/` 重播出來的。要重設，刪掉 `shared/` 與 `activity/`（建議先備份）。新版 mod 與 adapter 不再讀寫 `cities/`、`commits/`、`sources/`。
 
 ## 開發
 

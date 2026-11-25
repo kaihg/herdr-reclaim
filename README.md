@@ -24,7 +24,7 @@ sh tools/install.sh
 
 The script copies the mod to `~/.config/herdr-app/mods/herdr-reclaim`, copies the OMP extension to `~/.omp/agent/extensions/`, and runs `herdr-app check`. Only OMP sessions started afterwards load the extension.
 
-No git hooks are needed. Older versions asked each repo for a recorder in exchange for a commit bonus; that has stopped. Repos that still have a recorder are listed on the left with a one-off "remove all".
+No git hooks are needed. Older versions asked each repo for a recorder in exchange for a commit bonus; that has stopped, and the recorders were removed once on 2026-11-25.
 
 ## Rules
 
@@ -32,7 +32,7 @@ Detailed rules and numbers (map, reveal, base income, build target, recipes and 
 
 ## Where data lives
 
-Everything is under `~/.config/herdr-app/data/herdr-reclaim/`. The ledger is append-only and the town on screen is replayed from `shared/`. To reset, delete `shared/` and `activity/` (back them up first). The current mod and adapters no longer read or write `cities/`, `commits/` or `sources/`, but a recorder still installed in a repo keeps appending to `commits/` on every commit until you remove it from the cleanup card.
+Everything is under `~/.config/herdr-app/data/herdr-reclaim/`. The ledger is append-only and the town on screen is replayed from `shared/`. To reset, delete `shared/` and `activity/` (back them up first). The current mod and adapters no longer read or write `cities/`, `commits/` or `sources/`.
 
 ## Development
 

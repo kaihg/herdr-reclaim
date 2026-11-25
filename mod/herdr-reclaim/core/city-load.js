@@ -30,11 +30,7 @@ export async function loadCity(io, { root, list, activities: given = null, now =
   const activities = mergeActivities([...state.activities.values(), ...fromDisk]);
   await ingestIncome(ledger, { activities, activateAt });
   await advanceConstruction(ledger, { now });
-  return {
-    city: readSharedCity(await ledger.state()),
-    activities,
-    repositories: repositoriesOf(activities),
-  };
+  return { city: readSharedCity(await ledger.state()), activities };
 }
 
 /**
@@ -92,19 +88,3 @@ export async function recordActivities(ledger, activities) {
   return results;
 }
 
-/**
- * 活動碰到的 repo（`visit.checkout`），最近用過的在前面：自動收成的同意流程要對每一個 repo
- * 問一次，而不是對「一座城」問——共用城市沒有自己的 checkout。
- */
-export function repositoriesOf(activities = []) {
-  const latest = new Map();
-  for (const record of activities) {
-    for (const event of record.events ?? []) {
-      const checkout = event.visit?.checkout;
-      if (typeof checkout !== "string" || checkout === "") continue;
-      const at = Number(event.at ?? record.updatedAt ?? 0);
-      if (!(latest.get(checkout) >= at)) latest.set(checkout, at);
-    }
-  }
-  return [...latest].map(([checkout, at]) => ({ checkout, at })).sort((a, b) => b.at - a.at || a.checkout.localeCompare(b.checkout));
-}

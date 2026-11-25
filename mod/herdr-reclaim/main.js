@@ -16,7 +16,6 @@ import { ADAPTER_DIR, activityDir, adapterRoot, loadActivities } from "./core/ad
 import { loadCity, townOf } from "./core/city-load.js";
 import { MAP_RADIUS, cameraFor, clampCamera, contentSize, panCamera } from "./core/grid.js";
 import { hostIo } from "./core/host-io.js";
-import { leftoverHooks, removeLeftoverHooks } from "./core/hooks.js";
 import { CasConflict, CityLedger } from "./core/ledger.js";
 import { quotaLines } from "./core/provider-stats.js";
 import { QUOTA_REFRESH_MS, QUOTA_SOURCE, claimQuotaAttempt, parseQuotaReport } from "./core/quota-source.js";
@@ -145,32 +144,12 @@ function openShared(io) {
 }
 
 /**
- * 沒解析到 commonDir 的 visit_start 用 git 補一次（adapter 偶爾只寫得到 cwd）。
- * 補到之後 `repositoriesOf` 才認得這個 checkout：舊版記錄器的清理範圍就是活動碰過的 repo。
- * 補不到就原樣留著；收入只看工作量，不受影響。
- */
-async function retryUnresolvedActivities(activities) {
-  return Promise.all((activities ?? []).map(async (record) => {
-    const events = await Promise.all((record.events ?? []).map(async (event) => {
-      if (event.kind !== "visit_start" || !event.visit?.cwd || event.visit.commonDir) return event;
-      const [commonDir, checkout] = await Promise.all([
-        exec("git", ["-C", event.visit.cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"]),
-        exec("git", ["-C", event.visit.cwd, "rev-parse", "--show-toplevel"]),
-      ]);
-      if (commonDir.code !== 0 || checkout.code !== 0) return event;
-      return { ...event, visit: { ...event.visit, commonDir: commonDir.stdout.trim(), checkout: checkout.stdout.trim() } };
-    }));
-    return { ...record, events };
-  }));
-}
-
-/**
- * 正式載入：活動檔（補齊 checkout）→ `loadCity` → 公開模型。
+ * 正式載入：活動檔 → `loadCity` → 公開模型。
  * 沒有 repo 舊帳本的讀寫，也不碰 git 的提交紀錄（#28：commit 不另外收成）。
  */
 async function loadModel(io) {
   const root = adapterRoot(appHome());
-  const activities = await retryUnresolvedActivities(await loadActivities(io, activityDir(appHome())));
+  const activities = await loadActivities(io, activityDir(appHome()));
   const loaded = await loadCity(io, { root, list: listFiles, activities });
   return townOf(loaded, await loadQuotas(io));
 }
@@ -257,8 +236,6 @@ export default class Town extends View {
     this.selection = null;
     this.ui = null;
     this.devMode = false;
-    this.leftovers = [];
-    this.cleanupResults = null;
     this.toast = null;
     this.note = "正在讀取共用城市帳本…";
     this.metricsOpen = false;
@@ -297,7 +274,6 @@ export default class Town extends View {
           this.town = null;
           this.note = `共用城市帳本讀取失敗：${error}`;
         }
-        await this.refreshLeftovers();
         cx.notify();
         first = false;
         try {
@@ -468,7 +444,7 @@ export default class Town extends View {
       ]);
   }
 
-  /** 左側：建設目標的狀態、可選的建築、舊版記錄器的清理與額度。 */
+  /** 左側：建設目標的狀態、可選的建築與額度。 */
   sharedPanel(shared, t, cx, width) {
     const plan = shared.plan;
     const building = plan?.stage === "building";
@@ -491,7 +467,6 @@ export default class Town extends View {
           : building
             ? `位置 (${plan.x}, ${plan.y})、占地 ${plan.w}×${plan.h}；配方已支付，${clockText(plan.completesAt)} 完工`
             : `位置 (${plan.x}, ${plan.y})、占地 ${plan.w}×${plan.h}；還缺 ${missingText(plan.missing)}，備齊自動開工`),
-        ...this.cleanupSections(t, cx),
         ...cityBuildings().map((building) => this.buildingCard(shared, building, t, cx)),
         div().text_size(9).text_color(t.dim)
           .child("草地、疏林、碎石地可以蓋；深水、峭壁與迷霧不行。預覽與下令用同一條規則。"),
@@ -737,61 +712,6 @@ export default class Town extends View {
       } catch (error) {
         this.note = `完工推進失敗：${error}`;
       }
-      cx2.notify();
-    });
-  }
-
-  // ---- 舊版 commit 記錄器的清理（#28、ADR 0002）：列出來，按下才動任何 repo
-
-  /**
-   * 活動碰過的 checkout 裡，還留著舊版記錄器的那幾個（讀 hook 檔，不是記憶）。沒有就不動。
-   * 掃描本身已經逐 repo 隔離錯誤，這裡只留最後一道保護：整批失敗時不清掉上一次的清單。
-   */
-  async refreshLeftovers() {
-    const repos = (this.town?.repositories ?? []).map(({ checkout }) => checkout);
-    try {
-      this.leftovers = await leftoverHooks({ repos, io: storageIo(), exec });
-    } catch {
-      // 保留上一次的清單：下一次載入或操作還會重試
-    }
-  }
-
-  /**
-   * 左側的清理卡：commit 收成已停止，但舊版可能在這些 repo 留下記錄器。卡上列出 repo，
-   * 按「全部移除」才動；結果逐 repo 列出，失敗的附原因並留在卡上（清單裡還有就再按一次重試）。
-   * 全部清乾淨（沒有殘留、也沒有失敗）之後整張卡消失。
-   */
-  cleanupSections(t, cx) {
-    const leftovers = this.leftovers ?? [];
-    const failures = (this.cleanupResults ?? []).filter((result) => !result.ok);
-    if (leftovers.length === 0 && failures.length === 0) return [];
-    return [v_flex().gap(4).p(7).rounded(6).bg(t.surface).border(1).border_color(t.accent).children([
-      div().text_size(11).font_semibold().child("commit 收成已停止"),
-      div().text_size(9).text_color(t.muted).child(
-        "舊版在下面這些 repo 裝了記錄器（每次提交在本機記一筆）。它們不會影響 commit，也不會再換成資源；"
-        + "要清掉就按「全部移除」，串接過的原 hook 會原樣還原。沒按之前不動任何 repo。",
-      ),
-      ...leftovers.map(({ repo }) => div().text_size(9).text_color(t.dim).truncate().child(repo)),
-      ...failures.map(({ repo, reason }) => div().text_size(9).text_color(t.blocked)
-        .child(`移除失敗：${repo}（${reason}）`)),
-      h_flex().gap(6).children([leftovers.length > 0
-        ? chipButton("全部移除", t, (cx2) => this.removeLeftovers(cx2))
-        : chipButton("知道了", t, (cx2) => { this.cleanupResults = null; cx2.notify(); })]),
-    ])];
-  }
-
-  /** 只移除畫面上列出的那幾個 repo；失敗的留在卡上（含原因），其餘照樣清掉。 */
-  removeLeftovers(cx) {
-    cx.spawn(async (cx2) => {
-      const repos = (this.leftovers ?? []).map(({ repo }) => repo);
-      try {
-        this.cleanupResults = await removeLeftoverHooks({ repos, exec });
-      } catch (error) {
-        this.cleanupResults = repos.map((repo) => ({ repo, ok: false, reason: String(error) }));
-      }
-      await this.refreshLeftovers();
-      const failed = (this.cleanupResults ?? []).filter((result) => !result.ok).length;
-      this.showToast(failed ? `已移除記錄器；${failed} 個 repo 失敗` : "已移除記錄器", cx2);
       cx2.notify();
     });
   }

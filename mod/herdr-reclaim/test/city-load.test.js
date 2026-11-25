@@ -8,7 +8,7 @@ import { describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { loadCity, repositoriesOf, townOf } from "../core/city-load.js";
+import { loadCity, townOf } from "../core/city-load.js";
 import { WORK_TOKENS_PER_UNIT, WORK_YIELD } from "../core/rules.js";
 import { revealedCells } from "../core/city-map.js";
 import { createFileIo } from "./fs-io.js";
@@ -113,8 +113,6 @@ describe("正式載入路徑：活動檔 → 共用城市", () => {
       expect(first.city.buildings).toEqual([]);
       expect(first.city.tiles).toBeUndefined();
       expect(revealedCells(first.city).size).toBe(63); // 起始 8×8 扣掉東北角的迷霧
-      // 活動碰到的 repo 都在（同意流程要對每一個 repo 問一次）。
-      expect(first.repositories.map((repo) => repo.checkout).sort()).toEqual([CHECKOUT_A, CHECKOUT_B]);
 
       // `cities/` 只有原本那一份，內容逐位元不變；新資料只在 `shared/`。
       expect(fs.readFileSync(legacy, "utf8")).toBe("{\"schemaVersion\":2}\n");
@@ -201,17 +199,5 @@ describe("正式載入路徑：活動檔 → 共用城市", () => {
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
     }
-  });
-
-  test("repositoriesOf：同一份 repo 只列一次，最近用過的在前面", () => {
-    const repos = repositoriesOf([
-      { events: [{ at: 10, visit: { checkout: "/a", commonDir: "/a/.git" } }] },
-      { events: [{ at: 30, visit: { checkout: "/b", commonDir: "/b/.git" } }] },
-      { events: [{ at: 20, visit: { checkout: "/a", commonDir: "/a/.git" } }, { at: 5, visit: { cwd: "/x" } }] },
-    ]);
-    expect(repos).toEqual([
-      { checkout: "/b", at: 30 },
-      { checkout: "/a", at: 20 },
-    ]);
   });
 });

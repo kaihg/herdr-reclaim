@@ -63,10 +63,6 @@ commit 不另外收成，見 ADR 0002：收入只看工作量，有沒有 commit
 - 額度是帳號層級、所有 workspace 共用：`quotas.json` 與「上次嘗試時間」都是全域檔案，不管開幾個視窗，每 5 分鐘最多查一次；按「更新額度」可以立刻抓。
 - 顯示在共用城市左側的「行會人力（provider 回報）」。
 
-## 舊版 git hook 的清理（#28）
+## 舊版 git hook（#28）
 
-舊版會在 repo 裝三個記錄器（`post-commit`、`post-merge`、`post-rewrite`）。新版不再安裝、也不再收成；殘留的記錄器一律以 exit 0 結束，不影響 commit。
-
-- 清理範圍是活動紀錄裡出現過的 checkout。左側只列還留著記錄器的 repo，沒按「全部移除」之前不動任何 repo。
-- 按下之後逐一移除：有 `*.herdr-reclaim-original` 的把原 hook 搬回去（內容與權限原樣），沒有的直接刪掉記錄器。
-- 結果逐 repo 列出；失敗附原因，並留在卡上，下次再試。全部清乾淨後整張卡消失。
+舊版會在 repo 裝三個記錄器（`post-commit`、`post-merge`、`post-rewrite`），用來換取 commit 加碼。新版不再安裝、也不再收成；記錄器已在 2026-11-25 一次性移除，產品不提供清理介面。若某個 repo 還留著記錄器，它只會在本機記一筆並以 exit 0 結束，不影響 commit，也不再換成資源。
