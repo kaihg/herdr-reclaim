@@ -8,7 +8,8 @@
 //   6  ticket #25 共用城市的建築占地與配方（市場、書庫、工坊、民居）；選址不動庫存
 //   7  ticket #26 共用城市的工期與完工揭開半徑；備齊自動開工、到期完工
 //   8  ticket #27 哨站：沿用選址、備料與施工，完工揭開比一般建築更大片的土地
-export const RULES_VERSION = 8;
+//   9  停止 commit 加碼（#28、ADR 0002）：不再產生成果收成；已落帳的照常重播
+export const RULES_VERSION = 9;
 
 /** 庫存裡的資源種類。羊皮卷已不再生產（舊玩法移除），保留鍵名讓舊快照重播時不變形。 */
 export const RESOURCES = ["wood", "stone", "iron", "parchment"];
@@ -49,8 +50,3 @@ export function workYieldOf(tokens = 0) {
   return Object.fromEntries(Object.entries(WORK_YIELD).map(([key, amount]) => [key, amount * units]));
 }
 
-/**
- * #24：一個可核對成果的額外收成——歸屬確定的 commit 另外發一份建材，基本收入照發。
- * 只發基本建材，確認收穫不看 commit 大小（試玩參數）。
- */
-export const ACHIEVEMENT_YIELD = { wood: 3, stone: 2, iron: 1 };

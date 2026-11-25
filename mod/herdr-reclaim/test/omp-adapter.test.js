@@ -19,7 +19,7 @@ function activity({ sessionId, role = "root", interactive = true, parentSessionI
     schema: 1,
     cli: "omp",
     cliVersion: "test",
-    capabilities: { usage: true, parent: true, heartbeat: true, commitEnv: true },
+    capabilities: { usage: true, parent: true, heartbeat: true },
     sessionId,
     role,
     interactive,

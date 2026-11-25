@@ -20,8 +20,11 @@ function context({
   artifactsDir = path.join(isolatedHome, "artifacts", sessionId),
 } = {}) {
   const timers = [];
+  // `#28` 之後 extension 不再讀 artifacts（changes.jsonl）：測試要用計數證明「沒有讀」。
+  const reads = { artifacts: 0 };
   return {
     timers,
+    reads,
     entries,
     mode: hasUI ? "tui" : "print",
     hasUI,
@@ -30,7 +33,7 @@ function context({
     sessionManager: {
       getSessionId: () => sessionId,
       getSessionFile: () => undefined,
-      getArtifactsDir: () => artifactsDir,
+      getArtifactsDir: () => { reads.artifacts += 1; return artifactsDir; },
       getCwd: () => cwd,
       getHeader: () => parentSession ? { parentSession } : null,
       getEntries: () => entries,
@@ -135,20 +138,18 @@ describe("OMP extension 寫入遠征活動檔", () => {
     fire("agent_end", {}, ctx);
     expect(readActivity("named-id")[0].sessionName).toBe("使用者改名");
   });
-  test("selective commit 的 artifacts 只寫入同一個精確 SHA 的來源憑證", () => {
+  test("不再讀 changes.jsonl、也不再寫 sources/（#28）：commit 不另外收成", () => {
     const handlers = new Map();
     install({ on: (name, handler) => handlers.set(name, handler) });
     const artifactsDir = path.join(isolatedHome, "artifacts", "selective-session");
     fs.mkdirSync(artifactsDir, { recursive: true });
-    fs.writeFileSync(path.join(artifactsDir, "changes.jsonl"), [
-      JSON.stringify({ type: "commit", sha: "0123456789abcdef0123456789abcdef01234567", paths: ["src/app.js"] }),
-      JSON.stringify({ type: "commit", sha: "89abcdef0123456789abcdef0123456789abcdef", paths: ["test/app.test.js"] }),
-    ].join("\n"));
-    handlers.get("turn_end")({}, context({ sessionId: "selective-session", cwd: "/tmp/selective-repo", artifactsDir }));
-    const evidenceDir = path.join(isolatedHome, "data", "herdr-reclaim", "sources");
-    const evidence = JSON.parse(fs.readFileSync(path.join(evidenceDir, "0123456789abcdef0123456789abcdef01234567.omp.selective-session.json"), "utf8"));
-    expect(evidence).toMatchObject({ sha: "0123456789abcdef0123456789abcdef01234567", sessionId: "selective-session", cli: "omp" });
-    expect(evidence.paths).toEqual(["src/app.js"]);
-    expect(fs.existsSync(path.join(evidenceDir, "89abcdef0123456789abcdef0123456789abcdef.omp.selective-session.json"))).toBe(true);
+    fs.writeFileSync(path.join(artifactsDir, "changes.jsonl"), JSON.stringify({
+      type: "commit", sha: "0123456789abcdef0123456789abcdef01234567", paths: ["src/app.js"],
+    }));
+    const ctx = context({ sessionId: "selective-session", artifactsDir });
+    handlers.get("turn_end")({}, ctx);
+    handlers.get("agent_end")({}, ctx);
+    expect(ctx.reads.artifacts).toBe(0); // 連 artifacts 目錄都不問
+    expect(fs.existsSync(path.join(isolatedHome, "data", "herdr-reclaim", "sources"))).toBe(false);
   });
 });

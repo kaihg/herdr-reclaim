@@ -1,32 +1,25 @@
 // 正式載入路徑（#22）：活動檔 → 共用帳本 → 公開的共用城市讀取模型。
 //
-// 只有這條路：沒有各 repo 的舊帳本（`cities/`）、沒有遠征建格、沒有舊 commit 收成或研究。
-// `loadCity` 是 main.js 開機與 watch 變更時呼叫的那一個函式，也是測試走的那一個——
-// 兩者不能各自拼一條「差不多」的流程，否則整合層的行為沒有被任何測試釘住。
+// 只有這條路：沒有各 repo 的舊帳本（`cities/`）、沒有遠征建格、也沒有 commit 收成
+// （#28、ADR 0002：收入只看工作量）。`loadCity` 是 main.js 開機與 watch 變更時呼叫的
+// 那一個函式，也是測試走的那一個——兩者不能各自拼一條「差不多」的流程，否則整合層的
+// 行為沒有被任何測試釘住。
 //
-// 主機相依的部分（列目錄、跑 git）由呼叫端注入：
-//   `list(dir)`                列檔案（herdr 的 mod 沒有 listdir）
-//   `remoteMerges`             遠端合併的 sha（不可能有 session 歸屬，不發成果加成）
-//   `diffForCommit(sha, hook)` 一個 commit 的第一父節點差異（成果收成用）
-//   `now`                      推進施工用的現在時刻（測試給固定值）
+// 主機相依的部分由呼叫端注入：
+//   `list(dir)`  列檔案（herdr 的 mod 沒有 listdir）
+//   `now`        推進施工用的現在時刻（測試給固定值）
 import { loadActivities, mergeActivities } from "./adapter.js";
-import { loadCommitEvidence } from "./commit-evidence.js";
 import { CityLedger } from "./ledger.js";
-import {
-  SHARED_CITY_ID, advanceConstruction, ingestAchievements, ingestIncome, readSharedCity, sharedCityDir,
-} from "./shared-city.js";
+import { SHARED_CITY_ID, advanceConstruction, ingestIncome, readSharedCity, sharedCityDir } from "./shared-city.js";
 
 /**
- * 一次完整的重讀：adapter 的活動檔寫進帳本（§6.2），與帳本保存的那一份合併之後入帳
- * （收入＋成果加成），再推進工期已到的完工，最後回傳公開讀取模型。
+ * 一次完整的重讀：adapter 的活動檔寫進帳本（§6.2），與帳本保存的那一份合併之後入帳，
+ * 再推進工期已到的完工，最後回傳公開讀取模型。
  *
- * `activities` 可以覆寫（main.js 先用 git 補齊未解析的 `visit.commonDir`）；沒有給就讀磁碟。
- * `extraHooks` 是主機另外找到的提交證據（reflog），`remoteMerges` 是遠端合併的 sha。
+ * `activities` 可以覆寫（測試給固定的事件）；沒有給就讀磁碟。
  * `activateAt` 只給測試：正式 runtime 由第一次啟用的當下決定。
  */
-export async function loadCity(io, {
-  root, list, activities: given = null, extraHooks = [], remoteMerges = new Set(), diffForCommit, now = Date.now(), activateAt,
-} = {}) {
+export async function loadCity(io, { root, list, activities: given = null, now = Date.now(), activateAt } = {}) {
   const fromDisk = given ?? await loadActivities({ ...io, list }, `${root}/activity`);
   const ledger = await new CityLedger({ io, dir: sharedCityDir(root), cityId: SHARED_CITY_ID }).open();
   await ledger.maybeCheckpoint();
@@ -36,21 +29,10 @@ export async function loadCity(io, {
   // adapter 的磁碟快照會被 ack compact；帳本保存的那一份才是完整的，兩邊取聯集。
   const activities = mergeActivities([...state.activities.values(), ...fromDisk]);
   await ingestIncome(ledger, { activities, activateAt });
-  const evidence = await loadCommitEvidence(io, root, list);
-  // 主機另外找到的 reflog 紀錄：同一個 sha、同一個 repo、同一種證據只留一筆。
-  const seen = new Set(evidence.hooks.map((record) => `${record.sha}@@${record.commonDir ?? ""}@@${record.hook}`));
-  for (const record of extraHooks) {
-    const key = `${record.sha}@@${record.commonDir ?? ""}@@${record.hook}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    evidence.hooks.push(record);
-  }
-  await ingestAchievements(ledger, { activities, ...evidence, remoteMerges, diffForCommit, activateAt });
   await advanceConstruction(ledger, { now });
   return {
     city: readSharedCity(await ledger.state()),
     activities,
-    evidence,
     repositories: repositoriesOf(activities),
   };
 }

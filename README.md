@@ -2,7 +2,7 @@
 
 English · [繁體中文](README.zh-TW.md)
 
-A herdr mod where **every agent session is an expedition: it clears land while it works, harvests resources from every commit, and spends them on buildings. Your whole town is your work history.**
+A herdr mod where **every agent session shares one town: work accumulates building materials, and you spend them on buildings. The town grows with the amount of work.**
 
 The only goal is to make herdr's UI fun. It is not a productivity tracker and it does not judge your code; the numbers on screen are game numbers, not performance metrics.
 
@@ -10,10 +10,9 @@ The only goal is to make herdr's UI fun. It is not a productivity tracker and it
 
 ## Concepts
 
-- **One town = one git repo.** Several spaces and worktrees of the same repo share one town.
-- **One plot of land = one interactive root session.** `/new` claims another plot, `/resume` returns to the original one, and subagents count under their root.
-- **Resources come from commits only.** Work without a commit never produces wood, stone or iron; only "research" slowly turns tokens into parchment.
-- **Working time slowly clears the land**; once cleared, you can build on it.
+- **One town.** One local user's data shares one town, one storehouse and one build target, regardless of repo, space, session or provider.
+- **Resources come from work only.** Valid work (interactive, finished turns, non-cache input + output only) yields wood 3, stone 2, iron 1 per 10,000 tokens. Commits make no difference; they are no longer a bonus ([ADR 0002](docs/adr/0002-income-from-work-only.md)).
+- **Site selection is the player's decision.** Pick a building and a spot; construction starts when materials are ready, and completion reveals the land around it.
 
 ## Install
 
@@ -25,15 +24,15 @@ sh tools/install.sh
 
 The script copies the mod to `~/.config/herdr-app/mods/herdr-reclaim`, copies the OMP extension to `~/.omp/agent/extensions/`, and runs `herdr-app check`. Only OMP sessions started afterwards load the extension.
 
-**Harvesting needs git hooks.** The first time the UI sees a town without them, it asks whether to enable automatic harvesting (three small files in that repo's `.git/hooks`). Without hooks a town only tracks working time. You can stop it at any time from the top bar, which restores any hook that was there before.
+No git hooks are needed. Older versions asked each repo for a recorder in exchange for a commit bonus; that has stopped. Repos that still have a recorder are listed on the left with a one-off "remove all".
 
 ## Rules
 
-Detailed rules and numbers (map, land states, how commits are classified and de-duplicated, research, buildings, boost, market, hooks) are in [`docs/rules.md`](docs/rules.md). They are MVP playtest baselines and may change. That document is currently Traditional Chinese only.
+Detailed rules and numbers (map, reveal, base income, build target, recipes and durations, quotas, legacy hook cleanup) are in [`docs/rules.md`](docs/rules.md). They are MVP playtest baselines and may change. That document is currently Traditional Chinese only.
 
 ## Where data lives
 
-Everything is under `~/.config/herdr-app/data/herdr-reclaim/`. The ledger is append-only and the town on screen is replayed from it. To reset, delete `cities/` and `activity/` (back them up first).
+Everything is under `~/.config/herdr-app/data/herdr-reclaim/`. The ledger is append-only and the town on screen is replayed from `shared/`. To reset, delete `shared/` and `activity/` (back them up first). The current mod and adapters no longer read or write `cities/`, `commits/` or `sources/`, but a recorder still installed in a repo keeps appending to `commits/` on every commit until you remove it from the cleanup card.
 
 ## Development
 

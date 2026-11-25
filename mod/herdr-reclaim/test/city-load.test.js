@@ -35,7 +35,7 @@ const record = (sessionId, writerEpoch, { cli = "omp", role = "root", parentSess
   }
   return {
     schema: 1, cli, cliVersion: "test",
-    capabilities: { usage: true, parent: true, heartbeat: true, commitEnv: true },
+    capabilities: { usage: true, parent: true, heartbeat: true },
     sessionId, role, interactive: true, parentSessionId, writerEpoch,
     ...(name ? { sessionName: name } : {}),
     events: events.map((event, index) => ({ eventSeq: index + 1, ...event })),
@@ -166,6 +166,38 @@ describe("正式載入路徑：活動檔 → 共用城市", () => {
       expect(revealedCells(done.city).has("5,0")).toBe(true);
       // 只做研究、沒有 commit：庫存只扣一次配方，沒有成果加成。
       expect(stock(done.city)).toEqual([10, 10, 10]);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  test("磁碟上留著 commits/ 與 sources/ 也不再產生成果收成：庫存只有基本收入", async () => {
+    const base = root();
+    try {
+      writeActivity(base, record("a-root", "a-root-1", { repo: REPO_A, checkout: CHECKOUT_A }));
+      // 舊版留下來的證據檔（#28 不刪磁碟資料，只是不再讀）：就算完全可歸屬，也不再換成資源。
+      const sha = "a".repeat(40);
+      fs.mkdirSync(`${base}/commits`, { recursive: true });
+      fs.writeFileSync(`${base}/commits/${sha}.post-commit.1.json`, JSON.stringify({
+        schema: 1, sha, hook: "post-commit", commonDir: REPO_A, toplevel: CHECKOUT_A,
+        at: AT + 2_000, env: { PI_SESSION_ID: "a-root" },
+      }));
+      fs.mkdirSync(`${base}/sources`, { recursive: true });
+      fs.writeFileSync(`${base}/sources/${sha}.json`, JSON.stringify({
+        schema: 1, sha, sessionId: "a-root", cli: "omp", at: AT + 2_000,
+      }));
+
+      let diffAsked = 0;
+      const loaded = await loadCity(createFileIo(), {
+        root: base, list, now: AT + 1_000_000, activateAt: AT - 1_000,
+        diffForCommit: async () => { diffAsked++; return [{ status: "M", path: "src/a.js", blob: "blob1" }]; },
+      });
+      const city = townOf(loaded, null).shared.city;
+      expect(stock(city)).toEqual(times(1)); // 一個回合的基本收入，沒有額外加碼
+      expect(diffAsked).toBe(0); // 連差異都不必問 git
+      // 舊證據檔留在磁碟上，不刪也不改。
+      expect(fs.readdirSync(`${base}/commits`)).toHaveLength(1);
+      expect(fs.readdirSync(`${base}/sources`)).toHaveLength(1);
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
     }

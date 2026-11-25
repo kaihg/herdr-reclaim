@@ -73,7 +73,7 @@ interface Activity {
   schema: 1;
   cli: "omp";
   cliVersion: string;
-  capabilities: { usage: boolean; parent: boolean; heartbeat: boolean; commitEnv: boolean };
+  capabilities: { usage: boolean; parent: boolean; heartbeat: boolean };
   sessionId: string;
   role: Role;
   parentSessionId?: string;
@@ -98,7 +98,6 @@ interface SessionEntryView {
 interface SessionManagerView {
   getSessionId(): string;
   getSessionFile(): string | undefined;
-  getArtifactsDir?(): string | undefined;
   getCwd(): string;
   getHeader(): { parentSession?: string } | null;
   getEntries(): SessionEntryView[];
@@ -128,7 +127,6 @@ const HERDR_APP_HOME = process.env.HERDR_APP_HOME || path.join(os.homedir(), ".c
 const ROOT = path.join(HERDR_APP_HOME, "data", "herdr-reclaim");
 const ACTIVITY_DIR = path.join(ROOT, "activity");
 const SHARED_ACKS_DIR = path.join(ROOT, "shared", "acks");
-const SOURCES_DIR = path.join(ROOT, "sources");
 function detectCliVersion() {
   if (process.env.OMP_VERSION) return process.env.OMP_VERSION;
   try {
@@ -209,36 +207,6 @@ function writeAtomic(file: string, value: unknown) {
   fs.renameSync(temp, file);
 }
 
-/** OMP selective commit records the exact SHA in this session's artifacts journal. */
-function syncCommitEvidence(ctx: HandlerContext) {
-  try {
-    const artifactsDir = ctx.sessionManager.getArtifactsDir?.();
-    if (!artifactsDir) return;
-    const journal = path.join(artifactsDir, "changes.jsonl");
-    if (!fs.existsSync(journal)) return;
-    const sessionId = ctx.sessionManager.getSessionId();
-    for (const line of fs.readFileSync(journal, "utf8").split(/\r?\n/)) {
-      if (!line) continue;
-      let value: unknown;
-      try { value = JSON.parse(line); } catch { continue; }
-      if (!value || typeof value !== "object" || !("type" in value) || !("sha" in value)) continue;
-      const entry = value as { type?: unknown; sha?: unknown; at?: unknown; parent?: unknown; paths?: unknown };
-      if (entry.type !== "commit" || typeof entry.sha !== "string" || !/^[0-9a-f]{40,64}$/i.test(entry.sha)) continue;
-      writeAtomic(path.join(SOURCES_DIR, `${entry.sha}.omp.${safeName(sessionId)}.json`), {
-        schema: 1,
-        sha: entry.sha,
-        cli: CLI,
-        sessionId,
-        at: typeof entry.at === "number" ? entry.at : Date.now(),
-        parent: typeof entry.parent === "string" ? entry.parent : null,
-        paths: Array.isArray(entry.paths) ? entry.paths.filter((path): path is string => typeof path === "string") : [],
-      });
-    }
-  } catch (error) {
-    logError("commit-evidence", error);
-  }
-}
-
 function logError(where: string, error: unknown) {
   try {
     fs.mkdirSync(ROOT, { recursive: true });
@@ -297,7 +265,7 @@ class Writer {
       schema: SCHEMA,
       cli: CLI,
       cliVersion: CLI_VERSION,
-      capabilities: { usage: true, parent: true, heartbeat: true, commitEnv: true },
+      capabilities: { usage: true, parent: true, heartbeat: true },
       sessionId: this.sessionId,
       role: this.role,
       ...(this.parentSessionId ? { parentSessionId: this.parentSessionId } : {}),
@@ -511,7 +479,6 @@ export default function (pi: ExtensionApi) {
   pi.on(
     "turn_end",
     guard((payload, ctx) => {
-      syncCommitEvidence(ctx);
       const current = ensure(ctx);
       if (!current) return;
       const at = Date.now();
@@ -524,7 +491,6 @@ export default function (pi: ExtensionApi) {
   pi.on(
     "agent_end",
     guard((_payload, ctx) => {
-      syncCommitEvidence(ctx);
       const current = ensure(ctx);
       if (!current) return;
       const at = Date.now();
@@ -537,7 +503,6 @@ export default function (pi: ExtensionApi) {
   pi.on(
     "session_shutdown",
     guard((_payload, ctx) => {
-      syncCommitEvidence(ctx);
       close(ctx, Date.now());
     }),
   );

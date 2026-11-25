@@ -8,23 +8,21 @@
 // 路徑是 core/city-load.js 的 `loadCity`（活動檔 → 共用帳本 → 讀取模型），開機、watch
 // 變更與額度更新都走同一條路。
 //
-// 選取、開發模式與自動收成的回答不進帳本（見 core/selection.js 的說明），存在 mod 資料
-// 目錄下的小檔案。
+// 選取與開發模式不進帳本（見 core/selection.js 的說明），存在 mod 資料目錄下的小檔案。
 import { View, div } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
 import { appHome, checking, exec, home, readTextFile, settings, theme, watchFolder, writeTextFile } from "herdr";
 import { ADAPTER_DIR, activityDir, adapterRoot, loadActivities } from "./core/adapter.js";
 import { loadCity, townOf } from "./core/city-load.js";
-import { parseRawDiff, parseReflogEvidence } from "./core/commit-evidence.js";
 import { MAP_RADIUS, cameraFor, clampCamera, contentSize, panCamera } from "./core/grid.js";
 import { hostIo } from "./core/host-io.js";
-import { hooksStatus, installHooks, removeHooks } from "./core/hooks.js";
+import { leftoverHooks, removeLeftoverHooks } from "./core/hooks.js";
 import { CasConflict, CityLedger } from "./core/ledger.js";
 import { quotaLines } from "./core/provider-stats.js";
 import { QUOTA_REFRESH_MS, QUOTA_SOURCE, claimQuotaAttempt, parseQuotaReport } from "./core/quota-source.js";
 import { quotaView, readQuotaView } from "./core/quota-view.js";
 import { RESOURCE_LABELS, RULES_VERSION } from "./core/rules.js";
-import { parseUi, selectionOf, serializeUi, withDev, withHookChoice, withSelection } from "./core/selection.js";
+import { parseUi, selectionOf, serializeUi, withDev, withSelection } from "./core/selection.js";
 import {
   SHARED_CITY_ID, advanceConstruction, placePlan, readSharedCity, sharedCityDir,
 } from "./core/shared-city.js";
@@ -39,13 +37,6 @@ const MAX_RIGHT_W = 292;
 const TOP_H = 104;
 /** 操作結果小提示顯示多久（ms）。 */
 const TOAST_MS = 6000;
-
-/** 自動收成要先請使用者確認的原因（白話）。 */
-const HOOK_CONFIRM_LABELS = {
-  husky: "這個 repo 的 hook 由 husky 管理，自動開啟可能改到版控內的檔案，所以沒有動。",
-  "tracked-hooks": "這個 repo 的 hook 目錄已納入版本控制，自動開啟會弄髒工作樹，所以沒有動。",
-  "backup-exists": "hook 目錄裡已有 *.herdr-reclaim-original 備份檔，為免蓋掉你的 hook，所以沒有動。請先確認那些檔案。",
-};
 
 const RESOURCES = [
   { key: "wood", label: "木材", color: "ansi3" },
@@ -155,7 +146,8 @@ function openShared(io) {
 
 /**
  * 沒解析到 commonDir 的 visit_start 用 git 補一次（adapter 偶爾只寫得到 cwd）。
- * 只影響 commit 歸屬，不影響收入；補不到就原樣留著。
+ * 補到之後 `repositoriesOf` 才認得這個 checkout：舊版記錄器的清理範圍就是活動碰過的 repo。
+ * 補不到就原樣留著；收入只看工作量，不受影響。
  */
 async function retryUnresolvedActivities(activities) {
   return Promise.all((activities ?? []).map(async (record) => {
@@ -173,44 +165,13 @@ async function retryUnresolvedActivities(activities) {
 }
 
 /**
- * 正式載入：活動檔（補齊 commonDir）→ `loadCity` → 公開模型。
- * git 只用在兩件事：commit 的第一父節點差異（成果收成）與 reflog（hook 沒記到的提交、
- * 遠端合併）。沒有任何 repo 舊帳本的讀寫。
+ * 正式載入：活動檔（補齊 checkout）→ `loadCity` → 公開模型。
+ * 沒有 repo 舊帳本的讀寫，也不碰 git 的提交紀錄（#28：commit 不另外收成）。
  */
 async function loadModel(io) {
   const root = adapterRoot(appHome());
   const activities = await retryUnresolvedActivities(await loadActivities(io, activityDir(appHome())));
-  // checkout → 它屬於哪個 repo（commonDir），由 visit 事件決定。
-  const repos = new Map();
-  for (const record of activities) {
-    for (const event of record.events ?? []) {
-      const { commonDir, checkout } = event.visit ?? {};
-      if (commonDir && checkout && !repos.has(checkout)) repos.set(checkout, commonDir);
-    }
-  }
-  const remoteMerges = new Set();
-  const extraHooks = [];
-  for (const [checkout, commonDir] of repos) {
-    // %ct＝提交時間（秒）：沒有 hook env 的提交仍要有一個真實事件時間，不能用讀取當下。
-    const reflog = await exec("git", ["-C", checkout, "reflog", "-n", "64", "--format=%H%x09%ct%x09%gs"]);
-    if (reflog.code !== 0) continue;
-    const parsed = parseReflogEvidence(reflog.stdout, commonDir, checkout);
-    for (const sha of parsed.remoteMerges) remoteMerges.add(sha);
-    extraHooks.push(...parsed.records);
-  }
-  const diffs = new Map();
-  /** 一個 commit 的第一父節點差異（新 repo 的第一筆用 `--root`）。 */
-  const diffForCommit = async (sha, hook) => {
-    if (!hook?.toplevel) return [];
-    const key = `${hook.toplevel}@@${sha}`;
-    if (diffs.has(key)) return diffs.get(key);
-    let result = await exec("git", ["-C", hook.toplevel, "diff-tree", "-r", "-M", "--raw", "-z", `${sha}^1`, sha]);
-    if (result.code !== 0) result = await exec("git", ["-C", hook.toplevel, "diff-tree", "--root", "-r", "-M", "--raw", "-z", sha]);
-    const changes = result.code === 0 ? parseRawDiff(result.stdout) : [];
-    diffs.set(key, changes);
-    return changes;
-  };
-  const loaded = await loadCity(io, { root, list: listFiles, activities, extraHooks, remoteMerges, diffForCommit });
+  const loaded = await loadCity(io, { root, list: listFiles, activities });
   return townOf(loaded, await loadQuotas(io));
 }
 
@@ -296,7 +257,8 @@ export default class Town extends View {
     this.selection = null;
     this.ui = null;
     this.devMode = false;
-    this.hookStates = {};
+    this.leftovers = [];
+    this.cleanupResults = null;
     this.toast = null;
     this.note = "正在讀取共用城市帳本…";
     this.metricsOpen = false;
@@ -335,7 +297,7 @@ export default class Town extends View {
           this.town = null;
           this.note = `共用城市帳本讀取失敗：${error}`;
         }
-        await this.refreshHookStates();
+        await this.refreshLeftovers();
         cx.notify();
         first = false;
         try {
@@ -492,13 +454,13 @@ export default class Town extends View {
           .items_end()
           .gap(3)
           .child(h_flex().flex_wrap().gap(6).items_center().children([
-            hookButton("更新額度", t, (cx2) => this.refreshQuotas(cx2, { manual: true })),
-            hookButton(this.devMode ? "開發模式 ✓" : "開發模式", t, (cx2) => this.toggleDev(cx2)),
+            chipButton("更新額度", t, (cx2) => this.refreshQuotas(cx2, { manual: true })),
+            chipButton(this.devMode ? "開發模式 ✓" : "開發模式", t, (cx2) => this.toggleDev(cx2)),
           ]))
           // 規則版本與量測是開發用的工程資訊：開發模式才出現。
           .when(this.devMode, (element) => element.child(h_flex().flex_wrap().gap(6).items_center().children([
             div().text_size(9).text_color(t.dim).child(`規則 v${RULES_VERSION}`),
-            hookButton(this.metricsOpen ? "關閉量測" : "量測", t, (cx2) => {
+            chipButton(this.metricsOpen ? "關閉量測" : "量測", t, (cx2) => {
               this.metricsOpen = !this.metricsOpen;
               cx2.notify();
             }),
@@ -506,7 +468,7 @@ export default class Town extends View {
       ]);
   }
 
-  /** 左側：建設目標的狀態、可選的建築、自動收成的同意流程與額度。 */
+  /** 左側：建設目標的狀態、可選的建築、舊版記錄器的清理與額度。 */
   sharedPanel(shared, t, cx, width) {
     const plan = shared.plan;
     const building = plan?.stage === "building";
@@ -529,7 +491,7 @@ export default class Town extends View {
           : building
             ? `位置 (${plan.x}, ${plan.y})、占地 ${plan.w}×${plan.h}；配方已支付，${clockText(plan.completesAt)} 完工`
             : `位置 (${plan.x}, ${plan.y})、占地 ${plan.w}×${plan.h}；還缺 ${missingText(plan.missing)}，備齊自動開工`),
-        ...this.hookSections(t, cx),
+        ...this.cleanupSections(t, cx),
         ...cityBuildings().map((building) => this.buildingCard(shared, building, t, cx)),
         div().text_size(9).text_color(t.dim)
           .child("草地、疏林、碎石地可以蓋；深水、峭壁與迷霧不行。預覽與下令用同一條規則。"),
@@ -676,8 +638,8 @@ export default class Town extends View {
         .child(div().text_size(9).text_color(t.dim).child(`(${cell.x}, ${cell.y})`))
         .child(div().text_size(10).text_color(cell.problem ? t.blocked : t.muted)
           .child(cell.problem ? SITE_PROBLEMS[cell.problem] ?? cell.problem : TERRAIN[cell.terrain]?.label ?? "迷霧"))),
-      preview.ok ? hookButton("預定這裡", t, (cx2) => this.submitPlan(preview, cx2)) : null,
-      hookButton("取消選址", t, (cx2) => {
+      preview.ok ? chipButton("預定這裡", t, (cx2) => this.submitPlan(preview, cx2)) : null,
+      chipButton("取消選址", t, (cx2) => {
         this.preview = null;
         cx2.notify();
       }),
@@ -779,79 +741,58 @@ export default class Town extends View {
     });
   }
 
-  // ---- 自動收成：對每一個看過的 repo 問一次（共用城市沒有自己的 checkout）
+  // ---- 舊版 commit 記錄器的清理（#28、ADR 0002）：列出來，按下才動任何 repo
 
-  /** 這些 repo 的自動收成開著嗎（讀 hook 檔，不是記憶）。已經確定開著的 repo 不重查。 */
-  async refreshHookStates() {
-    for (const { checkout } of this.town?.repositories ?? []) {
-      if (this.hookStates[checkout] === "installed") continue;
-      try {
-        this.hookStates[checkout] = (await hooksStatus({ repo: checkout, exec, io: storageIo() })).status;
-      } catch {
-        this.hookStates[checkout] = "unknown";
-      }
+  /**
+   * 活動碰過的 checkout 裡，還留著舊版記錄器的那幾個（讀 hook 檔，不是記憶）。沒有就不動。
+   * 掃描本身已經逐 repo 隔離錯誤，這裡只留最後一道保護：整批失敗時不清掉上一次的清單。
+   */
+  async refreshLeftovers() {
+    const repos = (this.town?.repositories ?? []).map(({ checkout }) => checkout);
+    try {
+      this.leftovers = await leftoverHooks({ repos, io: storageIo(), exec });
+    } catch {
+      // 保留上一次的清單：下一次載入或操作還會重試
     }
   }
 
   /**
-   * 左側的自動收成區塊：一次問一個還沒回答的 repo（寫進 .git/hooks，不能默默做）。
-   * 回答「先不要」會記在 ui.json（以 repo 路徑為鍵），之後不再跳出。
+   * 左側的清理卡：commit 收成已停止，但舊版可能在這些 repo 留下記錄器。卡上列出 repo，
+   * 按「全部移除」才動；結果逐 repo 列出，失敗的附原因並留在卡上（清單裡還有就再按一次重試）。
+   * 全部清乾淨（沒有殘留、也沒有失敗）之後整張卡消失。
    */
-  hookSections(t, cx) {
-    const sections = [];
-    for (const { checkout } of (this.town?.repositories ?? []).slice(0, 4)) {
-      const state = this.hookStates[checkout];
-      const on = state === "installed";
-      const name = checkout.split("/").filter(Boolean).pop() ?? checkout;
-      if (on) {
-        sections.push(h_flex().gap(6).items_center().flex_wrap()
-          .child(div().text_size(9).text_color(t.done).truncate().child(`自動收成 ✓ ${name}`))
-          .child(hookButton("停止", t, (cx2) => this.manageHooks(checkout, true, cx2))));
-        continue;
-      }
-      if (state !== "missing" && state !== "partial") continue;
-      if (this.ui?.hooks?.[checkout] === "declined") continue;
-      sections.push(v_flex().gap(4).p(7).rounded(6).bg(t.surface).border(1).border_color(t.accent).children([
-        div().text_size(11).font_semibold().child("開啟自動收成？"),
-        div().text_size(9).text_color(t.muted).child(
-          `${name}：agent 在這裡的 commit 要換成資源，需要在 .git/hooks 加入三個記錄用的小檔案。只在本機記一筆，不連網、不改你的 commit，隨時可以停止。沒開的話這個 repo 的成果不會收成。`,
-        ),
-        h_flex().gap(6).children([
-          hookButton("開啟", t, (cx2) => this.manageHooks(checkout, false, cx2)),
-          hookButton("先不要", t, (cx2) => this.declineHooks(checkout, cx2)),
-        ]),
-      ]));
-    }
-    return sections;
+  cleanupSections(t, cx) {
+    const leftovers = this.leftovers ?? [];
+    const failures = (this.cleanupResults ?? []).filter((result) => !result.ok);
+    if (leftovers.length === 0 && failures.length === 0) return [];
+    return [v_flex().gap(4).p(7).rounded(6).bg(t.surface).border(1).border_color(t.accent).children([
+      div().text_size(11).font_semibold().child("commit 收成已停止"),
+      div().text_size(9).text_color(t.muted).child(
+        "舊版在下面這些 repo 裝了記錄器（每次提交在本機記一筆）。它們不會影響 commit，也不會再換成資源；"
+        + "要清掉就按「全部移除」，串接過的原 hook 會原樣還原。沒按之前不動任何 repo。",
+      ),
+      ...leftovers.map(({ repo }) => div().text_size(9).text_color(t.dim).truncate().child(repo)),
+      ...failures.map(({ repo, reason }) => div().text_size(9).text_color(t.blocked)
+        .child(`移除失敗：${repo}（${reason}）`)),
+      h_flex().gap(6).children([leftovers.length > 0
+        ? chipButton("全部移除", t, (cx2) => this.removeLeftovers(cx2))
+        : chipButton("知道了", t, (cx2) => { this.cleanupResults = null; cx2.notify(); })]),
+    ])];
   }
 
-  declineHooks(repo, cx) {
-    this.ui = withHookChoice(this.ui ?? parseUi(null), repo, "declined");
-    if (this.io) updateUi(this.io, (ui) => withHookChoice(ui, repo, "declined")).catch(() => {});
-    cx.notify();
-  }
-
-  manageHooks(repo, remove, cx) {
+  /** 只移除畫面上列出的那幾個 repo；失敗的留在卡上（含原因），其餘照樣清掉。 */
+  removeLeftovers(cx) {
     cx.spawn(async (cx2) => {
-      let text;
+      const repos = (this.leftovers ?? []).map(({ repo }) => repo);
       try {
-        const result = remove
-          ? await removeHooks({ repo, exec })
-          : await installHooks({ repo, exec, io: storageIo(), appHome: appHome() });
-        if (result.status === "installed") this.hookStates[repo] = "installed";
-        if (result.status === "removed" || result.status === "not-installed") this.hookStates[repo] = "missing";
-        text = result.status === "refused"
-          ? `沒有開啟自動收成：${result.message ?? result.reason}`
-          : result.status === "needs-confirmation"
-            ? HOOK_CONFIRM_LABELS[result.reason] ?? `需先確認：${result.reason}`
-            : result.status === "installed" ? "已開啟自動收成"
-            : result.status === "removed" ? "已停止自動收成"
-            : result.status === "not-installed" ? "目前沒有開啟自動收成"
-            : `操作未完成：${result.reason ?? result.status}`;
+        this.cleanupResults = await removeLeftoverHooks({ repos, exec });
       } catch (error) {
-        text = `自動收成操作失敗：${error}`;
+        this.cleanupResults = repos.map((repo) => ({ repo, ok: false, reason: String(error) }));
       }
-      this.showToast(text, cx2);
+      await this.refreshLeftovers();
+      const failed = (this.cleanupResults ?? []).filter((result) => !result.ok).length;
+      this.showToast(failed ? `已移除記錄器；${failed} 個 repo 失敗` : "已移除記錄器", cx2);
+      cx2.notify();
     });
   }
 
@@ -1011,7 +952,7 @@ export default class Town extends View {
   }
 }
 
-function hookButton(label, t, action) {
+function chipButton(label, t, action) {
   return div().role("button").tab_index(0)
     .px(6)
     .py(3)

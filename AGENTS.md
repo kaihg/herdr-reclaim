@@ -1,6 +1,6 @@
 # herdr-reclaim
 
-herdr 的開墾城鎮 mod：每個 agent session 是一支遠征隊，commit 收成資源、蓋出可回看的工作史。設計見 `docs/proposal.md`。
+herdr 的開墾城鎮 mod：所有 agent session 共用一座城，工作累積建材、蓋出建築；收入只看工作量，commit 不另外收成（ADR 0002）。設計見 `docs/proposal.md` 與 `docs/adr/`。
 
 ## Agent skills
 

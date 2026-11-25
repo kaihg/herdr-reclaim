@@ -4,8 +4,8 @@ import { describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import path from "node:path";
 import { CityLedger } from "../core/ledger.js";
-import { ACHIEVEMENT_YIELD, CITY_BUILDINGS, WORK_TOKENS_PER_UNIT, WORK_YIELD } from "../core/rules.js";
-import { SHARED_CITY_ID, advanceConstruction, ingestAchievements, ingestIncome, placePlan, readSharedCity, sharedCityDir } from "../core/shared-city.js";
+import { CITY_BUILDINGS, WORK_TOKENS_PER_UNIT, WORK_YIELD } from "../core/rules.js";
+import { SHARED_CITY_ID, advanceConstruction, ingestIncome, placePlan, readSharedCity, sharedCityDir } from "../core/shared-city.js";
 import { groundAt, legalSites, revealedCells, siteCheck, terrainAt } from "../core/city-map.js";
 import { createFileIo } from "./fs-io.js";
 
@@ -22,7 +22,7 @@ function activity({ sessionId, role = "root", interactive = true, parentSessionI
     schema: 1,
     cli: "omp",
     cliVersion: "test",
-    capabilities: { usage: true, parent: true, heartbeat: true, commitEnv: true },
+    capabilities: { usage: true, parent: true, heartbeat: true },
     sessionId,
     role,
     interactive,
@@ -267,181 +267,6 @@ describe("共用城市的基本收入（#23）", () => {
     expect(fs.readFileSync(legacyFile, "utf8")).toBe(before);
     expect(fs.readdirSync(`${dir}/cities`)).toEqual(["deadbeef"]);
     expect(fs.existsSync(sharedCityDir(dir))).toBe(true);
-  });
-});
-
-// ticket #24：明確成果的額外收成。同樣走「固定事件 → 實際隔離帳本 → 公開共用城市」，
-// commit 證據的形狀與 hook／adapter 寫的檔案相同；斷言只看共用倉庫的庫存。
-const sha = (digit) => String(digit).repeat(40);
-const checkoutOf = (repo) => repo.replace(/\/\.git$/, "");
-
-/** 一筆 commit hook 證據（post-commit 或 reflog）；`env` 是 commit 當下看得到的 session 變數。 */
-const hookRecord = (commit, at, env = {}, { repo = REPO_A, hook = "post-commit", toplevel = checkoutOf(repo) } = {}) => ({
-  schema: 1,
-  sha: commit,
-  hook,
-  commonDir: repo,
-  toplevel,
-  at,
-  env,
-});
-
-/** 每個 commit 的第一父節點差異（`git diff-tree --raw` 解析後的形狀）。 */
-const diffsOf = (table) => async (commit) => table[commit] ?? [];
-const modified = (file, blob) => ({ status: "M", path: file, oldBlob: "0".repeat(40), resultBlob: blob });
-
-/** 一個 space 完整重載：先入帳基本收入，再核對成果。 */
-async function harvestAll(ledger, { activities, hooks = [], sources = [], diffs = {}, remoteMerges = new Set(), activateAt } = {}) {
-  await settle(ledger, activities, activateAt == null ? {} : { activateAt });
-  return ingestAchievements(ledger, { activities, hooks, sources, remoteMerges, diffForCommit: diffsOf(diffs) });
-}
-
-const bonus = (n) => [ACHIEVEMENT_YIELD.wood * n, ACHIEVEMENT_YIELD.stone * n, ACHIEVEMENT_YIELD.iron * n];
-const plus = (a, b) => a.map((amount, index) => amount + b[index]);
-
-/** 同量的有效工作：session `w` 在 repo A 的一個回合，正好一單位。 */
-const workIn = (sessionId = "w") => activity({
-  sessionId,
-  events: round(REPO_A, T(0), T(60_000), [usageEvent(T(1_000), `${sessionId}1`, TEN_K, { sessionId })]),
-});
-
-describe("明確成果的額外收成（#24）", () => {
-  test("同量有效工作：有可核對成果的倉庫多一份成果加成，沒有成果只有基本收入", async () => {
-    const withDir = root("with-commit");
-    await harvestAll(await sharedLedger(withDir), {
-      activities: [workIn()],
-      hooks: [hookRecord(sha(1), T(30_000), { PI_SESSION_ID: "w" })],
-      diffs: { [sha(1)]: [modified("src/town.js", "b".repeat(40))] },
-    });
-
-    const withoutDir = root("without-commit");
-    await harvestAll(await sharedLedger(withoutDir), { activities: [workIn()] });
-
-    expect(stock(await cityAt(withoutDir))).toEqual(times(1));
-    expect(stock(await cityAt(withDir))).toEqual(plus(times(1), bonus(1)));
-  });
-
-  test("只有同 terminal、時間接近、環境變數衝突或對不到活動檔的線索：不發成果加成，基本收入照發", async () => {
-    const cases = {
-      // hook 當下只看到 terminal（同一台 pane），沒有任何 CLI 的 session 變數。
-      "terminal-only": { env: { HC_TERMINAL_ID: "term-1" } },
-      // 有 session 變數，但活動檔裡沒有這支 codex session（對不到來源）。
-      "no-matching-adapter-session": { env: { CODEX_THREAD_ID: "cx-1" } },
-      // 兩個 CLI 的變數同時在環境裡（OMP 的 bash 底下又開了別的 CLI）：來源衝突。
-      "ambiguous-session-source": { env: { PI_SESSION_ID: "w", CODEX_THREAD_ID: "cx-1" } },
-    };
-    for (const [name, { env }] of Object.entries(cases)) {
-      const repo = root(name);
-      await harvestAll(await sharedLedger(repo), {
-        activities: [workIn()],
-        hooks: [hookRecord(sha(2), T(30_000), env)],
-        diffs: { [sha(2)]: [modified("src/town.js", "c".repeat(40))] },
-      });
-      // 提交時間落在同一個回合裡——時間接近不能用來補猜歸屬。
-      expect(stock(await cityAt(repo))).toEqual(times(1));
-    }
-
-    // 反例對照：同一組事件把 session 變數換成對得上的值，就拿到加成。
-    const verified = root("verified");
-    await harvestAll(await sharedLedger(verified), {
-      activities: [workIn()],
-      hooks: [hookRecord(sha(3), T(30_000), { PI_SESSION_ID: "w" })],
-      diffs: { [sha(3)]: [modified("src/town.js", "c".repeat(40))] },
-    });
-    expect(stock(await cityAt(verified))).toEqual(plus(times(1), bonus(1)));
-  });
-
-  test("同一成果從兩個 space 抵達、重開重播、rebase 換 sha 都不重複發；第二個不同成果仍入帳", async () => {
-    const repo = root("dedupe");
-    const work = [workIn()];
-    const first = sha(4);
-    const firstDiffs = { [first]: [modified("src/town.js", "d".repeat(40))] };
-    const hooks = [hookRecord(first, T(30_000), { PI_SESSION_ID: "w" })];
-    await harvestAll(await sharedLedger(repo), { activities: work, hooks, diffs: firstDiffs });
-    expect(stock(await cityAt(repo))).toEqual(plus(times(1), bonus(1)));
-
-    // 第二個 space：同一份證據，外加同一支 commit 被兩處 checkout 各記一筆（reflog 也看到它）。
-    await harvestAll(await sharedLedger(repo), {
-      activities: work,
-      hooks: [...hooks, hookRecord(first, T(30_000), { PI_SESSION_ID: "w" }, { hook: "reflog" })],
-      diffs: firstDiffs,
-    });
-    expect(stock(await cityAt(repo))).toEqual(plus(times(1), bonus(1)));
-
-    // 重開再重播：同一份紀錄再跑一次，庫存不變。
-    await harvestAll(await sharedLedger(repo), { activities: work, hooks, diffs: firstDiffs });
-    expect(stock(await cityAt(repo))).toEqual(plus(times(1), bonus(1)));
-
-    // 改寫（amend／rebase）換了 sha、內容沒變：不是新的成果。
-    const rewritten = sha(5);
-    await harvestAll(await sharedLedger(repo), {
-      activities: work,
-      hooks: [...hooks, hookRecord(rewritten, T(40_000), { PI_SESSION_ID: "w" })],
-      diffs: { ...firstDiffs, [rewritten]: firstDiffs[first] },
-    });
-    expect(stock(await cityAt(repo))).toEqual(plus(times(1), bonus(1)));
-
-    // 第二個不同且合格的成果：自己的新內容，照發一份。
-    const second = sha(6);
-    await harvestAll(await sharedLedger(repo), {
-      activities: work,
-      hooks: [...hooks, hookRecord(second, T(50_000), { PI_SESSION_ID: "w" })],
-      diffs: { ...firstDiffs, [second]: [modified("src/grid.js", "e".repeat(40))] },
-    });
-    expect(stock(await cityAt(repo))).toEqual(plus(times(1), bonus(2)));
-
-    // 另一個專案的同名檔案剛好內容相同（同路徑、同 blob）：仍是兩個不同的成果，各自入帳。
-    const elsewhere = sha(11);
-    await harvestAll(await sharedLedger(repo), {
-      activities: work,
-      hooks: [...hooks, hookRecord(second, T(50_000), { PI_SESSION_ID: "w" }), hookRecord(elsewhere, T(60_000), { PI_SESSION_ID: "w" }, { repo: REPO_B })],
-      diffs: { ...firstDiffs, [second]: [modified("src/grid.js", "e".repeat(40))], [elsewhere]: firstDiffs[first] },
-    });
-    expect(stock(await cityAt(repo))).toEqual(plus(times(1), bonus(3)));
-  });
-
-  test("啟用之前的提交、沒有可信時間的證據、空 commit 與非互動 session 都不是成果；基本收入不受影響", async () => {
-    // 啟用邊界之後才成立：同一段工作之前（上一版舊城歷史）的提交不補發。
-    const beforeDir = root("before-activation");
-    await harvestAll(await sharedLedger(beforeDir), {
-      activities: [workIn()],
-      hooks: [hookRecord(sha(7), T(-1), { PI_SESSION_ID: "w" })],
-      diffs: { [sha(7)]: [modified("src/town.js", "f".repeat(40))] },
-    });
-    expect(stock(await cityAt(beforeDir))).toEqual(times(1));
-
-    // 舊 recorder 留下的 at=0：沒有可信提交時間，不用讀取當下冒充。
-    const noTimeDir = root("no-time");
-    await harvestAll(await sharedLedger(noTimeDir), {
-      activities: [workIn()],
-      hooks: [hookRecord(sha(8), 0, { PI_SESSION_ID: "w" })],
-      diffs: { [sha(8)]: [modified("src/town.js", "f".repeat(40))] },
-    });
-    expect(stock(await cityAt(noTimeDir))).toEqual(times(1));
-
-    // 空 commit、只改 lockfile：沒有可核對的新內容。
-    const emptyDir = root("empty-commit");
-    await harvestAll(await sharedLedger(emptyDir), {
-      activities: [workIn()],
-      hooks: [hookRecord(sha(9), T(30_000), { PI_SESSION_ID: "w" })],
-      diffs: { [sha(9)]: [modified("bun.lock", "a".repeat(40))] },
-    });
-    expect(stock(await cityAt(emptyDir))).toEqual(times(1));
-
-    // print／headless 的 session 不建格，也就不是工作成果。
-    const headlessDir = root("headless");
-    const headless = activity({
-      sessionId: "w",
-      interactive: false,
-      events: round(REPO_A, T(0), T(60_000), [usageEvent(T(1_000), "h1", TEN_K, { sessionId: "w" })]),
-    });
-    await harvestAll(await sharedLedger(headlessDir), {
-      activities: [headless],
-      hooks: [hookRecord(sha(10), T(30_000), { PI_SESSION_ID: "w" })],
-      diffs: { [sha(10)]: [modified("src/town.js", "f".repeat(40))] },
-    });
-    // 連基本收入也不發：這不是互動工作（與 #23 同一條判準）。
-    expect(stock(await cityAt(headlessDir))).toEqual([0, 0, 0]);
   });
 });
 

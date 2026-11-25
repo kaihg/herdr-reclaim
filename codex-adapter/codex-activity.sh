@@ -354,7 +354,7 @@ EOF
       | ([$closers[] | select(.kind == "interval_close")] | length) as $newCloses
       | { schema: 1, cli: $cli,
           cliVersion: (($ident.cliVersion // $o.cliVersion) // "unknown"),
-          capabilities: {usage: true, parent: true, heartbeat: true, commitEnv: true},
+          capabilities: {usage: true, parent: true, heartbeat: true},
           sessionId: $sessionId,
           role: (($ident.role // $o.role) // "root"),
           parentSessionId: (($ident.parentSessionId // $o.parentSessionId) // null),

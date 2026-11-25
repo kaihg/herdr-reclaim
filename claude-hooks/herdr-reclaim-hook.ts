@@ -71,7 +71,7 @@ export interface Activity {
   schema: 1;
   cli: "claude";
   cliVersion: string;
-  capabilities: { usage: boolean; parent: boolean; heartbeat: boolean; commitEnv: boolean };
+  capabilities: { usage: boolean; parent: boolean; heartbeat: boolean };
   sessionId: string;
   role: Role;
   parentSessionId?: string;
@@ -405,7 +405,7 @@ export class HookRun {
       schema: SCHEMA,
       cli: CLI,
       cliVersion: typeof existing?.cliVersion === "string" ? existing.cliVersion : "unknown",
-      capabilities: { usage: true, parent: true, heartbeat: true, commitEnv: true },
+      capabilities: { usage: true, parent: true, heartbeat: true },
       sessionId: this.sessionId,
       role: state.role,
       ...(state.parentSessionId ? { parentSessionId: state.parentSessionId } : {}),

@@ -228,3 +228,30 @@ describe("adapter 的 ack", () => {
     expect(hashText(fs.readFileSync(`${dir}/acks/s1/e1.json`, "utf8"))).toHaveLength(16);
   });
 });
+
+describe("commit 收成退場（#28、ADR 0002）：只重播、不再產生", () => {
+  const LEGACY = {
+    at: T(10), rulesVersion: 8, opId: "achievement:shared:abc", kind: "achievement", cityId: "shared",
+    sha: "abc", repo: "/tmp/repo", claims: ["/tmp/repo|src/a.js:blob1"], resources: { wood: 3, stone: 2, iron: 1 },
+  };
+
+  test("帳本裡已落帳的 achievement 照常重播，庫存與升級前一致", async () => {
+    const dir = root("legacy-achievement");
+    const ledger = await open(dir);
+    await ledger.submit((state) => incomeOp(state, "w"));
+    // 舊版（v8）寫下的成果收成：直接寫進 journal，模擬磁碟上既有的帳本。
+    fs.appendFileSync(`${dir}/journal/0.json`, `${JSON.stringify({ journalSeq: 1, ...LEGACY })}\n`);
+    const state = await (await open(dir)).state();
+    expect(stock(state)).toEqual([6, 4, 2]); // 基本收入 3/2/1 ＋ 舊成果 3/2/1
+    expect(state.claims.has("shared@@/tmp/repo|src/a.js:blob1")).toBe(true);
+    expect(state.opSeqs.has("achievement:shared:abc")).toBe(true);
+  });
+
+  test("新的 achievement 一律被拒：帳本不再發得出這一種收成", async () => {
+    const dir = root("retired-achievement");
+    const ledger = await open(dir);
+    const result = await ledger.submit(() => ({ ...LEGACY, opId: "achievement:shared:def", sha: "def" }));
+    expect(result).toMatchObject({ status: "rejected", reason: "retired" });
+    expect(stock(await (await open(dir)).state())).toEqual([0, 0, 0]);
+  });
+});

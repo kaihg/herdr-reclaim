@@ -30,7 +30,7 @@ import { BlobStore } from "./blobs.js";
 import { byteLen, canonicalJson, hashText } from "./bytes.js";
 import { casWrite, rejectUnlessConflict } from "./cas.js";
 import { PrefixIndex } from "./pages.js";
-import { ACHIEVEMENT_YIELD, CITY_BUILDINGS, RESOURCES, RULES_VERSION, WORK_TOKENS_PER_UNIT, affordable, workYieldOf } from "./rules.js";
+import { CITY_BUILDINGS, RESOURCES, RULES_VERSION, WORK_TOKENS_PER_UNIT, affordable, workYieldOf } from "./rules.js";
 import { siteCheck } from "./city-map.js";
 
 export { byteLen, hashText };
@@ -224,21 +224,13 @@ export const KINDS = {
     },
   },
   /**
-   * 共用城市的成果收成（#24）：歸屬確定、且帶來新內容的 commit 另外發一份建材。`claims` 是這個
-   * commit 改到的內容版本（路徑＋result blob），寫進城級 claim 索引——同一個 commit 從兩個 space
-   * 抵達、重播、或 rebase／amend 後內容不變，都不會再發。
+   * 舊版的成果收成（#24）：**只重播、不再產生**（#28、ADR 0002）。已落帳的 entry 由 `apply`
+   * 原樣加回庫存與 claim 索引，庫存與升級前一致；新的提交一律被擋下，帳本再也發不出這一種收成。
+   * 收成的資源向量由 entry 自己帶，重播不看現在的規則表。
    */
   achievement: {
-    precheck(state, op) {
-      if (op.cityId !== state.cityId) return "wrong_city";
-      if (!Array.isArray(op.claims) || op.claims.length === 0) return "missing_claims";
-      const paid = Object.entries(ACHIEVEMENT_YIELD);
-      const got = Object.entries(op.resources ?? {});
-      if (got.length !== paid.length || !paid.every(([key, amount]) => Number(op.resources?.[key]) === amount)) {
-        return "rate_mismatch";
-      }
-      if (op.claims.some((claim) => state.claims.has(claimKey(op.cityId, claim)))) return "claim_exists";
-      return null;
+    precheck() {
+      return "retired";
     },
     apply(state, entry) {
       stockUp(state, entry);
