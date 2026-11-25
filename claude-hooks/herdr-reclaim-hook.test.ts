@@ -1,12 +1,13 @@
-// Claude Code adapter 的固定事件重播接點：hook 事件 → 活動檔 → 公開城鎮讀取模型。
-// 只斷言使用者可觀察的遠征、工作時間、visit、用量與未知標記，不測函式名稱或私有欄位。
+// Claude Code adapter 的固定事件重播接點：hook 事件 → 活動檔 → 共用城市讀得到的工作回合。
+// 只斷言 adapter 寫出來的可觀察資料（session、visit、回合、用量與未知標記），不測畫面模型。
+// #22 之後沒有各 repo 的遠征格：這些活動就是共用城市的工作來源。
 import { afterAll, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { loadActivities, activityDir } from "../mod/herdr-reclaim/core/adapter.js";
-import { readTown } from "../mod/herdr-reclaim/core/town.js";
+import { activityDir, loadActivities } from "../mod/herdr-reclaim/core/adapter.js";
+import { createsTile, roundsOf } from "../mod/herdr-reclaim/core/research.js";
 import { handleHook, interactiveOf, normalizeUsage, transcriptUsage } from "./herdr-reclaim-hook.ts";
 
 const testRoots: string[] = [];
@@ -80,8 +81,8 @@ function listJson(dir) {
   return out.sort();
 }
 
-/** 走 mod 自己的讀取路徑：活動檔 → 合併 → 公開城鎮模型。 */
-async function townOf(appHome) {
+/** 走 mod 自己的讀取路徑：活動檔 → 合併（與共用城市入帳時看到的是同一份）。 */
+async function activitiesOf(appHome) {
   const io = {
     list: async (dir) => listJson(dir),
     read: async (file) => {
@@ -92,16 +93,7 @@ async function townOf(appHome) {
       }
     },
   };
-  const activities = await loadActivities(io, activityDir(appHome));
-  return { town: readTown({ activities, repoFacts: {} }), activities };
-}
-
-function tileOf(town, rootSessionId = sid) {
-  for (const city of town.cities) {
-    const tile = city.tiles.find((candidate) => candidate.rootSessionId === rootSessionId);
-    if (tile) return tile;
-  }
-  return null;
+  return loadActivities(io, activityDir(appHome));
 }
 
 function usageEvents(appHome) {
@@ -111,8 +103,23 @@ function usageEvents(appHome) {
   );
 }
 
-describe("Claude Code adapter：hook 事件重播到城鎮模型", () => {
-  test("純文字回合與工具回合更新同一遠征；resume 不重算先前活動或用量", async () => {
+/** 同一把來源鍵只留最後一次（adapter 的 flush 會用完整快照取代 partial）。 */
+function usageTotals(appHome) {
+  const latest = new Map();
+  for (const event of usageEvents(appHome)) {
+    const key = event.usage?.anthropic?.sourceKey ?? event.sourceEntryId;
+    if (!latest.has(key) || (event.at ?? 0) >= (latest.get(key).at ?? 0)) latest.set(key, event);
+  }
+  const totals = { inputNonCache: 0, cacheRead: 0, cacheWrite: 0, output: 0 };
+  for (const event of latest.values()) {
+    for (const field of Object.keys(totals)) totals[field] += Number(event.usage.anthropic[field] ?? 0);
+  }
+  return totals;
+}
+
+
+describe("Claude Code adapter：hook 事件重播到活動檔", () => {
+  test("純文字回合與工具回合更新同一支 session；resume 不重算先前活動或用量", async () => {
     const { base, repo } = setupRepo("turns");
     const appHome = path.join(base, "apphome");
     const fire = hook(appHome, 1000);
@@ -138,17 +145,18 @@ describe("Claude Code adapter：hook 事件重播到城鎮模型", () => {
     fire("PreToolUse", { transcript_path: second, cwd: repo }, t2 + 500);
     fire("Stop", { transcript_path: second, cwd: repo, prompt_id: "p2" }, t2 + 2_000);
 
-    const turnOne = await townOf(appHome);
-    expect(turnOne.town.cities).toHaveLength(1);
-    expect(turnOne.town.cities[0].name).toBe("repo");
-    expect(turnOne.town.cities[0].tiles).toHaveLength(1);
-    const tile = tileOf(turnOne.town);
-    expect(tile.cli).toBe("claude");
-    expect(tile.repo.commonDir).toBe(path.join(repo, ".git"));
-    expect(tile.visits).toHaveLength(1);
-    expect(tile.usage).toMatchObject({ inputNonCache: 150, cacheRead: 2, cacheWrite: 3, output: 17 });
-    expect(tile.workMs).toBe(3_500); // 兩個回合的工作時間，中間的閒置不算
-    expect(tile.points).toBe(0);
+    const turnOne = await activitiesOf(appHome);
+    expect(turnOne).toHaveLength(1);
+    const record = turnOne[0];
+    expect(createsTile(record)).toBe(true); // 互動的 root：這棵樹的工作算進共用城市
+    expect(record.cli).toBe("claude");
+    const visits = record.events.filter((event) => event.kind === "visit_start");
+    expect(visits).toHaveLength(1);
+    expect(visits[0].visit.commonDir).toBe(path.join(repo, ".git"));
+    // 每個回合各關一次：共用城市的收入只結算已結束的回合。
+    expect(roundsOf(record).rounds).toHaveLength(2);
+    expect(roundsOf(record).open).toBeNull();
+    expect(usageTotals(appHome)).toMatchObject({ inputNonCache: 150, cacheRead: 2, cacheWrite: 3, output: 17 });
 
     // resume：新行程（新 pid）接續同一個 session，transcript 裡已經有舊帳。
     const resumed = hook(appHome, 2000);
@@ -163,18 +171,19 @@ describe("Claude Code adapter：hook 事件重播到城鎮模型", () => {
     resumed("UserPromptSubmit", { transcript_path: third, cwd: repo }, t3 + 500);
     resumed("Stop", { transcript_path: third, cwd: repo, prompt_id: "p3" }, t3 + 2_000);
 
-    const afterResume = await townOf(appHome);
-    const resumedTile = tileOf(afterResume.town);
-    expect(afterResume.town.cities[0].tiles).toHaveLength(1); // 同一支遠征、同一格
-    expect(resumedTile.usage).toMatchObject({ inputNonCache: 157, cacheRead: 2, cacheWrite: 3, output: 18 });
+    const afterResume = await activitiesOf(appHome);
+    // 同一支 session 的兩個 writer epoch：合併之後是兩份紀錄，不是兩支工作樹。
+    expect(afterResume).toHaveLength(2);
+    expect(afterResume.every((entry) => createsTile(entry))).toBe(true);
+    expect(usageTotals(appHome)).toMatchObject({ inputNonCache: 157, cacheRead: 2, cacheWrite: 3, output: 18 });
     expect(usageEvents(appHome).filter((event) => event.sourceEntryId === "msg_c")).toHaveLength(1);
-    const epochs = afterResume.activities.map((record) => record.writerEpoch);
+    const epochs = afterResume.map((entry) => entry.writerEpoch);
     expect(new Set(epochs)).toHaveLength(2);
     expect(epochs.some((epoch) => epoch.startsWith("c1000-"))).toBe(true);
     expect(epochs.some((epoch) => epoch.startsWith("c2000-"))).toBe(true);
   });
 
-  test("child 不另建格、投入歸 root；中途中止只算到最後一次 heartbeat", async () => {
+  test("child 併進 root；中途中止只算到最後一次 heartbeat", async () => {
     const { base, repo } = setupRepo("child");
     const appHome = path.join(base, "apphome");
     const fire = hook(appHome, 3000);
@@ -190,15 +199,13 @@ describe("Claude Code adapter：hook 事件重播到城鎮模型", () => {
     fire("SubagentStop", { cwd: repo, agent_id: childId, agent_transcript_path: childTranscript }, t + 9_000);
     fire("Stop", { cwd: repo }, t + 10_000);
 
-    const done = await townOf(appHome);
-    expect(done.town.cities[0].tiles).toHaveLength(1);
-    const tile = tileOf(done.town);
-    expect(tile.workMs).toBe(10_000); // root 0–10000 與 child 2000–9000 取聯集
-    expect(tile.usage).toMatchObject({ inputNonCache: 5, output: 1 });
-    expect(done.activities.map((record) => record.role).sort()).toEqual(["child", "root"]);
-    const child = done.activities.find((record) => record.role === "child");
+    const done = await activitiesOf(appHome);
+    expect(done.map((entry) => entry.role).sort()).toEqual(["child", "root"]);
+    const child = done.find((entry) => entry.role === "child");
     expect(child.parentSessionId).toBe(sid);
     expect(child.interactive).toBe(false);
+    expect(createsTile(child)).toBe(false); // child 的回合併進 root，不另外算一份工作
+    expect(usageTotals(appHome)).toMatchObject({ inputNonCache: 5, output: 1 });
 
     // 中止：新的行程（pid 4000）只有 heartbeat，沒有 Stop／SessionEnd。
     const aborted = hook(appHome, 4000);
@@ -208,11 +215,13 @@ describe("Claude Code adapter：hook 事件重播到城鎮模型", () => {
     aborted("PreToolUse", { cwd: repo }, t2 + 4_000);
     aborted("PreToolUse", { cwd: repo }, t2 + 9_000);
 
-    const halt = await townOf(appHome);
-    const abortedTile = tileOf(halt.town);
-    // 第二次遠征沒有收尾：只算到最後一次寫進磁碟的 heartbeat（9000），不是無限延長。
-    expect(abortedTile.workMs).toBe(10_000 + 9_000);
-    expect(abortedTile.status).toBe("active");
+    const halt = await activitiesOf(appHome);
+    const openEpoch = halt.find((entry) => entry.writerEpoch?.startsWith("c4000-"));
+    // 第二次遠征沒有收尾：回合沒有 close（共用城市不結算未結束的回合），最後一次寫進磁碟的
+    // heartbeat 就是它的最後活動。
+    expect(roundsOf(openEpoch).open).not.toBeNull();
+    expect(Math.max(...openEpoch.events.map((event) => event.at))).toBe(t2 + 9_000);
+    expect(halt.reduce((sum, entry) => sum + roundsOf(entry).rounds.length, 0)).toBeGreaterThanOrEqual(2);
   });
 
   test("同一個 message ID 只留一次；欄位不完整標 unknown 不補零；沒有 assistant usage 不當成零消耗", async () => {
@@ -241,8 +250,6 @@ describe("Claude Code adapter：hook 事件重播到城鎮模型", () => {
     expect("cacheRead" in y.usage.anthropic).toBe(false); // 不補 0
     expect("cacheWrite" in y.usage.anthropic).toBe(false);
     expect(y.usage.anthropic).toMatchObject({ inputNonCache: 4, output: 2, costUnknownEntries: 1 });
-    const publicTown = await townOf(appHome);
-    expect(tileOf(publicTown.town).usage.unknownFields).toEqual(["cacheRead", "cacheWrite"]);
 
     // 只有請求紀錄、沒有 assistant usage 的 session：不產生任何用量事件。
     const empty = writeTranscript(base, "empty", [transcriptLine("user", { at: t - 1 })]);
@@ -251,8 +258,6 @@ describe("Claude Code adapter：hook 事件重播到城鎮模型", () => {
     quiet("SessionStart", { source: "startup", transcript_path: empty, cwd: repo }, t);
     quiet("Stop", { transcript_path: empty, cwd: repo }, t + 100);
     expect(usageEvents(quietHome)).toHaveLength(0);
-    const quietTown = await townOf(quietHome);
-    expect(tileOf(quietTown.town).usage).toMatchObject({ inputNonCache: 0, costUnknownEntries: 0 });
   });
 
   test("同 message ID 的 usage 在 flush 與 compact 邊界以完整快照取代 partial，亂序不回退", async () => {
@@ -276,13 +281,10 @@ describe("Claude Code adapter：hook 事件重播到城鎮模型", () => {
     ].join("\n") + "\n");
     firstFire("Stop", { transcript_path: incremental, cwd: first.repo }, t + 5);
 
-    const afterCompact = await townOf(firstHome);
-    const compactTile = tileOf(afterCompact.town);
-    expect(compactTile.usage).toMatchObject({ inputNonCache: 11, cacheRead: 3, cacheWrite: 2, output: 9, costUnknownEntries: 1 });
+    expect(usageTotals(firstHome)).toMatchObject({ inputNonCache: 11, cacheRead: 3, cacheWrite: 2, output: 9 });
     const corrections = usageEvents(firstHome);
     expect(corrections.map((event) => event.sourceEntryId)).toEqual(["msg_incremental", "msg_incremental"]);
     expect(new Set(corrections.map((event) => event.usage.anthropic.sourceKey))).toHaveLength(1);
-    expect("unknownFields" in compactTile.usage).toBe(false);
 
     const second = setupRepo("usage-reversed-snapshot");
     const secondHome = path.join(second.base, "apphome");
@@ -295,13 +297,11 @@ describe("Claude Code adapter：hook 事件重播到城鎮模型", () => {
     secondFire("UserPromptSubmit", { transcript_path: reversed, cwd: second.repo }, t + 1);
     secondFire("Stop", { transcript_path: reversed, cwd: second.repo }, t + 5);
 
-    const afterReverse = await townOf(secondHome);
-    const reverseTile = tileOf(afterReverse.town);
-    expect(reverseTile.usage).toMatchObject({ inputNonCache: 11, cacheRead: 3, cacheWrite: 2, output: 9, costUnknownEntries: 1 });
-    expect("unknownFields" in reverseTile.usage).toBe(false);
+    // 亂序的 partial 不會蓋掉完整快照：最後留下的仍是完整的那一筆。
+    expect(usageTotals(secondHome)).toMatchObject({ inputNonCache: 11, cacheRead: 3, cacheWrite: 2, output: 9 });
   });
 
-  test("worktree 與 /cd 之後的 visit 用工作當下保存的 repo 身分，worktree 刪掉後仍歸同一座城", async () => {
+  test("worktree 與 /cd 之後的 visit 用工作當下保存的 repo 身分，worktree 刪掉後仍歸同一個 repo", async () => {
     const { base, repo } = setupRepo("worktree");
     const appHome = path.join(base, "apphome");
     const fire = hook(appHome, 6000);
@@ -316,17 +316,18 @@ describe("Claude Code adapter：hook 事件重播到城鎮模型", () => {
 
     fs.rmSync(worktree, { recursive: true, force: true }); // herdr 關著、worktree 已刪
 
-    const town = await townOf(appHome);
-    expect(town.town.cities).toHaveLength(1);
-    expect(town.town.cities[0].cityId).toBe(path.join(repo, ".git"));
-    const tile = tileOf(town.town);
-    expect(tile.visits).toHaveLength(2);
-    expect(tile.visits.map((visit) => visit.checkout).sort()).toEqual([repo, worktree].sort());
-    expect(tile.visits.every((visit) => visit.commonDir === path.join(repo, ".git"))).toBe(true);
-    expect(tile.workMs).toBe(60_000);
+    const records = await activitiesOf(appHome);
+    expect(records).toHaveLength(1);
+    const visits = records[0].events.filter((event) => event.kind === "visit_start").map((event) => event.visit);
+    expect(visits).toHaveLength(2);
+    expect(visits.map((visit) => visit.checkout).sort()).toEqual([repo, worktree].sort());
+    expect(visits.every((visit) => visit.commonDir === path.join(repo, ".git"))).toBe(true);
+    // 換 checkout 會收掉前一個 visit 的回合、開一個新的：兩個 visit、兩個已結束的回合，
+    // 共用城市只看到同一支 session 的工作。
+    expect(roundsOf(records[0]).rounds).toHaveLength(2);
   });
 
-  test("-p（sdk-cli）不建格；互動 cli 才建格", async () => {
+  test("-p（sdk-cli）不是互動工作：不產生可結算的回合", async () => {
     const { base, repo } = setupRepo("print");
     const appHome = path.join(base, "apphome");
     const print = hook(appHome, 7000, "sdk-cli");
@@ -334,9 +335,9 @@ describe("Claude Code adapter：hook 事件重播到城鎮模型", () => {
     print("SessionStart", { source: "startup", cwd: repo }, t);
     print("UserPromptSubmit", { cwd: repo }, t);
     print("Stop", { cwd: repo }, t + 60_000);
-    const town = await townOf(appHome);
-    expect(town.town.cities).toHaveLength(0);
-    expect(town.activities[0]).toMatchObject({ interactive: false, role: "root" });
+    const records = await activitiesOf(appHome);
+    expect(records[0]).toMatchObject({ interactive: false, role: "root" });
+    expect(createsTile(records[0])).toBe(false); // 共用城市不把 print 的回合算成工作
     expect(interactiveOf("sdk-cli")).toBe(false);
     expect(interactiveOf("cli")).toBe(true);
   });

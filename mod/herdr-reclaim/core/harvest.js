@@ -1,4 +1,5 @@
-// Git tree diff classification and deterministic harvest calculation (§7–§8).
+// Git tree diff classification 與 commit 的內容 claim（共用城市的成果收成 #24 用）。
+// 一個 commit 只看首見的路徑與內容：純改名不換內容不算、排除路徑（lockfile、生成物、vendor）不算。
 const TEST = /(?:^|\/)(?:tests|__tests__)(?:\/|$)|(?:^|\/)test_[^/]*$|(?:^|\/)[^/]*_test\.[^/]*$|\.(?:spec|test)\.[^/]+$/i;
 const DOCUMENT = /\.md$|\.rst$|(?:^|\/)docs(?:\/|$)/i;
 const CONFIG = /\.json$|\.ya?ml$|\.toml$|(?:^|\/)\.[^/]+$/i;
@@ -16,12 +17,10 @@ export function classifyPath(path) {
   return "code";
 }
 
-const EMPTY_RESOURCES = () => ({ wood: 0, stone: 0, iron: 0, parchment: 0 });
-const claimKey = (cityId, claim) => `${cityId}@@${claim}`;
 
 /**
- * 一個 commit 的首見路徑與內容 claim（收成與成果收成共用同一條分類與 claim 規則）：
- * 同一路徑只算一次；純改名不換內容不算新版本；排除路徑（lockfile、生成物、vendor）沒有 claim。
+ * 一個 commit 的首見路徑與內容 claim：同一路徑只算一次；純改名不換內容不算新版本；
+ * 排除路徑（lockfile、生成物、vendor）沒有 claim。
  */
 export function changesOfCommit(changes = []) {
   const seen = new Set();
@@ -32,46 +31,12 @@ export function changesOfCommit(changes = []) {
     const category = classifyPath(path);
     if (!category || seen.has(path)) continue;
     seen.add(path);
-    // §7.3 的城級 claim key：刪除是 cityId+path+"deleted"+firstParentBlob，與新增的
-    // cityId+path+resultBlob 不同；同一份內容版本的新增與刪除因此各自只發一次。
+    // §7.3 的城級 claim key：刪除是 path+"deleted"+firstParentBlob，與新增的
+    // path+resultBlob 不同；同一份內容版本的新增與刪除因此各自只發一次。
     const claim = change.status === "D"
       ? `${path}|deleted|${change.oldBlob ?? ""}`
       : `${path}|${change.resultBlob ?? ""}`;
     units.push({ path, category, claim, resultBlob: change.resultBlob ?? null, firstParentBlob: change.oldBlob ?? null });
   }
   return units;
-}
-
-/**
- * Computes only units not already claimed by the city or counted in this generation.
- * `changes` are first-parent tree changes; deletions carry their first-parent blob.
- */
-export function harvestForCommit({ cityId, rootSessionId, generation, sha, changes, state, tile }) {
-  const seenPaths = new Set(tile?.harvestedPaths ?? []);
-  const claims = [];
-  const units = [];
-  const resources = EMPTY_RESOURCES();
-  for (const unit of changesOfCommit(changes ?? [])) {
-    if (seenPaths.has(unit.path)) continue;
-    if (state?.claims?.has(claimKey(cityId, unit.claim))) continue;
-    seenPaths.add(unit.path);
-    claims.push(unit.claim);
-    units.push(unit);
-    if (unit.category === "test") resources.stone += 10;
-    else if (unit.category === "document") resources.parchment += 1;
-    else if (unit.category === "config") resources.iron += 5;
-    else resources.wood += 10;
-  }
-  return {
-    opId: `harvest:${sha}`,
-    cityId,
-    rootSessionId,
-    generation,
-    sha,
-    claims,
-    paths: [...seenPaths],
-    units,
-    resources,
-    points: units.length ? 20 : 0,
-  };
 }

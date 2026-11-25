@@ -1,21 +1,15 @@
-// 選取狀態：畫面自己的狀態，不是城鎮帳本的一部分。
+// 畫面自己的狀態：選取、開發模式、自動收成的回答。不是共用城市的帳本的一部分。
 //
-// 決策（ticket #3）：選取不寫進城的 journal。它不產生資源、不改變土地或 claim，
-// 寫進 append-only 的帳本只會讓每個城多出純 UI 噪音，並讓「重播 = 同一座城」的
-// 驗證多一個無關變數。改存在 mod 資料目錄下的小檔案（ui.json），以 cityId 為鍵；
-// 重開 herdr 後還原同一個選取。
+// 決策（ticket #3）：選取不寫進帳本。它不產生資源、不改變土地，寫進 append-only 的帳本
+// 只會讓帳本多出純 UI 噪音，並讓「重播 = 同一座城」的驗證多一個無關變數。改存在 mod 資料
+// 目錄下的小檔案（ui.json）；重開 herdr 後還原同一個選取。
 //
-// 純 JS：解析、合併與「還原後的選取還有效嗎」都放在這裡，檔案 I/O 由呼叫端做。
+// 共用城市只有一張地圖（#22：舊版各 repo 城的指揮桌已移除），選取就是地圖上的一格。
 
 export const UI_SCHEMA = 1;
 
-/** 畫面顯示哪一座地圖：舊版各城的指揮桌，或共用城市（#25 的選址發生在共用城市的地圖上）。 */
-export const VIEW_REPO = "repo";
-export const VIEW_SHARED = "shared";
-const viewOf = (ui) => (ui?.view === VIEW_SHARED ? VIEW_SHARED : VIEW_REPO);
-
 export function emptyUi() {
-  return { schema: UI_SCHEMA, selections: {}, dev: false, hooks: {}, view: VIEW_REPO };
+  return { schema: UI_SCHEMA, selections: {}, dev: false, hooks: {} };
 }
 
 export function parseUi(text) {
@@ -24,9 +18,9 @@ export function parseUi(text) {
     const data = JSON.parse(text);
     if (!data || typeof data !== "object" || !data.selections || typeof data.selections !== "object") return emptyUi();
     const hooks = data.hooks && typeof data.hooks === "object" ? data.hooks : {};
-    return { schema: UI_SCHEMA, selections: data.selections, dev: data.dev === true, hooks, view: viewOf(data) };
+    return { schema: UI_SCHEMA, selections: data.selections, dev: data.dev === true, hooks };
   } catch {
-    return emptyUi(); // 壞掉的 UI 檔不影響城鎮，回到預設選取
+    return emptyUi(); // 壞掉的 UI 檔不影響城市，回到預設選取
   }
 }
 
@@ -39,61 +33,13 @@ export function withDev(ui, dev) {
   return { ...ui, schema: UI_SCHEMA, dev: dev === true };
 }
 
-/** 切換地圖（舊城／共用城市）：畫面自己的狀態，跟選取一起放在 ui.json。 */
-export function withView(ui, view) {
-  return { ...ui, schema: UI_SCHEMA, view: viewOf({ view }) };
-}
-
-/** 使用者對「這座城要不要開自動收成」的回答（目前只記「先不要」，不再重複詢問）。 */
-export function withHookChoice(ui, cityId, choice) {
-  return { ...ui, schema: UI_SCHEMA, hooks: { ...(ui.hooks ?? {}), [cityId]: choice } };
+/** 使用者對某個 repo「要不要開自動收成」的回答（目前只記「先不要」，不再重複詢問）。 */
+export function withHookChoice(ui, repo, choice) {
+  return { ...ui, schema: UI_SCHEMA, hooks: { ...(ui.hooks ?? {}), [repo]: choice } };
 }
 
 export function selectionOf(ui, cityId) {
   return ui?.selections?.[cityId] ?? null;
-}
-
-/**
- * 指揮桌一打開右邊就有東西：預設選第一支遠征。畫面一次顯示一座城（由目前的 space 決定），
- * `cityId` 指定要看哪一座；沒指定或找不到就用第一座。
- */
-export function defaultSelection(town, cityId) {
-  const cities = town?.cities ?? [];
-  const city = (cityId ? cities.find((candidate) => candidate.cityId === cityId) : null) ?? cities[0] ?? null;
-  const first = city?.tiles?.reduce((latest, tile) =>
-    !latest || tile.generation > latest.generation ? tile : latest, null) ?? null;
-  return first
-    ? { kind: "expedition", cityId: city.cityId, rootSessionId: first.rootSessionId, generation: first.generation }
-    : null;
-}
-
-/**
- * 還原後的選取：城或格子已經不在（例如帳本換了一座城）就回到預設，
- * 不讓畫面停在一個永遠找不到的選取上。
- */
-export function resolveSelection(town, saved, cityId) {
-  if (saved && typeof saved === "object") {
-    const city = (town?.cities ?? []).find((candidate) => candidate.cityId === saved.cityId) ?? null;
-    if (city) {
-      if (saved.kind === "expedition") {
-        const candidates = city.tiles.filter((tile) => tile.rootSessionId === saved.rootSessionId);
-        const selected = candidates.find((tile) => tile.generation === saved.generation) ??
-          candidates.reduce((latest, tile) => !latest || tile.generation > latest.generation ? tile : latest, null);
-        if (selected) {
-          return {
-            kind: "expedition",
-            cityId: city.cityId,
-            rootSessionId: saved.rootSessionId,
-            generation: selected.generation,
-          };
-        }
-      }
-      if (saved.kind === "tile" && Number.isInteger(saved.x) && Number.isInteger(saved.y)) {
-        return { kind: "tile", cityId: city.cityId, x: saved.x, y: saved.y };
-      }
-    }
-  }
-  return defaultSelection(town, cityId ?? saved?.cityId);
 }
 
 export function serializeUi(ui) {

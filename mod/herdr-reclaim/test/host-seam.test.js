@@ -7,32 +7,30 @@
 //
 // 這裡用一個行為相同的假 host 逼出這個接縫：帳本只認 CasConflict，其他錯誤原樣往上丟。
 import { describe, expect, test } from "bun:test";
-import { bfsNextTile } from "../core/grid.js";
 import { CasConflict, CityLedger } from "../core/ledger.js";
 import { hostIo } from "../core/host-io.js";
-import { AT } from "../scenarios/first-expedition.js";
+import { workYieldOf } from "../core/rules.js";
 
 const HOST_CONFLICT =
   "`herdr.writeTextFile`: The file changed outside Herdr. Reload before saving; your draft is still here.";
 const HOST_PERMISSION = "`herdr.writeTextFile`: Operation not permitted (os error 1)";
 
+const AT = 1_800_000_000_000;
 const cityIdOf = (name) => `/reclaim/${name}`;
-const expeditionOp = (state, sessionId, cityId) => {
-  const taken = new Set(state.tiles.filter((tile) => tile.cityId === cityId).map((tile) => `${tile.x},${tile.y}`));
-  const spot = bfsNextTile((candidate) => taken.has(`${candidate.x},${candidate.y}`));
+
+/** 一筆基本收入：一份有效工作（10k token）換一份建材，來源鍵讓兩筆收入互不重複。 */
+function incomeOp(state, source, cityId) {
+  const tokens = 10_000;
   return {
-    opId: `expedition:${cityId}:${sessionId}:1`,
-    kind: "expedition",
+    opId: `income:${cityId}:${source}`,
+    kind: "income",
     at: AT,
     cityId,
-    rootSessionId: sessionId,
-    generation: 1,
-    x: spot.x,
-    y: spot.y,
-    cli: "omp",
-    repo: { commonDir: cityId, checkout: cityId },
+    tokens,
+    sources: [source],
+    resources: workYieldOf(Number(state.work.tokens ?? 0) + tokens),
   };
-};
+}
 
 /** 行為與 herdr 的檔案 API 相同的假 host（記憶體檔案系統）。 */
 function fakeHost() {
@@ -110,16 +108,15 @@ describe("host 接縫：真實 host 的 CAS 衝突", () => {
     const a = await new CityLedger({ io, dir, cityId }).open();
     const b = await new CityLedger({ io, dir, cityId }).open();
     const results = await Promise.all([
-      a.submit((state) => expeditionOp(state, "sess-a", cityId)),
-      b.submit((state) => expeditionOp(state, "sess-b", cityId)),
+      a.submit((state) => incomeOp(state, "sess-a", cityId)),
+      b.submit((state) => incomeOp(state, "sess-b", cityId)),
     ]);
 
     expect(results.map((result) => result.status)).toEqual(["applied", "applied"]);
     const state = await a.state();
-    expect(state.tiles).toHaveLength(2);
-    expect(new Set(state.tiles.map((tile) => `${tile.x},${tile.y}`))).toEqual(new Set(["0,-1", "1,-1"]));
-    const appends = [...host.files.values()].join("\n").trim().split("\n").filter((line) => line.includes("expedition"));
-    expect(appends).toHaveLength(2); // 沒有重複附加
+    expect(state.claims.size).toBe(2); // 兩筆來源都入帳，沒有重複附加
+    const appends = [...host.files.values()].join("\n").trim().split("\n").filter((line) => line.includes('"kind":"income"'));
+    expect(appends).toHaveLength(2);
   });
 
   test("帳本的附加遇到非衝突錯誤時原樣丟出（畫面才能說讀取失敗）", async () => {
@@ -130,7 +127,7 @@ describe("host 接縫：真實 host 的 CAS 衝突", () => {
     const ledger = await new CityLedger({ io, dir, cityId }).open();
     host.failures.set(`${dir}/journal/0.json`, { message: HOST_PERMISSION, onlyUpdates: true });
 
-    await expect(ledger.submit((state) => expeditionOp(state, "sess-a", cityId))).rejects.toThrow(/Operation not permitted/);
-    expect((await ledger.state()).tiles).toHaveLength(0);
+    await expect(ledger.submit((state) => incomeOp(state, "sess-a", cityId))).rejects.toThrow(/Operation not permitted/);
+    expect((await ledger.state()).claims.size).toBe(0);
   });
 });

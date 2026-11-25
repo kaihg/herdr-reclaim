@@ -1,4 +1,4 @@
-// 城帳本：append-only journal + CAS + checkpoint（proposal §13.1，ticket #3／#4）。
+// 共用城市的帳本：append-only journal + CAS + checkpoint（proposal §13.1，ticket #3／#4）。
 //
 // 這一層是純 JS：所有檔案 I/O 都走呼叫端給的 `io`（`read`／`write` 兩個非同步函式）。
 //
@@ -13,8 +13,7 @@
 //   journal/<n>.json                ndjson；每段 ≤ limit，滿了就封段換下一段
 //   blobs/<hash>.json               內容檔（core/blobs.js）；超過上限的內容切塊＋多層 manifest
 //   checkpoints/<seq>/manifest.json 小型索引；衍生狀態放在同層的其他檔案
-//   checkpoints/<seq>/ops|claims|expeditions|activities/   可延長前綴的雜湊分頁（core/pages.js）
-//   checkpoints/<seq>/chunk-index/ + chunks/<cx>_<cy>.json 座標分塊（32×32 格）
+//   checkpoints/<seq>/ops|claims|activities/   可延長前綴的雜湊分頁（core/pages.js）
 //   acks/<sessionId>/<epoch>.json   adapter 的 ack；journal 成功之後才寫
 //
 // **沒有任何 listdir**：herdr 的 mod 只有 readTextFile／writeTextFile，所以走訪一律靠
@@ -23,24 +22,22 @@
 //
 // 唯一完成依據是 journal entry：只有內容檔、沒有 entry 的操作不算完成（§13.1）。
 //
-// **這一票的語意邊界**：帳本只做「操作怎麼落帳、怎麼重播、怎麼查」。
-//   - 收成的**點數與資源向量由 entry 自己帶**（§7.3 的規則屬於收成票）。帳本不會自己發明
-//     一個固定值——S3 spike 的 `applyEntry()` 寫死 +100 就是這一條的反例。
-//   - 土地生命週期（撤回／封存／重新派遣的條件）屬於 #7；這一票只提供 generation 的身份
-//     與「一筆操作指定的 generation 必須是這支遠征的現役 generation」這個前提檢查。
+// **這一版的語意邊界**（#22）：帳本只服務共用城市，entry kind 只有工作啟用邊界、收入、
+// 成果收成、建設目標、開工、完工與活動合併。收成的資源向量由 entry 自己帶（§7.3），
+// 帳本不會自己發明數字。舊版各 repo 城的遠征／收成／研究／市集 entry 已移除，程式不再
+// 讀寫 `cities/`（使用者的舊目錄留在磁碟上，不遷移）。
 import { BlobStore } from "./blobs.js";
 import { byteLen, canonicalJson, hashText } from "./bytes.js";
 import { casWrite, rejectUnlessConflict } from "./cas.js";
 import { PrefixIndex } from "./pages.js";
-import { ACHIEVEMENT_YIELD, BOOST_POINTS_PER_PARCHMENT, CITY_BUILDINGS, CLEAR_POINTS, RECIPES, RESEARCH_TOKENS_PER_PARCHMENT, RESOURCES, RULES_VERSION, LEGACY_TRADE_GIVE, WORK_TOKENS_PER_UNIT, affordable, tradeTerms, workYieldOf } from "./rules.js";
+import { ACHIEVEMENT_YIELD, CITY_BUILDINGS, RESOURCES, RULES_VERSION, WORK_TOKENS_PER_UNIT, affordable, workYieldOf } from "./rules.js";
 import { siteCheck } from "./city-map.js";
-import { historyRecordOf } from "./history.js";
 
 export { byteLen, hashText };
 
 /** 帳本目錄格式的版本（head.json 的 schemaVersion）。 */
 export const SCHEMA = 2;
-/** 活動紀錄的格式版本：`core/town.js` 的重播就是認這個號碼。 */
+/** 活動紀錄的格式版本：帳本保存的那一份就是認這個號碼。 */
 export const ACTIVITY_SCHEMA = 1;
 /** 規則表版本（core/rules.js）：每一筆 entry 都存當時的版本（§8.2）。 */
 export { RULES_VERSION };
@@ -50,9 +47,6 @@ export const SEGMENT_LIMIT = 256 * 1024;
 
 /** 每段預留封段行的空間，讓「封段」一定還在單段上限之內。 */
 export const SEAL_RESERVE = 96;
-
-/** §13.1：座標分塊的邊長（格）。 */
-export const CHUNK_SIDE = 32;
 
 /** 預設每幾筆 entry 就主動做一次 checkpoint（mod 開機時呼叫 `maybeCheckpoint`）。 */
 export const CHECKPOINT_EVERY = 512;
@@ -93,7 +87,6 @@ export class CrashAfterSeal extends Error {
   }
 }
 
-
 /**
  * checkpoint（衍生索引）不完整：manifest 欄位、頁面存在與否或筆數對不上。
  * 呼叫端要整份丟棄、從 journal 重建——缺頁不能當成「沒有資料」。
@@ -105,10 +98,6 @@ export class CheckpointIncomplete extends Error {
     this.seq = seq;
     this.reason = reason;
   }
-}
-/** 城的目錄名：cityId 是絕對路徑，不能直接當檔名。 */
-export function cityDir(baseDir, cityId) {
-  return `${baseDir}/cities/${hashText(cityId)}`;
 }
 
 /** 一個 journal 段的內容：entry 陣列，最後可能有一行封段標記。 */
@@ -132,10 +121,6 @@ export function parseSegment(text) {
   return { entries, sealed, sealSeq, sealNext };
 }
 
-/** 一格座標在這座城的身分（佔位用）。 */
-export const tileKey = (cityId, x, y) => `${cityId}@@${x},${y}`;
-/** 一支遠征的一個 generation 的身分（格子鍵要含 generation，重新派遣才不會撞到上一代）。 */
-export const tileId = (cityId, rootSessionId, generation) => `${cityId}@@${rootSessionId}@@${generation ?? 1}`;
 /** §7.3 的城級去重鍵：同一座城同一份成果只發一次。 */
 export const claimKey = (cityId, claim) => `${cityId}@@${claim}`;
 /**
@@ -144,18 +129,14 @@ export const claimKey = (cityId, claim) => `${cityId}@@${claim}`;
  */
 export const planKey = (plan) => `${plan.building}:${plan.x},${plan.y}:${plan.at}`;
 export const activityKey = (record) => `${record.sessionId}@@${record.writerEpoch ?? ""}`;
-/** 座標分塊的名字（32×32 格）。 */
-export const chunkName = (x, y) => `${Math.floor(x / CHUNK_SIDE)},${Math.floor(y / CHUNK_SIDE)}`;
 
 const zeroResources = () => Object.fromEntries(RESOURCES.map((key) => [key, 0]));
 
 /**
- * 空狀態。`tiles`／`activities` 的順序就是 journal 的附加順序，重播結果因此可重現。
- * `opSeqs`／`claims` 是索引（§13.2）；`currentGen` 是每支遠征的現役 generation。
- * `research.tokens` 是這座城還沒換成羊皮卷的研究進度（餘數，§7.4）；
+ * 空狀態。`activities` 的順序就是 journal 的附加順序，重播結果因此可重現；
+ * `opSeqs`／`claims` 是索引（§13.2）；
  * `work.tokens` 是共用城市（#23）還沒換成建材的有效工作進度（餘數）；`work.stockedAt` 是入庫
  * 建材裡最晚的那一筆的時間（#26：材料到齊不會早於它，開工從這裡起算）；
- * `market` 分開記錄市集轉入與轉出，跟 commit 的直接發放分開（§11）。
  * `plan` 是共用城市唯一的建設目標（#25）：建築、錨點與整片占地；沒有目標時是 null。
  * 開工之後（#26）多出 `startedAt`／`buildMs`／`completesAt`。`buildings` 是共用城市已完工的建築。
  */
@@ -164,43 +145,14 @@ export function emptyState(cityId) {
     cityId,
     rulesVersion: RULES_VERSION,
     lastSeq: -1,
-    tiles: [],
-    tileById: new Map(),
-    currentGen: new Map(),
-    taken: new Set(),
     activities: new Map(),
     opSeqs: new Map(),
     claims: new Map(),
     resources: zeroResources(),
-    research: { tokens: 0 },
     work: { tokens: 0, since: null, stockedAt: null },
     plan: null,
     buildings: [],
-    market: { in: zeroResources(), out: zeroResources() },
   };
-}
-
-/** 一格的總開墾點：自然工作、收成與加速分開保存，再加總（§10）。 */
-export function pointsOf(tile) {
-  return Number(tile?.workPoints ?? 0) + Number(tile?.harvestPoints ?? 0) + Number(tile?.boostPoints ?? 0);
-}
-
-/** 一格現在的階段；舊 entry 沒有 `landStage` 時由點數推得（§10）。 */
-export function stageOf(tile) {
-  return tile?.landStage ?? (pointsOf(tile) >= CLEAR_POINTS ? "cleared" : "reserved");
-}
-
-/** 開墾點一滿就把階段推進到已開墾；已撤回／已封存／已建不覆寫。 */
-function settleStage(tile) {
-  if (!tile.landStage && pointsOf(tile) >= CLEAR_POINTS) tile.landStage = "cleared";
-  return tile;
-}
-
-/** 操作指定的遠征 generation 必須是現役的那一代（#7 的身份規則）。 */
-function targetTile(state, op) {
-  const generation = op.generation ?? 1;
-  if (state.currentGen.get(`${op.cityId}@@${op.rootSessionId}`) !== generation) return null;
-  return state.tileById.get(tileId(op.cityId, op.rootSessionId, generation)) ?? null;
 }
 
 /** 實付資源必須就是規則表裡的那份配方，不能少扣或多扣（§7.6）。 */
@@ -209,17 +161,6 @@ function sameCosts(costs, recipe) {
   const expected = Object.entries(recipe ?? {});
   return entries.length === expected.length &&
     expected.every(([key, need]) => Number(costs[key]) === Number(need));
-}
-
-/** 把一格放進狀態（順序由呼叫端決定；`tiles` 的順序就是重播順序）。 */
-export function addTile(state, tile) {
-  state.tiles.push(tile);
-  state.tileById.set(tileId(tile.cityId, tile.rootSessionId, tile.generation), tile);
-  if (tile.landStage !== "withdrawn") state.taken.add(tileKey(tile.cityId, tile.x, tile.y));
-  const key = `${tile.cityId}@@${tile.rootSessionId}`;
-  const current = state.currentGen.get(key) ?? 0;
-  if ((tile.generation ?? 1) > current) state.currentGen.set(key, tile.generation ?? 1);
-  return tile;
 }
 
 /**
@@ -235,271 +176,12 @@ function stockUp(state, entry) {
 }
 
 /**
- * 每一種 operation 的套用與前提檢查。之後的票（#5／#6／#7／#8）在這裡加新的 kind，
- * entry 只要帶上自己的欄位即可，格式不用改。
+ * 每一種 operation 的套用與前提檢查。entry 只要帶上自己的欄位即可，格式不用改。
  */
-const MINUTE_MS = 60_000;
-
-/**
- * §6.1：只有 role=child 的 session 併進它的 parent；互動 fork 是**獨立的 root**，
- * 保留自己的格。這裡跟 `core/town.js` 的歸戶規則用同一套（每個 session 取 writerEpoch
- * 最小的那一筆 epoch 當身份），否則帳本說「沒開墾」而畫面說「已開墾」。
- */
-function rootLookup(activities) {
-  const byId = new Map();
-  const ordered = [...activities].sort((a, b) => a.sessionId === b.sessionId
-    ? String(a.writerEpoch ?? "").localeCompare(String(b.writerEpoch ?? ""))
-    : a.sessionId.localeCompare(b.sessionId));
-  for (const record of ordered) {
-    if (byId.has(record.sessionId)) continue;
-    byId.set(record.sessionId, { role: record.role ?? "root", parentSessionId: record.parentSessionId ?? null });
-  }
-  return (sessionId) => {
-    const seen = new Set();
-    let current = byId.get(sessionId);
-    let root = sessionId;
-    while (current?.role === "child" && current.parentSessionId && !seen.has(sessionId)) {
-      seen.add(sessionId);
-      sessionId = current.parentSessionId;
-      root = sessionId;
-      current = byId.get(sessionId);
-    }
-    return root;
-  };
-}
-
-/** Intervals clipped to a generation's activation window, then unioned. */
-function naturalWorkPoints(state, tile) {
-  const rootOf = rootLookup(state.activities.values());
-  const intervals = [];
-  for (const record of state.activities.values()) {
-    if (rootOf(record.sessionId) !== tile.rootSessionId) continue;
-    let cityId = null;
-    let opened = null;
-    for (const event of record.events ?? []) {
-      if (event.kind === "visit_start") cityId = event.visit?.commonDir ?? null;
-      else if (event.kind === "visit_end") {
-        if (opened !== null && cityId === tile.cityId) intervals.push([opened, event.at]);
-        opened = null;
-        cityId = null;
-      } else if (event.kind === "interval_open") opened = event.at;
-      else if (event.kind === "heartbeat" && opened !== null) {
-        if (cityId === tile.cityId) intervals.push([opened, event.at]);
-        opened = event.at;
-      } else if (event.kind === "interval_close" && opened !== null) {
-        if (cityId === tile.cityId) intervals.push([opened, event.at]);
-        opened = null;
-      }
-    }
-  }
-  const start = Number(tile.activatedAt ?? 0);
-  const end = tile.deactivatedAt == null ? Infinity : Number(tile.deactivatedAt);
-  const clipped = intervals
-    .map(([a, b]) => [Math.max(a, start), Math.min(b, end)])
-    .filter(([a, b]) => b > a)
-    .sort((a, b) => a[0] - b[0]);
-  let total = 0;
-  let from = null;
-  let to = null;
-  for (const [a, b] of clipped) {
-    if (from === null) [from, to] = [a, b];
-    else if (a > to) {
-      total += to - from;
-      [from, to] = [a, b];
-    } else to = Math.max(to, b);
-  }
-  if (from !== null) total += to - from;
-  return Math.floor(total / MINUTE_MS);
-}
-
-export function generationAt(state, rootSessionId, at) {
-  const timestamp = Number(at);
-  return state.tiles.find((tile) =>
-    tile.rootSessionId === rootSessionId &&
-    Number(tile.activatedAt ?? 0) <= timestamp &&
-    (tile.deactivatedAt == null || timestamp < Number(tile.deactivatedAt))
-  ) ?? null;
-}
-
 export const KINDS = {
   /**
-   * 遠征取得土地（§4 的自動選地）：座標由呼叫端在 `make` 裡用 BFS 算出來；
-   * 前提是那一格還空著、這支遠征的這一代還沒有格、而且 generation 是現役的下一個
-   * （重新派遣建立的下一代，#7 的規則）。
-   */
-  expedition: {
-    precheck(state, op) {
-      const generation = op.generation ?? 1;
-      if (state.tileById.has(tileId(op.cityId, op.rootSessionId, generation))) return "tile_exists";
-      if (state.taken.has(tileKey(op.cityId, op.x, op.y))) return "tile_taken";
-      const current = state.currentGen.get(`${op.cityId}@@${op.rootSessionId}`);
-      if (current === undefined ? generation !== 1 : generation !== current + 1) return "bad_generation";
-      if (current !== undefined) {
-        const previous = state.tileById.get(tileId(op.cityId, op.rootSessionId, current));
-        if (!previous || !["withdrawn", "archived"].includes(previous.landStage)) return "generation_not_released";
-      }
-      return null;
-    },
-    apply(state, entry) {
-      const tile = addTile(state, {
-        seq: entry.journalSeq,
-        cityId: entry.cityId,
-        rootSessionId: entry.rootSessionId,
-        generation: entry.generation ?? 1,
-        x: entry.x,
-        y: entry.y,
-        activatedAt: Number(entry.activatedAt ?? entry.at ?? 0),
-        deactivatedAt: null,
-        landStage: null,
-        workPoints: 0,
-        harvestPoints: 0,
-        boostPoints: 0,
-        harvestedPaths: [],
-        harvests: [],
-        cli: entry.cli ?? null,
-        repo: entry.repo ?? null,
-        harvested: false,
-      });
-      tile.workPoints = naturalWorkPoints(state, tile);
-      settleStage(tile);
-    },
-  },
-  landAction: {
-    precheck(state, op) {
-      const generation = op.generation ?? 1;
-      if (state.currentGen.get(`${op.cityId}@@${op.rootSessionId}`) !== generation) return "stale_generation";
-      const tile = state.tileById.get(tileId(op.cityId, op.rootSessionId, generation));
-      if (!tile) return "no_expedition";
-      if (tile.harvested) return "has_commit_harvest";
-      const stage = stageOf(tile);
-      if (op.action === "withdraw" && stage !== "reserved") return "not_withdrawable";
-      if (op.action === "archive" && stage !== "cleared") return "not_archivable";
-      if (op.action !== "withdraw" && op.action !== "archive") return "invalid_action";
-      return null;
-    },
-    apply(state, entry) {
-      const generation = entry.generation ?? 1;
-      const tile = state.tileById.get(tileId(entry.cityId, entry.rootSessionId, generation));
-      tile.landStage = entry.action === "withdraw" ? "withdrawn" : "archived";
-      tile.deactivatedAt = Number(entry.at);
-      if (entry.action === "withdraw") state.taken.delete(tileKey(entry.cityId, tile.x, tile.y));
-    },
-  },
-  /**
-   * 蓋房（§7.6、§8.1）：只列庫存足以支付完整配方的建築；一次扣完整份配方，
-   * 並把配方、實付資源與當時的規則版本存進那一格。已建好的格子不能再蓋。
-   * 蓋房不影響收成：已建的格子之後 resume 又有新 commit，收成照常發生（§17.1 情境 7）。
-   */
-  build: {
-    precheck(state, op) {
-      if (op.cityId !== state.cityId) return "wrong_city";
-      const tile = targetTile(state, op);
-      if (!tile) return "stale_generation";
-      const stage = stageOf(tile);
-      if (stage === "withdrawn" || stage === "archived") return "inactive_expedition";
-      if (stage === "built") return "already_built";
-      if (stage !== "cleared") return "not_cleared";
-      const recipe = RECIPES[op.recipe];
-      if (!recipe) return "unknown_recipe";
-      if (!sameCosts(op.costs, recipe.costs)) return "recipe_mismatch";
-      if (!affordable(recipe.costs, state.resources)) return "insufficient_resources";
-      return null;
-    },
-    apply(state, entry) {
-      const tile = targetTile(state, entry);
-      tile.landStage = "built";
-      tile.building = { recipe: entry.recipe, costs: entry.costs, rulesVersion: entry.rulesVersion };
-      for (const [key, amount] of Object.entries(entry.costs ?? {})) {
-        state.resources[key] = Number(state.resources[key] ?? 0) - Number(amount);
-      }
-    },
-  },
-  /**
-   * 加速（§7.6）：目標是「遠征身份 + generation」，不是座標。同城、現役、沒撤回或封存、
-   * 還佔著原本的座標、未滿 100 點、庫存足夠 —— 只要有一項不符就整筆不扣卷、不加點。
-   * 超過 100 的部分不退還，也不會轉到其他格。
-   */
-  boost: {
-    precheck(state, op) {
-      if (op.cityId !== state.cityId) return "wrong_city";
-      const tile = targetTile(state, op);
-      if (!tile) return "stale_generation";
-      const stage = stageOf(tile);
-      if (stage === "withdrawn" || stage === "archived") return "inactive_expedition";
-      if (!state.taken.has(tileKey(op.cityId, tile.x, tile.y))) return "tile_released";
-      const scrolls = Number(op.scrolls);
-      if (!Number.isInteger(scrolls) || scrolls <= 0) return "invalid_scrolls";
-      if (pointsOf(tile) >= CLEAR_POINTS) return "already_cleared";
-      if (Number(state.resources.parchment ?? 0) < scrolls) return "insufficient_parchment";
-      return null;
-    },
-    apply(state, entry) {
-      const tile = targetTile(state, entry);
-      const scrolls = Number(entry.scrolls);
-      tile.boostPoints = Number(tile.boostPoints ?? 0) + scrolls * BOOST_POINTS_PER_PARCHMENT;
-      tile.scrollsUsed = Number(tile.scrollsUsed ?? 0) + scrolls;
-      state.resources.parchment = Number(state.resources.parchment ?? 0) - scrolls;
-      settleStage(tile);
-    },
-  },
-  /**
-   * 市集（§7.6、§11）：同城任兩種資源依配對的費率交換（見 rules.js 的 tradeTerms），一次一筆 CAS。
-   * 庫存不足時整筆不執行，
-   * 不會產生部分交易。市集轉入與轉出另外記，跟 commit 的直接發放分開（§11）。
-   */
-  trade: {
-    precheck(state, op) {
-      if (op.cityId !== state.cityId) return "wrong_city";
-      const amount = Number(op.amount);
-      const invalid = !RESOURCES.includes(op.from) || !RESOURCES.includes(op.to) || op.from === op.to ||
-        !Number.isInteger(amount) || amount <= 0;
-      if (invalid) return "invalid_trade";
-      const terms = tradeTerms(op.from, op.to);
-      if (op.give !== terms.give || op.get !== terms.get) return "rate_mismatch";
-      if (Number(state.resources[op.from] ?? 0) < amount * terms.give) return "insufficient_resources";
-      return null;
-    },
-    apply(state, entry) {
-      const amount = Number(entry.amount);
-      // 紀錄裡存了當時的費率；規則版本 2 以前的紀錄沒有，一律是 3 換 1。
-      const spent = amount * Number(entry.give ?? LEGACY_TRADE_GIVE);
-      const received = amount * Number(entry.get ?? 1);
-      state.resources[entry.from] = Number(state.resources[entry.from] ?? 0) - spent;
-      state.resources[entry.to] = Number(state.resources[entry.to] ?? 0) + received;
-      state.market.out[entry.from] = Number(state.market.out[entry.from] ?? 0) + spent;
-      state.market.in[entry.to] = Number(state.market.in[entry.to] ?? 0) + received;
-    },
-  },
-  /**
-   * 研究（§7.4）：沒有可歸屬 commit 的回合，把 non-cache input + output token 加進這座城的
-   * 計量器；每滿 100,000 換 1 張羊皮卷，餘數按城保留。operation ID 由回合身份決定，
-   * 重播不會再次發放；已經落帳的進度與已發的羊皮卷不會因為來源晚到而倒扣。
-   */
-  research: {
-    precheck(state, op) {
-      if (!(Number.isInteger(Number(op.tokens)) && Number(op.tokens) > 0)) return "invalid_research";
-      // §5.3：這個回合要與這支遠征某一代**現役**的時間窗重疊（跟 town.js 的工時一樣把
-      // 區間裁到時間窗）；完全落在撤回／封存空窗裡的回合不算。
-      const to = Number(op.at);
-      const from = Number(op.openAt ?? op.at);
-      const active = state.tiles.some((tile) =>
-        tile.rootSessionId === op.rootSessionId &&
-        Number(tile.activatedAt ?? 0) <= to &&
-        from <= (tile.deactivatedAt == null ? Infinity : Number(tile.deactivatedAt)));
-      return active ? null : "outside_generation";
-    },
-    apply(state, entry) {
-      const tokens = Number(entry.tokens);
-      const total = Number(state.research.tokens ?? 0) + tokens;
-      state.research.tokens = total % RESEARCH_TOKENS_PER_PARCHMENT;
-      const scrolls = Math.floor(total / RESEARCH_TOKENS_PER_PARCHMENT);
-      if (scrolls > 0) state.resources.parchment = Number(state.resources.parchment ?? 0) + scrolls;
-    },
-  },
-
-  /**
-   * 共用城市的啟用邊界（#23）：只寫一次，記下第一次啟用的時間。之前已結束的舊城歷史不重發，
-   * 舊資料的轉換另行規劃（#22）。時間跟著 entry 存進 journal，重播不會改變。
+   * 共用城市的啟用邊界（#23）：只寫一次，記下第一次啟用的時間。之後才結束的工作回合才入帳；
+   * 時間跟著 entry 存進 journal，重播不會改變。
    */
   workStart: {
     precheck(state, op) {
@@ -517,7 +199,7 @@ export const KINDS = {
    *
    * entry 自己帶收成的資源向量（調整費率不改寫已落帳的結果）；`sources` 是這個回合用掉的
    * 用量來源鍵，寫進城級 claim 索引——兩個 space 或恢復對話後的另一個 epoch 重送同一份
-   * 工作時，整筆不重複入帳。舊版各城帳本沒有這種 entry，重播不受影響。
+   * 工作時，整筆不重複入帳。
    */
   income: {
     precheck(state, op) {
@@ -698,63 +380,7 @@ export const KINDS = {
         lastEventSeq: Math.max(current?.lastEventSeq ?? -1, entry.lastEventSeq ?? -1),
         events,
       });
-      for (const tile of state.tiles) {
-        if (tile.landStage) continue;
-        tile.workPoints = naturalWorkPoints(state, tile);
-        settleStage(tile);
-      }
     },
-  },
-  /**
-   * 收成（§7.3）：entry 自己帶 claim（城級去重）、資源向量與開墾點。
-   * **前提包含 generation 時間窗**：即使目前已是新一代，晚到收成仍只能落到事件當時
-   * 啟用的舊 generation；不會把舊 commit 加進新格。
-   */
-  harvest: {
-    precheck(state, op) {
-      const generation = op.generation ?? 1;
-      const tile = state.tileById.get(tileId(op.cityId, op.rootSessionId, generation));
-      if (!tile) return "no_expedition";
-      if (generationAt(state, op.rootSessionId, op.at)?.generation !== generation) return "outside_generation";
-      const claims = op.claims ?? (op.claim ? [op.claim] : (op.blobs?.paths ?? []).map((unit) => unit.claim).filter(Boolean));
-      if (claims.some((claim) => state.claims.has(claimKey(op.cityId, claim)))) return "claim_exists";
-      return null;
-    },
-    apply(state, entry, content) {
-      const tile = state.tileById.get(tileId(entry.cityId, entry.rootSessionId, entry.generation));
-      if (!tile) throw new Error(`收成找不到遠征：${entry.rootSessionId}@${entry.generation}`);
-      const units = content?.paths ?? [];
-      const paths = entry.paths ?? units.map((unit) => unit.path).filter(Boolean);
-      tile.harvestPoints = (tile.harvestPoints ?? 0) + Number(entry.points ?? 0);
-      tile.harvestedPaths = [...new Set([...(tile.harvestedPaths ?? []), ...paths])];
-      tile.harvested = tile.harvested || paths.length > 0;
-      settleStage(tile);
-      for (const [name, amount] of Object.entries(entry.resources ?? {})) {
-        state.resources[name] = (state.resources[name] ?? 0) + Number(amount);
-      }
-      const claims = entry.claims ?? (entry.claim ? [entry.claim] : units.map((unit) => unit.claim).filter(Boolean));
-      for (const claim of claims) state.claims.set(claimKey(entry.cityId, claim), entry.journalSeq);
-      tile.harvests ??= [];
-      tile.harvests.push({
-        sha: content?.sha ?? entry.sha ?? null,
-        subject: entry.subject ?? content?.subject ?? null,
-        at: entry.at,
-        claims: claims.slice(0, 64),
-        claimCount: claims.length,
-        paths: paths.length <= 64 ? paths : paths.slice(0, 64),
-        pathCount: paths.length,
-        resources: { ...(entry.resources ?? {}) },
-        points: Number(entry.points ?? 0),
-        rulesVersion: entry.rulesVersion ?? null,
-      });
-    },
-  },
-  /** Commit evidence is journaled even when no trustworthy session source is available. */
-  commit: {
-    precheck(_state, op) {
-      return op.sha && typeof op.reason === "string" ? null : "invalid_commit_record";
-    },
-    apply() {},
   },
 };
 
@@ -771,10 +397,10 @@ export class CityLedger {
   /**
    * @param {object} options
    * @param {{ read(path: string): Promise<string|null>, write(path: string, text: string, expected: string|null): Promise<void> }} options.io
-   * @param {string} options.dir 這個城的目錄
-   * @param {string} options.cityId canonical git common dir
+   * @param {string} options.dir 這座城的帳本目錄
+   * @param {string} options.cityId 帳本身份（共用城市固定是 `shared`）
    * @param {number} [options.segmentLimit] 每個 journal 段的位元組上限
-   * @param {number} [options.pageLimit] 內容檔、索引頁與座標分塊的上限（預設同 segmentLimit）
+   * @param {number} [options.pageLimit] 內容檔與索引頁的上限（預設同 segmentLimit）
    */
   constructor({ io, dir, cityId, segmentLimit = SEGMENT_LIMIT, pageLimit, rulesVersion = RULES_VERSION }) {
     if (!io || typeof io.read !== "function" || typeof io.write !== "function") {
@@ -807,7 +433,7 @@ export class CityLedger {
     return `${this.dir}/acks/${sessionId}/${writerEpoch}.json`;
   }
 
-  /** 第一次開這個城時建立 head 與第 0 段；已經有就沿用。 */
+  /** 第一次開這個帳本時建立 head 與第 0 段；已經有就沿用。 */
   async open() {
     const headText = await this.io.read(this.headPath());
     if (headText === null) {
@@ -960,8 +586,8 @@ export class CityLedger {
 
   /**
    * 提交一筆操作（§13.1 的提交流程）：重建狀態 → `make(state)` 產生 op → 檢查前提
-   * （含 operation ID 去重與 generation）→ 先寫內容檔 → CAS 附加 entry。
-   * CAS 失敗或有別人先封段就重讀、重新 `make`（例如重新選地）再試。
+   * （含 operation ID 去重）→ 先寫內容檔 → CAS 附加 entry。
+   * CAS 失敗或有別人先封段就重讀、重新 `make` 再試。
    *
    * `make` 回 null 代表沒有事要做。回傳 `{ status, journalSeq?, reason?, attempts }`。
    */
@@ -1073,43 +699,9 @@ export class CityLedger {
     const built = {};
     built.ops = await index("ops").build([...state.opSeqs]);
     built.claims = await index("claims").build([...state.claims]);
-    // 格子紀錄整份存進索引（不是挑欄位），所以之後的票加欄位時，
-    // 「checkpoint 重播 == 完整 journal 重播」不會因為少抄一個欄位而失效。
-    built.expeditions = await index("expeditions").build(
-      await Promise.all(state.tiles.map(async (tile) => [
-        tileId(tile.cityId, tile.rootSessionId, tile.generation),
-        await this.packRecord(tile),
-      ])),
-    );
     built.activities = await index("activities").build(
       await Promise.all([...state.activities].map(async ([key, record]) => [key, await this.packRecord(record)])),
     );
-    const historyEntries = [];
-    for (const part of await this.scanSegments()) {
-      for (const entry of part.entries) {
-        historyEntries.push([String(entry.journalSeq).padStart(12, "0"), historyRecordOf(entry)]);
-      }
-    }
-    built.history = await index("history").build(historyEntries);
-
-    // 座標分塊：每塊 32×32 格，只記「畫得出來、佔得住」的格子鍵（遠征資料在 expeditions
-    // 索引）。已撤回／已封存的格子只是同一格的歷史，不進分塊——同一個座標同時只會有一格
-    // 佔著，所以每一塊的鍵數有界（≤ 32×32），十萬次撤回重用同一格也不會把分塊撐爆。
-    // 分塊的摘要跟著它的鍵數記在 chunk-index 的值裡（分頁索引不隨格數長成一個大檔）。
-    const chunks = new Map();
-    for (const tile of state.tiles) {
-      if (tile.landStage === "withdrawn" || tile.landStage === "archived") continue;
-      const name = chunkName(tile.x, tile.y);
-      if (!chunks.has(name)) chunks.set(name, []);
-      chunks.get(name).push(`${tile.rootSessionId}@@${tile.generation}`);
-    }
-    for (const [name, ids] of chunks) {
-      const text = JSON.stringify({ t: "chunk", name, tiles: ids });
-      if (byteLen(text) >= this.pageLimit) throw new Error(`座標分塊超過上限：${name}`);
-      await casWrite(this.io, `${dir}/chunks/${name}.json`, text);
-      chunks.set(name, { n: ids.length, d: hashText(text) });
-    }
-    built["chunk-index"] = await index("chunk-index").build([...chunks]);
 
     const manifest = {
       t: "ckpt",
@@ -1119,21 +711,17 @@ export class CityLedger {
       seq,
       segment,
       resources: state.resources,
-      research: state.research,
       work: state.work,
       plan: state.plan,
       // 共用城市的建築會一直增加：清單放內容檔（可切塊），manifest 只留固定長度的雜湊；
-      // 沒有建築（舊版各城一律如此）就不寫內容檔。
+      // 沒有建築時就不寫內容檔。
       buildings: state.buildings.length > 0 ? (await this.blobs.putValue(state.buildings)).hash : null,
-      market: state.market,
-      // 每一組索引的內容摘要（固定 6 個 16 進位字串；不隨資料量成長）。
+      // 每一組索引的內容摘要（固定幾個 16 進位字串；不隨資料量成長）。
       digests: Object.fromEntries(Object.entries(built).map(([part, result]) => [part, result.digest])),
       counts: {
-        tiles: state.tiles.length,
         activities: state.activities.size,
         ops: state.opSeqs.size,
         claims: state.claims.size,
-        chunks: chunks.size,
       },
     };
     const manifestText = JSON.stringify(manifest);
@@ -1166,10 +754,6 @@ export class CityLedger {
     return packed?.inline ?? null;
   }
 
-  async unpackExpeditionRecord(record) {
-    return typeof record === "string" ? JSON.parse(record) : this.unpackRecord(record);
-  }
-
   /**
    * checkpoint → 狀態（不含 checkpoint 之後的 journal）。
    *
@@ -1197,36 +781,31 @@ export class CityLedger {
     }
     const counts = manifest?.counts;
     const digests = manifest?.digests;
-    const parts = ["ops", "claims", "expeditions", "activities", "history", "chunk-index"];
+    const parts = ["ops", "claims", "activities"];
     const shaped = manifest?.t === "ckpt" && manifest.schema === SCHEMA && Number.isInteger(manifest.seq) &&
       manifest.seq === seq && Number.isInteger(manifest.segment) &&
-      counts && ["tiles", "activities", "ops", "claims", "chunks"].every((key) => Number.isInteger(counts[key])) &&
+      counts && ["activities", "ops", "claims"].every((key) => Number.isInteger(counts[key])) &&
       digests && parts.every((part) => typeof digests[part] === "string" && digests[part] !== "");
     if (!shaped) throw incomplete("manifest 欄位不完整");
     const index = (part) => new PrefixIndex({ io: this.io, dir: `${dir}/${part}`, limit: this.pageLimit });
     try {
       const read = {};
-      for (const part of ["ops", "claims", "expeditions", "activities", "chunk-index"]) {
+      for (const part of parts) {
         read[part] = await index(part).scan({ strict: true });
         if (read[part].digest !== digests[part]) throw new Error(`索引內容與摘要不符：${part}`);
       }
       const mismatch = read.ops.entries.size !== counts.ops || read.claims.entries.size !== counts.claims ||
-        read.expeditions.entries.size !== counts.tiles || read.activities.entries.size !== counts.activities ||
-        read["chunk-index"].entries.size !== counts.chunks;
-      if (mismatch) throw new Error(`筆數不符（ops ${read.ops.entries.size}/${counts.ops}、claims ${read.claims.entries.size}/${counts.claims}、expeditions ${read.expeditions.entries.size}/${counts.tiles}、activities ${read.activities.entries.size}/${counts.activities}、chunks ${read["chunk-index"].entries.size}/${counts.chunks}）`);
+        read.activities.entries.size !== counts.activities;
+      if (mismatch) throw new Error(`筆數不符（ops ${read.ops.entries.size}/${counts.ops}、claims ${read.claims.entries.size}/${counts.claims}、activities ${read.activities.entries.size}/${counts.activities}）`);
       const state = emptyState(this.cityId);
       state.lastSeq = manifest.seq;
-      for (const [, record] of read.expeditions.entries) addTile(state, await this.unpackExpeditionRecord(record));
-      state.tiles.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
       for (const [key, value] of read.ops.entries) state.opSeqs.set(key, value);
       for (const [key, value] of read.claims.entries) state.claims.set(key, value);
       for (const [key, packed] of read.activities.entries) state.activities.set(key, await this.unpackRecord(packed));
       state.resources = manifest.resources ?? state.resources;
-      state.research = manifest.research ?? state.research;
       state.work = manifest.work ?? state.work;
       state.plan = manifest.plan ?? state.plan;
       state.buildings = manifest.buildings ? await this.blobs.getValue(manifest.buildings) : state.buildings;
-      state.market = manifest.market ?? state.market;
       return { state, segment: manifest.segment };
     } catch (error) {
       // 內容不符、頁面壞掉、內容檔（blob）對不上雜湊…都是「這份 checkpoint 不可信」。
@@ -1251,171 +830,6 @@ export class CityLedger {
       rejectUnlessConflict(error); // head 只是快取：寫不進去也不影響這次的重建
     }
     if (this.cache) this.cache.head = next;
-  }
-
-  /**
-   * 最新的 checkpoint（有的話）：目錄、manifest 與代號。manifest 壞掉、或被改過（內容雜湊
-   * 與 head 記下的根摘要不符）就當沒有——查詢端會退回「完整重播」那條路。
-   */
-  async checkpointInfo() {
-    const { head } = await this.head();
-    if (!head.checkpoint || head.checkpoint < 0) return null;
-    const dir = this.checkpointDir(head.checkpoint);
-    const text = await this.io.read(`${dir}/manifest.json`);
-    if (text === null) return null;
-    if (typeof head.checkpointDigest !== "string" || hashText(text) !== head.checkpointDigest) return null;
-    let manifest;
-    try {
-      manifest = JSON.parse(text);
-    } catch {
-      return null;
-    }
-    if (manifest?.t !== "ckpt" || manifest.seq !== head.checkpoint) return null;
-    return { seq: head.checkpoint, dir, manifest };
-  }
-
-  // ---- 查詢介面（#9 接手用；不做畫面） ------------------------------------------------
-
-  /**
-   * operation ID → journalSeq。有 checkpoint 就查它的分頁，沒有（或 checkpoint 之後才
-   * 寫入）就查「checkpoint + 後續 journal」重播出來的記憶體索引。
-   */
-  async lookupOp(opId) {
-    const info = await this.checkpointInfo();
-    if (info) {
-      const hit = await new PrefixIndex({ io: this.io, dir: `${info.dir}/ops`, limit: this.pageLimit }).get(opId);
-      if (hit !== null) return { seq: hit, source: "checkpoint" };
-    }
-    const seq = (await this.state()).opSeqs.get(opId);
-    return seq === undefined ? null : { seq, source: "journal" };
-  }
-
-  /** claim（城級去重鍵）→ journalSeq。 */
-  async lookupClaim(claim) {
-    const key = claimKey(this.cityId, claim);
-    const info = await this.checkpointInfo();
-    if (info) {
-      const hit = await new PrefixIndex({ io: this.io, dir: `${info.dir}/claims`, limit: this.pageLimit }).get(key);
-      if (hit !== null) return { seq: hit, source: "checkpoint" };
-    }
-    const seq = (await this.state()).claims.get(key);
-    return seq === undefined ? null : { seq, source: "journal" };
-  }
-
-  /** 一支遠征的一個 generation → 它的格子與流水號。 */
-  async lookupExpedition(rootSessionId, generation = 1) {
-    const id = tileId(this.cityId, rootSessionId, generation);
-    const info = await this.checkpointInfo();
-    if (info) {
-      const hit = await this.expeditionIndex(info.dir).get(id);
-      if (hit !== null) {
-        const tile = await this.unpackExpeditionRecord(hit);
-        return { tile, seq: tile.seq, source: "checkpoint" };
-      }
-    }
-    const found = (await this.state()).tileById.get(id);
-    return found ? { tile: found, seq: found.seq, source: "journal" } : null;
-  }
-
-  /**
-   * 一個座標分塊裡的格子（地圖用；32×32 格）：checkpoint 的分塊加上之後新增的。
-   *
-   * 分塊只列「畫得出來、佔得住」的格子（已撤回／已封存的格子是歷史，由 expeditions
-   * 索引查）。分塊自己壞掉（檔案不見、筆數跟 chunk-index 對不上、遠征頁缺了）時不能
-   * 當成「這一塊沒有格子」：把 checkpoint 丟掉、改用完整重播的狀態。
-   */
-  async tilesInChunk(x, y) {
-    const name = chunkName(x, y);
-    const info = await this.checkpointInfo();
-    const tiles = [];
-    let readable = true;
-    if (info) {
-      const listed = await new PrefixIndex({ io: this.io, dir: `${info.dir}/chunk-index`, limit: this.pageLimit }).get(name);
-      const text = await this.io.read(`${info.dir}/chunks/${name}.json`);
-      let keys = null;
-      try {
-        keys = text === null ? null : JSON.parse(text).tiles;
-      } catch {
-        keys = null;
-      }
-      // chunk-index 的值同時記著筆數與內容摘要：檔案不見、筆數不符、內容被改過都不可信。
-      const expected = listed && typeof listed === "object" && Number.isInteger(listed.n) && typeof listed.d === "string" ? listed : null;
-      readable = expected === null
-        ? keys === null && (listed === null || listed === undefined)
-        : Array.isArray(keys) && keys.length === expected.n && text !== null && hashText(text) === expected.d;
-      const index = this.expeditionIndex(info.dir);
-      for (const key of readable ? keys ?? [] : []) {
-        const [rootSessionId, generation] = key.split("@@");
-        const hit = await index.get(tileId(this.cityId, rootSessionId, Number(generation)));
-        if (hit === null) {
-          readable = false; // 遠征頁不見了：整塊分塊不可信
-          break;
-        }
-        tiles.push(await this.unpackExpeditionRecord(hit));
-      }
-      if (!readable) {
-        tiles.length = 0;
-        await this.discardCheckpoint();
-      }
-    }
-    // checkpoint 之後才落帳的格子也要在：查詢接點讀的是「checkpoint + 後續 journal」。
-    const seen = new Set(tiles.map((tile) => tileId(tile.cityId, tile.rootSessionId, tile.generation)));
-    for (const tile of (await this.state()).tiles) {
-      if (tile.landStage === "withdrawn" || tile.landStage === "archived") continue;
-      if (chunkName(tile.x, tile.y) !== name) continue;
-      const id = tileId(tile.cityId, tile.rootSessionId, tile.generation);
-      if (seen.has(id)) continue;
-      tiles.push(tile);
-    }
-    return tiles;
-  }
-
-  /** checkpoint 裡的遠征索引（key = tileId）。 */
-  expeditionIndex(dir) {
-    return new PrefixIndex({ io: this.io, dir: `${dir}/expeditions`, limit: this.pageLimit });
-  }
-
-  /** Read compact checkpoint records plus the bounded journal tail. */
-  async historyRecords() {
-    const info = await this.checkpointInfo();
-    const records = [];
-    let lastSeq = -1;
-    let from = 0;
-    if (info) {
-      let indexed = null;
-      try {
-        // 歷程索引也要驗內容摘要（它不在載入路徑上，只在面板查詢時讀）。
-        const scanned = await new PrefixIndex({ io: this.io, dir: `${info.dir}/history`, limit: this.pageLimit }).scan({ strict: true });
-        if (scanned.digest !== info.manifest.digests?.history) throw new Error("歷程索引內容與摘要不符");
-        indexed = scanned.entries;
-      } catch {
-        indexed = null; // 歷程索引缺頁：整份丟棄，從 journal 重建
-        await this.discardCheckpoint();
-      }
-      if (indexed) {
-        for (const record of indexed.values()) {
-          records.push(record);
-          lastSeq = Math.max(lastSeq, Number(record.seq));
-        }
-        from = Number(info.manifest.segment ?? 0);
-      }
-    }
-    for (const part of await this.scanSegments(from)) {
-      for (const entry of part.entries) {
-        if (entry.journalSeq > lastSeq) records.push(historyRecordOf(entry));
-      }
-    }
-    records.sort((a, b) => a.seq - b.seq);
-    return records;
-  }
-
-  /** Expedition history is indexed at checkpoint, not found by scanning the whole journal. */
-  async historyOf(rootSessionId, generation = 1) {
-    const located = await this.lookupExpedition(rootSessionId, generation);
-    const entries = (await this.historyRecords())
-      .filter((entry) => entry.rootSessionId === rootSessionId && (entry.generation ?? 1) === generation)
-      .map(({ seq, kind, at, content }) => ({ journalSeq: seq, kind, at, content }));
-    return { expedition: located?.tile ?? null, journalSeq: located?.seq ?? null, entries };
   }
 
   // ---- adapter 的 ack（§6.2） --------------------------------------------------------

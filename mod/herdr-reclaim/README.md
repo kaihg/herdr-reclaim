@@ -1,37 +1,47 @@
 # herdr-reclaim（mod）
 
-herdr 的開墾城鎮 mod。這個資料夾是 mod 本體：一個「遠征指揮桌」畫面（proposal §14.1 的 C 版），
-上方是城鎮庫存與主要行會，左邊是現役遠征，中央是 3/4 城市地圖，右邊是選取的遠征或格子的詳情。
+herdr 的開墾城鎮 mod。這個資料夾是 mod 本體：**一座共用城市**（#22 之後只剩這一個畫面）。
+上方是共用庫存、工作進度與唯一的建設目標，左邊是預定地與可選的建築（含自動收成的同意流程），
+中央是共用城市的地圖，右邊是選取格或整棟預覽的詳情。
+
+所有 repo、space 與 session 的工作都只當成同一座城的工作來源：不產生遠征格，也不讀寫
+`cities/` 下的舊帳本（舊資料留在使用者的磁碟上，不遷移）。
 
 | 檔案 | 內容 |
 |---|---|
-| `main.js` | 畫面：讀 OMP adapter 活動檔、寫入城帳本、從 journal 重建城鎮；監看新活動 |
+| `main.js` | 畫面：讀 adapter 活動檔、走正式載入路徑、選址與施工計時；監看新活動與額度排程 |
 | `../omp-extension/herdr-reclaim.ts` | OMP extension：按 session/writer epoch 寫活動事件、heartbeat、usage source key，讀 journal ack 後 compact |
-| `core/adapter.js` | 讀活動檔、分城及取得 repo facts（活動格式見 §6.1） |
-| `core/ledger.js` | 城帳本：append-only journal、CAS、內容檔、checkpoint、ack（§13.1，純 JS） |
-| `core/town.js` | 城鎮讀取模型：活動紀錄 → 城市、格子、遠征、工作時間、用量與詳情；帳本模式由 journal 決定格子位置 |
-| `core/history.js` | 從可重建的 checkpoint 索引與 journal 尾段搜尋提交、收成、活動及格子路徑；結果保留世代跳轉目標 |
-| `ui/history.js` | 只從選取遠征／格子的詳情開啟歷程搜尋，不在中央地圖常駐時間軸 |
-| `core/ingest.js` | 把 §6.1 的活動紀錄與「遠征取得土地」寫進帳本（順序與 `planExpeditions` 相同） |
-| `core/provider-stats.js` | 額度、投入與建築派系（§9）：S5 形狀的 provider 回報 → 顯示模型；一格依 provider 分開的投入與派系；不改變任何數值 |
-| `ui/standing.js` | 主要行會、額度與派系的畫面（上方那條、右側投入區、中央的行會人力清單） |
-| `core/grid.js` | 邏輯座標、BFS 選地與 3/4 投影（投影與規則分開） |
-| `core/space-city.js` | 目前的 space 對應哪一座城：用資料夾（repo 與 worktree checkout）比對，切換 space 城就跟著換 |
-| `core/shared-city.js` | 共用城市（#23–#27）：所有專案的工作累積到同一座城、一個倉庫；唯一的建設目標寫在帳本，備料到齊自動開工、工期到了完工（`advanceConstruction`）。工作來源只決定「是不是有效工作」，不分城、不換庫存 |
-| `core/city-map.js` | 共用城市的地圖（#25–#27）：固定地形、起始揭開區、完工建築的揭開範圍、建築占地與選址判準；預覽與帳本前提檢查共用同一個 `siteCheck`，`groundAt` 給畫面看工地與建築 |
+| `core/adapter.js` | 讀活動檔並合併同一 epoch 的紀錄（活動格式見 §6.1） |
+| `core/city-load.js` | 正式載入路徑（#22）：活動檔寫進 journal 並寫 ack（§6.2）→ 收入與成果加成 → 推進施工 → 公開讀取模型；測試與 runtime 共用這一支 |
+| `core/ledger.js` | 共用城市的帳本：append-only journal、CAS、內容檔、checkpoint、ack（§13.1，純 JS） |
+| `core/shared-city.js` | 共用城市（#23–#27）：工作收入、成果加成、唯一的建設目標、自動開工與到期完工 |
+| `core/city-map.js` | 共用城市的地圖（#25–#27）：固定地形、起始揭開區、完工建築的揭開範圍、建築占地與選址判準；預覽與帳本前提檢查共用同一個 `siteCheck` |
+| `core/research.js` | 回合（`roundsOf`）與工作資格的判準（互動 root／child 歸戶）：收入與成果收成共用 |
+| `core/commit-evidence.js` | commit 的來源證據 → 歸屬判定（hook 記錄、reflog、adapter 活動檔） |
+| `core/session-evidence.js` | Codex／Claude 的 session id 必須與 adapter 活動檔完全相等 |
+| `core/harvest.js` | commit 改動路徑的分類與內容 claim（成果加成用） |
+| `core/provider-stats.js` | 額度回報（S5 形狀）→ 顯示模型；不推算、不補 0 |
+| `core/quota-source.js` | 額度來源（官方 CLI 的 redacted JSON）與全域限流 |
+| `core/quota-view.js` | 額度模型的「現在」重新判定（TTL／resetsAt） |
+| `core/hooks.js` | 自動收成的三個 git hook（安裝／移除／狀態） |
+| `core/grid.js` | 邏輯座標與 3/4 投影（投影與規則分開） |
+| `core/selection.js` | 選取、開發模式與自動收成回答的保存（不是帳本；見下） |
 | `core/host-io.js` | 儲存介面的 host 適配層：herdr 的原生 CAS 衝突 → `CasConflict`（見下） |
-| `core/selection.js` | 選取狀態的保存（不是城的帳本；見下） |
-| `scenarios/first-expedition.js` | `herdr-app check` 與固定情境測試用資料；正式 runtime 不拿它入帳 |
-| `test/town.test.js` | 固定情境測試：只斷言可觀察的城鎮狀態 |
-| `test/restore.test.js` | 帳本重建的城 ＝ 直接重播的城；重開、重播、checkpoint 都一樣 |
-| `test/omp-adapter.test.js` | OMP 固定活動事件 → journal → 公開城鎮讀取模型；驗證用量來源去重與 root/child 歸戶 |
-| `test/shared-city.test.js` | 共用城市：跨專案、長短對話、換 provider 與重播只入帳一次；成果加成只發一次；選址的合法位置、整棟預覽、缺料預定與多視窗爭用目標；只靠研究備齊自動開工、到期完工、多視窗與重播不重扣不重蓋、疏林碎石同價、完工才揭開；同一處放普通建築或哨站，哨站揭開更大片且新地可直接預定 |
-| `test/history.test.js` | 歷程篩選、撤回／封存世代跳轉、未解析活動與可重建索引 |
-| `../omp-extension/herdr-reclaim.test.ts` | 驅動 extension 生命週期事件，驗證互動／child／fork／resume 與 ack compact |
-| `test/ledger.test.js` | 儲存層：完成依據、故障重試、CAS 競爭、換段、ack |
-| `test/host-seam.test.js` | host 接縫：用假 host 丟真實 host 的錯誤形狀，驗證衝突被正規化、其他錯誤不被吞 |
+| `core/blobs.js`／`core/pages.js`／`core/bytes.js`／`core/cas.js` | 帳本的內容檔、分頁索引、雜湊與 CAS 工具 |
+| `core/map-style.js` | 地圖每一格的樣式（填色、框線、預覽與建築記號）：純資料，依樣式分桶讓畫面只畫幾條路徑 |
+| `ui/map.js` | 共用城市的地圖繪製（地形、預定地、工地、建築、選址預覽） |
+| `ui/assets.js` | 建築 mock 的輪廓（向量，不影響數值） |
+| `scenarios/shared-city.js` | `herdr-app check` 的固定情境；正式 runtime 不拿它入帳 |
+| `test/city-load.test.js` | 正式載入路徑的整合測試：多 repo／多 session／`/new`／resume 只增加共用庫存、不建立 `cities/`、重載不雙算 |
+| `test/shared-city.test.js` | 共用城市：收入與成果加成只入帳一次、選址與整棟預覽、缺料預定、自動開工、到期完工、揭開與哨站 |
+| `test/ledger-storage.test.js` | 儲存層：完成依據、故障重試、CAS 競爭、換段、checkpoint 完整性、ack |
+| `test/ledger-capacity.test.js` | 長期帳本的容量（20,000 筆收入）：每個檔案 ≤ 256 KiB、checkpoint 查得回每一筆、兩條讀取路徑狀態一致 |
+| `test/codex-adapter.test.js` | 真 Codex adapter：hook → 活動檔（cached input 扣除、未知不補零）、ack compact 後控制狀態不遺失、進共用庫存計量器 |
+| `test/omp-adapter.test.js` | OMP 活動重播：root／fork 算工作、print 不算、child 併進 root、resume 用量去重；ack 後的新尾巴接回 journal；重播不變 |
+| `test/hook-git.test.js` | 真 git hook：post-commit／amend／cherry-pick／merge 寫出證據、安裝與移除；`commitContexts` → 成果加成只發一次 |
+| `test/commit-attribution-adapters.test.js` | Codex／Claude／OMP 的歸屬：精確配對才發成果加成、terminal-only／衝突／跨 CLI 不發、晚到證據補算一次 |
+| `test/commit-evidence.test.js` | git 輸出解析與 commit 歸屬（含來源不明與待核對） |
 | `test/fs-io.js` | bun 測試用的 fs 後端（說同一種 CAS 語言）；mod 不會載入它 |
-| `spike-panel.js` | S1／S2 的文字面板（proposal §15.1 的證據），沒有被載入 |
 
 領域邏輯完全不碰 host API，所以可以在 bun 下測；只有 `main.js` 匯入 `herdr` 與 `gpui-kit`。
 儲存層用一個小小的介面隔離（`io.read` / `io.write(path, text, expected)`），**契約是**：
@@ -40,23 +50,24 @@ mod 端由 `core/host-io.js` 把 herdr 的原生錯誤轉成 `CasConflict`（真
 `Error`，訊息是 `` `herdr.writeTextFile`: The file changed outside Herdr. Reload before saving… ``，
 三種衝突形狀共用同一句）；測試端由 `test/fs-io.js` 直接說同一種語言；帳本本身不認識 host API。
 
-## 城帳本（#3）
+## 帳本（#3、#4）
 
 - **journal entry 是操作完成的唯一依據**：只有內容檔、沒有 entry 的操作不算完成。
+- entry kind 只有共用城市用得到的幾種：`workStart`（啟用邊界）、`income`（基本收入）、
+  `achievement`（成果加成）、`plan`／`construct`／`complete`（建設目標、開工、完工）與
+  `activity`（活動合併）。收成的資源向量由 entry 自己帶，所以調整規則不改寫已落帳的結果。
 - 每個 writer 的活動寫成一筆 `activity` entry，內容（事件陣列）放在以雜湊命名的
   `blobs/<hash>.json`，**先寫內容再附加 entry**。
-- 「遠征取得土地」是一筆 `expedition` entry；座標由 BFS 算，前提（空格、這支遠征在這座城
-  還沒有格）在附加前重新檢查。
-- **CAS**：`writeTextFile(path, text, expected)` 的 expected 不符就重讀、重新檢查前提、再試
-  （`make(state)` 會被重新呼叫，所以會重新選地）。
-- **checkpoint**：`checkpoints/<seq>.json` 加之後的 journal 重播，等於從頭重播。
-- 每段有大小上限（預設 256 KiB）；放不下先 CAS 附加封段行，再寫下一段。內容格式保留
-  #4 的切塊與分頁空間（entry 只引用最上層雜湊）。
+- **CAS**：`writeTextFile(path, text, expected)` 的 expected 不符就重讀、重新檢查前提、再試。
+- **checkpoint**：`checkpoints/<seq>/` 的索引頁（`ops`／`claims`／`activities`）加之後的 journal
+  重播，等於從頭重播；manifest 的內容雜湊記在 `head.json`，對不上就整份丟棄重建。
+- 每段有大小上限（預設 256 KiB）；放不下先 CAS 附加封段行，再寫下一段。
 - **ack**（§6.2）：`acks/<sessionId>/<epoch>.json`，在 journal 提交成功之後才寫；帳本重播
   不讀 ack，所以 ack 延遲或重播不改變最終狀態。OMP adapter 只在讀到這個 epoch 的 ack 後
   才 compact 已確認的事件。
 
-資料在 `appHome()/data/herdr-reclaim/`：`activity/<sessionId>/<writerEpoch>.json` 是 OMP extension 寫入的活動檔；`cities/<cityId 的雜湊>/` 是每座城的帳本（§13）。
+資料在 `appHome()/data/herdr-reclaim/`：`activity/<sessionId>/<writerEpoch>.json` 是 adapter
+寫入的活動檔；`shared/` 是共用城市的帳本（舊版各 repo 城的 `cities/` 程式不再讀寫）。
 `quotas.json`（同一個資料目錄）是額度回報檔：內容是 provider 明確回報的額度，
 形狀與 `spikes/s5/observed.json` 相同（`omp usage --json --redact` 的輸出：`generatedAt`、
 `reports[].fetchedAt`、`reports[].limits[].amount` 與 `window.resetsAt`）。mod 啟動時與每 5 分鐘
@@ -68,37 +79,33 @@ mod 不讀任何 provider 憑證；檔案不存在、壞掉、過期，或某個
 
 OMP extension 是獨立檔 `omp-extension/herdr-reclaim.ts`，日常互動 session 自動寫活動檔；
 mod 以 `find` 列活動檔，成功寫 journal 後按 epoch 寫 ack，並用 `watchFolder` 監看新活動。
-`NormalizedUsage.sourceKey` 固定為 `cli + sessionId + source entry id`，城鎮讀取模型用它
-跨 epoch 去重；child 的用量併入 root，fork 的繼承歷史由 extension 的 session 起點排除。
+`NormalizedUsage.sourceKey` 固定為 `cli + sessionId + source entry id`，共用城市用它跨 epoch
+去重；child 的用量併入 root，fork 的繼承歷史由 extension 的 session 起點排除。
 
 ## 選取狀態（決策）
 
-選取**不寫進城的 journal**：它不產生資源、不改變土地或 claim，寫進 append-only 的帳本只會
-讓每座城多出純 UI 噪音，也讓「帳本重播＝同一座城」的驗證多一個無關變數。改存在
-`appHome()/data/herdr-reclaim/ui.json`（以 cityId 為鍵，設定檔等級、可重建的畫面狀態）。
-第一次開一座城會把當下顯示的選取記下來；重開 herdr 後還原同一個選取，城或格子已經不在
-時回到預設。
+選取**不寫進帳本**：它不產生資源、不改變土地或 claim，寫進 append-only 的帳本只會讓帳本
+多出純 UI 噪音，也讓「帳本重播＝同一座城」的驗證多一個無關變數。改存在
+`appHome()/data/herdr-reclaim/ui.json`（設定檔等級、可重建的畫面狀態）：選取的地圖格、
+開發模式、以及每個 repo 的自動收成回答（「先不要」以 repo 路徑為鍵）。重開 herdr 後還原
+同一個選取；格子已經不在就從沒有選取開始。
 
-## 研究、加速、市集與蓋房（#8）
+## 共用城市的玩法（#23–#27）
 
-規則表在 `core/rules.js`（有版本號 `RULES_VERSION`，每筆 entry 都存當時的版本，§8.2）：
-研究匯率 100,000 token 換 1 張羊皮卷、加速每張 +10 點、市集 3 換 1、五種建築配方。
+規則表在 `core/rules.js`（有版本號 `RULES_VERSION`，每筆 entry 都存當時的版本，§8.2）；
+完整規則與數值見 `docs/rules.md`。
 
-- **研究羊皮卷**（`core/research.js`，§7.4）：回合 = 一次 `interval_open` 到它的 `interval_close`。
-  只算互動遠征樹（root 互動；child 的回合也併進同一座城的計量器）。回合內沒有歸屬確定的
-  commit 才累加 non-cache input + output；`usage.unknownFields` 非空的回合不計、cache 不計。
-  這段時間內有待核對來源的 commit（`no-session-source`、`no-hook-repository-evidence`）時
-  **暫不結算**；來源補齊後若確認歸屬，這個回合不發；列為來源不明則視為沒有歸屬。
-  結算寫成一筆 `research` entry（operation ID 由回合身份決定），所以重播不重複發、晚到的來源
-  不倒扣計量器或已發羊皮卷，也不產生欠款；餘數按城保留（`state.research.tokens`）。
-- **加速**（`boost`）：目標是「遠征身份 + generation」，同城、現役、未撤回或封存、還佔著座標、
-  未滿 100 點、庫存足夠才成立；一項不符就整筆不扣卷。超過 100 的部分不退還。
-- **市集**（`trade`）：任兩種資源 3 換 1，庫存不足整筆不執行；轉入／轉出另外記在
-  `state.market`，跟 commit 的直接發放分開（§11）。
-- **蓋房**（`build`）：只列庫存足以支付完整配方的建築；一次扣完整份配方，格子保存配方、
-  實付資源與規則版本；已建的格子不能再蓋，之後的 resume 與 commit 收成仍保留建築。
-- 畫面（`main.js`）：上方顯示研究計量器與規則版本，右側詳情列出當下做得到的加速、蓋房與
-  市集操作（`economySection`）；每一筆都是帳本的一筆 CAS 操作，兩個畫面競爭只會有一筆成立。
+- **基本收入**（`ingestIncome`）：每一個已結束的有效工作回合累積 non-cache input + output，
+  每滿 10,000 token 收成木 3、石 2、鐵 1；用量來源鍵寫進城級 claim，兩個 space 或恢復對話
+  後的新 epoch 重送同一份工作只入帳一次。
+- **成果加成**（`ingestAchievements`）：歸屬確定、發生在啟用之後、且帶來新內容的 commit 另發
+  一份建材；同一份內容（repo + 路徑 + 結果 blob）只發一次。
+- **建設目標**（`placePlan`／`advanceConstruction`）：一次只有一個目標，不預扣庫存；材料備齊
+  的那一筆收成會自動開工並付清配方，工期到了完工並揭開附近土地。重開、重播、兩個視窗同時
+  推進都只有一筆開工與一筆完工。
+- 畫面（`main.js`）：上方是共用庫存、工作進度與目標；左側是建築卡（占地、配方、完工揭開
+  幾格）與自動收成的同意流程；中間是地圖（預定地、工地、完工建築、選址預覽）；右側是
+  整棟預覽與「預定這裡」。
 
 ## 跑測試
 
@@ -131,8 +138,9 @@ HERDR_APP_HOME="$H" herdr-app do pane.close '{"pane":"<pane id>"}'
 HERDR_APP_HOME="$H" herdr-app do window.close '{}'
 ```
 
-驗證完看一下 `$H/data/herdr-reclaim/`：第一次開會出現 `cities/<hash>/head.json`、`journal/0.json`、
-`blobs/*.json`、`acks/*`，以及 `ui.json`；關掉再開同一份 journal（位元組不變）重建出同一座城。
+驗證完看一下 `$H/data/herdr-reclaim/`：第一次開會出現 `shared/head.json`、`shared/journal/0.json`、
+`shared/blobs/*.json`、`shared/acks/*` 與 `ui.json`，**不會**出現舊版的 `cities/`；關掉再開同一份
+journal（位元組不變）重建出同一座城。
 
 注意：`HERDR_APP_HOME` 只隔離 layouts／mods／settings；spaces、tabs 與 panes 由該機器的
 herdr-core 保管，所以開 pane 會動到共用工作區，驗證完記得 `pane.close` 收乾淨

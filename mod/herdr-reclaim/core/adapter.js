@@ -1,14 +1,16 @@
-// 讀 OMP adapter（omp-extension/herdr-reclaim.ts）寫的活動檔，交給 ingest 寫進城帳本（#5）。
+// 讀 OMP adapter（omp-extension/herdr-reclaim.ts）寫的活動檔，交給共用城市入帳（#5、#23）。
 //
 // adapter 與 mod 共用一個根目錄（§6.1）：adapter 寫 activity/，mod 在帳本提交成功之後
-// 才在自己的城目錄寫 acks/。路徑由 appHome 決定，所以兩邊在隔離的 HERDR_APP_HOME 下
+// 才在自己的帳本目錄寫 acks/。路徑由 appHome 決定，所以兩邊在隔離的 HERDR_APP_HOME 下
 // 也看到同一份資料。
 //
 // mod 的 io 只有 read／write，沒有列目錄（herdr 的 readTextFile／writeTextFile），
-// 所以列檔由 host 層提供：`io.list(dir)` 回該目錄底下所有活動檔的絕對路徑。
-import { mergeActivities } from "./town.js";
+// 所以列檔由 host 層提供：`io.list(dir)` 回該目錄底下所有檔案的絕對路徑。
+//
+// 活動按 (sessionId, writerEpoch) 分檔；工作來源（repo、space、session）只決定「這是不是
+// 有效工作」，不決定城市——所有活動都進同一個共用城市（#22、ADR-0001）。
 
-/** 活動檔的目錄名（相對 appHome）。 */
+/** 資料根目錄名（相對 appHome）。 */
 export const ADAPTER_DIR = "data/herdr-reclaim";
 export const ACTIVITY_DIR = "activity";
 
@@ -43,38 +45,38 @@ export async function loadActivities(io, dir) {
 }
 
 /**
- * 每個 session 目前的名稱（omp 的 session title）：取「最後更新的那份活動檔」裡的名稱。
- * 名稱不進城帳本（它會被使用者改，不是歷史事實），每次重讀活動檔時重新取得。
+ * 同一支 session 同一個 writer epoch 的活動併成一份：事件取聯集（重複的 eventSeq 留時間較晚的），
+ * 名稱取最後更新那一份。帳本保存的那一份與磁碟快照（adapter ack 後會 compact）也會走這裡，
+ * 所以重播、重讀與 ack 後的尾巴不會互相覆蓋。
  */
-export function sessionNamesOf(activities) {
-  const latest = new Map();
-  for (const record of activities ?? []) {
-    if (typeof record.sessionName !== "string" || !record.sessionName.trim()) continue;
-    const current = latest.get(record.sessionId);
-    if (!current || (record.updatedAt ?? 0) >= (current.updatedAt ?? 0)) latest.set(record.sessionId, record);
-  }
-  return Object.fromEntries([...latest].map(([sessionId, record]) => [sessionId, record.sessionName.trim()]));
-}
-
-/** 這些活動碰到的城（§13：一個帳本只管一座城）。 */
-export function citiesOf(activities) {
-  const ids = new Set();
-  for (const record of activities ?? []) {
-    for (const event of record.events ?? []) {
-      if (event.visit?.commonDir) ids.add(event.visit.commonDir);
+export function mergeActivities(records) {
+  const byWriter = new Map();
+  for (const record of records ?? []) {
+    if (!record || record.schema !== 1 || typeof record.sessionId !== "string") continue;
+    const key = `${record.sessionId}@@${record.writerEpoch ?? ""}`;
+    const merged = byWriter.get(key);
+    const events = dedupeEvents(record.events ?? []);
+    if (!merged) {
+      byWriter.set(key, { ...record, events });
+      continue;
     }
+    merged.events = dedupeEvents([...merged.events, ...events]);
+    if ((record.updatedAt ?? 0) >= (merged.updatedAt ?? 0) && record.sessionName) merged.sessionName = record.sessionName;
+    merged.updatedAt = Math.max(merged.updatedAt ?? 0, record.updatedAt ?? 0);
   }
-  return [...ids].sort();
+  return [...byWriter.values()].sort((a, b) =>
+    a.sessionId === b.sessionId
+      ? String(a.writerEpoch ?? "").localeCompare(String(b.writerEpoch ?? ""))
+      : a.sessionId.localeCompare(b.sessionId),
+  );
 }
 
-/**
- * 開城時問 repo 有沒有 HEAD：只決定城鎮中心用哪一張圖（`center.kind`），名字一律是「城鎮中心」（§4）。
- * 這是設定檔等級的唯讀事實，拿不到就不猜（顯示「城鎮中心」）。
- */
-export async function repoFactsOf(io, cityIds) {
-  const facts = {};
-  for (const cityId of cityIds) {
-    facts[cityId] = { hadHead: (await io.read(`${cityId}/logs/HEAD`)) !== null };
+/** 同一個 epoch 內 eventSeq 不會重複；重複出現時留時間較晚的那一筆。 */
+function dedupeEvents(events) {
+  const bySeq = new Map();
+  for (const event of events) {
+    const previous = bySeq.get(event.eventSeq);
+    if (!previous || (event.at ?? 0) >= (previous.at ?? 0)) bySeq.set(event.eventSeq, event);
   }
-  return facts;
+  return [...bySeq.values()].sort((a, b) => a.eventSeq - b.eventSeq);
 }

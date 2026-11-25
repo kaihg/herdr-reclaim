@@ -28,7 +28,7 @@
 #   $HERDR_APP_HOME/data/herdr-reclaim/activity/<sessionId>/<writerEpoch>.json
 #   $HERDR_APP_HOME/data/herdr-reclaim/activity/<sessionId>/identity.state
 #     （`.state` 不是 `.json`：mod 列活動檔時用的是 `find -name '*.json'`）
-# mod 在帳本提交成功之後寫 `cities/<city>/acks/<sessionId>/<epoch>.json`；
+# mod 在帳本提交成功之後寫 `shared/acks/<sessionId>/<epoch>.json`（共用城市只有一本帳本）；
 # 這一支只讀自己的 ack，砍掉 `eventSeq ≤ ackedEventSeq` 的事件（§6.2）。已處理的用量來源
 # 身份與 writer 控制狀態（visit／區間是否開著、序號上限）**不隨 compact 遺忘**：
 # 從被砍過的 events 推導會讓序號歸零、區間與 visit 狀態遺失（見 read_state 的說明）。
@@ -44,7 +44,7 @@
 
 ROOT="${HERDR_APP_HOME:-$HOME/.config/herdr-app}/data/herdr-reclaim"
 ACTIVITY="$ROOT/activity"
-CITIES="$ROOT/cities"
+SHARED_ACKS="$ROOT/shared/acks"
 CLI="codex"
 TAB=$(printf '\t')
 
@@ -67,16 +67,11 @@ writer_epoch() {
   printf '%s-%s' "$PPID" "$(safe "${started:-unknown}")"
 }
 
-# mod 的 ack：只讀自己 epoch 的。ack 在每座城的目錄底下，所以要掃 cities/。
+# mod 的 ack：只讀自己 epoch 的。共用城市只有一本帳本（shared/）。
 acked_event_seq() {
-  acked=0
-  [ -d "$CITIES" ] || { printf '0'; return; }
-  for ack in "$CITIES"/*/acks/"$1"/"$2".json; do
-    [ -f "$ack" ] || continue
-    value=$(jq -r '.ackedEventSeq // 0' "$ack" 2>/dev/null || printf '0')
-    [ "$value" -gt "$acked" ] 2>/dev/null && acked=$value
-  done
-  printf '%s' "$acked"
+  ack="$SHARED_ACKS/$1/$2.json"
+  [ -f "$ack" ] || { printf '0'; return; }
+  jq -r '.ackedEventSeq // 0' "$ack" 2>/dev/null || printf '0'
 }
 
 # visit 開始當下自己問 git：之後 worktree 被刪掉，mod 仍能歸到正確的城（§6.1）。

@@ -291,24 +291,13 @@ function logError(root: string, where: string, error: unknown) {
 }
 
 /**
- * mod 的 ack：只讀自己 epoch 的。ack 檔在每一座城的目錄底下，所以要掃 cities/。
+ * mod 的 ack：只讀自己 epoch 的。共用城市只有一本帳本（`shared/`），
  * 讀不到、讀壞了都當成「還沒有 ack」。
  */
 function ackedEventSeq(root: string, sessionId: string, epoch: string): number {
-  const citiesDir = path.join(root, "cities");
-  let acked = 0;
-  let cities: string[];
-  try {
-    cities = fs.readdirSync(citiesDir);
-  } catch {
-    return 0;
-  }
-  for (const city of cities) {
-    const file = path.join(citiesDir, city, "acks", safeName(sessionId), `${safeName(epoch)}.json`);
-    const ack = readJson(file);
-    if (ack && typeof ack.ackedEventSeq === "number") acked = Math.max(acked, ack.ackedEventSeq);
-  }
-  return acked;
+  const file = path.join(root, "shared", "acks", safeName(sessionId), `${safeName(epoch)}.json`);
+  const ack = readJson(file);
+  return ack && typeof ack.ackedEventSeq === "number" ? ack.ackedEventSeq : 0;
 }
 
 /** 取得寫入者層級的鎖：hook 是獨立行程，讀改寫不能互相蓋掉。 */
@@ -513,7 +502,7 @@ export class HookRun {
       this.state.usageByMessage ??= {};
       this.state.usageByMessage[entry.messageId] = usage;
       if (previous && sameUsageSnapshot(previous, usage)) continue;
-      // A correction keeps sourceKey; readTown uses the last snapshot for that source.
+      // A correction keeps sourceKey; the shared city pays each source once (last snapshot wins).
       this.emit("usage", at, { usage: { anthropic: usage }, sourceEntryId: entry.messageId });
     }
   }

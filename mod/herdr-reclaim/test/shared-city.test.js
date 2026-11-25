@@ -3,9 +3,8 @@
 import { describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import path from "node:path";
-import { CityLedger, cityDir } from "../core/ledger.js";
-import { ingestScenario } from "../core/ingest.js";
-import { ACHIEVEMENT_YIELD, CITY_BUILDINGS, RECIPES, WORK_TOKENS_PER_UNIT, WORK_YIELD } from "../core/rules.js";
+import { CityLedger } from "../core/ledger.js";
+import { ACHIEVEMENT_YIELD, CITY_BUILDINGS, WORK_TOKENS_PER_UNIT, WORK_YIELD } from "../core/rules.js";
 import { SHARED_CITY_ID, advanceConstruction, ingestAchievements, ingestIncome, placePlan, readSharedCity, sharedCityDir } from "../core/shared-city.js";
 import { groundAt, legalSites, revealedCells, siteCheck, terrainAt } from "../core/city-map.js";
 import { createFileIo } from "./fs-io.js";
@@ -110,7 +109,7 @@ describe("共用城市的基本收入（#23）", () => {
     expect(stock(city)).toEqual(times(3));
     expect(city.work.tokens).toBe(0);
     // 沒有指定任何建築，也不會有人替玩家花掉庫存。
-    expect(Object.keys(RECIPES).length).toBeGreaterThan(0);
+    expect(Object.keys(CITY_BUILDINGS).length).toBeGreaterThan(0);
     expect(stock(await cityAt(dir))).toEqual(times(3));
   });
 
@@ -138,9 +137,9 @@ describe("共用城市的基本收入（#23）", () => {
 
     expect(stock(await cityAt(manyDir))).toEqual(stock(await cityAt(oneDir)));
     expect(stock(await cityAt(manyDir))).toEqual(times(3));
-    // 共用城市沒有「遠征格」：切對話不會多工地，帳本裡也沒有格子。
-    expect((await many.state()).tiles).toEqual([]);
-    expect((await one.state()).tiles).toEqual([]);
+    // 共用城市沒有「遠征格」：切對話不會多工地，帳本狀態與公開模型都沒有格子。
+    expect((await many.state()).tiles).toBeUndefined();
+    expect((await one.state()).tiles).toBeUndefined();
     expect(readSharedCity(await many.state()).city.tiles).toBeUndefined();
   });
 
@@ -253,36 +252,21 @@ describe("共用城市的基本收入（#23）", () => {
     expect(stock(await cityAt(dir))).toEqual(times(1));
   });
 
-  test("共用帳本不碰舊版各城帳本：舊城檔案逐位元不變，共用帳本也不會被當成一座舊城", async () => {
+  test("共用帳本不建立、也不讀寫 `cities/`：磁碟上既有的舊帳本原封不動，新資料只進 `shared/`", async () => {
     const dir = root("legacy-untouched");
-    const legacyId = REPO_A;
-    const legacy = await new CityLedger({ io: createFileIo(), dir: cityDir(dir, legacyId), cityId: legacyId }).open();
+    // 使用者磁碟上可能留著舊版各 repo 城的帳本：程式不再讀它，也不該刪它。
+    const legacyFile = `${dir}/cities/deadbeef/head.json`;
+    fs.mkdirSync(path.dirname(legacyFile), { recursive: true });
+    fs.writeFileSync(legacyFile, "keep me\n");
+    const before = fs.readFileSync(legacyFile, "utf8");
+
     const work = [activity({ sessionId: "old", events: round(REPO_A, T(0), T(60_000), [usageEvent(T(1_000), "o1", TEN_K, { sessionId: "old" })]) })];
-    await ingestScenario(legacy, { activities: work }, legacyId);
-
-    const snapshot = (base) => {
-      const files = {};
-      const walk = (current) => {
-        if (!fs.existsSync(current)) return;
-        for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
-          const file = path.join(current, entry.name);
-          if (entry.isDirectory()) walk(file);
-          else files[path.relative(base, file)] = fs.readFileSync(file, "utf8");
-        }
-      };
-      walk(base);
-      return files;
-    };
-    const legacyFiles = snapshot(`${dir}/cities`);
-    expect(Object.keys(legacyFiles).length).toBeGreaterThan(0);
-
     const shared = await sharedLedger(dir);
     await settle(shared, work);
     expect(stock(await cityAt(dir))).toEqual(times(1));
-    expect(snapshot(`${dir}/cities`)).toEqual(legacyFiles);
-    expect(Object.keys(snapshot(sharedCityDir(dir))).length).toBeGreaterThan(0);
-    // 掃 `cities/` 找舊城的地方（main.js）因此看不到共用帳本。
-    expect(Object.values(snapshot(`${dir}/cities`)).some((text) => text.includes(SHARED_CITY_ID))).toBe(false);
+    expect(fs.readFileSync(legacyFile, "utf8")).toBe(before);
+    expect(fs.readdirSync(`${dir}/cities`)).toEqual(["deadbeef"]);
+    expect(fs.existsSync(sharedCityDir(dir))).toBe(true);
   });
 });
 

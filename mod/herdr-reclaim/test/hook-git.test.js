@@ -1,13 +1,17 @@
+// 真 git hook：在暫存 repo 上安裝 hook，真的 commit／amend／cherry-pick／merge，看 recorder 寫出
+// 什麼；再用同一份 hook 證據走成果加成（#24）——歸屬確定才發、重播只發一次。
+//
+// 舊版這一支還驗了「改成當時的 generation」「不誤發研究」；那兩件事屬於已移除的遠征／研究系統，
+// 這裡刻意不補（見交接說明）。
 import { describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { installHooks } from "../core/hooks.js";
-import { CityLedger } from "../core/ledger.js";
-import { ingestScenario, ingestResearch, processLand, redispatch } from "../core/ingest.js";
-import { commitContexts, ingestCommits } from "../core/commit-evidence.js";
-import { activity, visitStart } from "../scenarios/first-expedition.js";
+import { adapterRoot, activityDir } from "../core/adapter.js";
+import { loadCity } from "../core/city-load.js";
+import { installHooks, removeHooks } from "../core/hooks.js";
+import { ACHIEVEMENT_YIELD } from "../core/rules.js";
 import { createFileIo } from "./fs-io.js";
 
 const run = (command, args, options = {}) => {
@@ -20,21 +24,63 @@ const exec = async (command, args = []) => {
   return { code: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 };
 const io = {
-  async read(file) { try { return readFileSync(file, "utf8"); } catch (error) { if (error.code === "ENOENT") return null; throw error; } },
-  async write(file, text) { writeFileSync(file, text); },
+  async read(file) {
+    try {
+      return readFileSync(file, "utf8");
+    } catch (error) {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    }
+  },
+  async write(file, text) {
+    writeFileSync(file, text);
+  },
 };
 
-describe("Git commit hook 線上證據", () => {
-  test("初始與一般 OMP bash commit 產生可配對的 repo/SHA 證據", async () => {
-    const repo = mkdtempSync(path.join(os.tmpdir(), "reclaim-git-live-"));
-    const appHome = path.join(repo, "isolated-home");
+const recordsOf = (appHome) => {
+  const dir = path.join(appHome, "data/herdr-reclaim/commits");
+  return readdirSync(dir)
+    .filter((file) => file.endsWith(".json"))
+    .map((file) => JSON.parse(readFileSync(path.join(dir, file), "utf8")));
+};
+
+async function listFiles(dir) {
+  const found = [];
+  const walk = (current) => {
+    let entries;
     try {
-      run("git", ["init", "-q", repo]);
-      run("git", ["-C", repo, "config", "user.email", "test@example.invalid"]);
-      run("git", ["-C", repo, "config", "user.name", "Test"]);
+      entries = readdirSync(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.name.endsWith(".json")) found.push(full);
+    }
+  };
+  walk(dir);
+  return found;
+}
+
+function setupRepo(prefix) {
+  const repo = mkdtempSync(path.join(os.tmpdir(), prefix));
+  run("git", ["init", "-q", repo]);
+  run("git", ["-C", repo, "config", "user.email", "test@example.invalid"]);
+  run("git", ["-C", repo, "config", "user.name", "Test"]);
+  return { repo, appHome: path.join(repo, "isolated-home") };
+}
+
+describe("Git commit hook 線上證據", () => {
+  test("初始與一般 OMP bash commit 產生可配對的 repo/SHA 證據；移除時還原 hook", async () => {
+    const { repo, appHome } = setupRepo("reclaim-git-live-");
+    try {
       const customHooks = path.join(repo, "custom-hooks");
       run("git", ["-C", repo, "config", "--local", "core.hooksPath", customHooks]);
       expect((await installHooks({ repo, appHome, io, exec })).status).toBe("installed");
+      // 安裝後三個 hook 都在自訂目錄裡。
+      expect(readdirSync(customHooks).sort()).toEqual(["post-commit", "post-merge", "post-rewrite"]);
+
       writeFileSync(path.join(repo, "README.md"), "first\n");
       run("git", ["-C", repo, "add", "README.md"]);
       const env = { ...process.env, PI_SESSION_ID: "session-exact", PI_TOOL_CALL_ID: "tool-exact", HC_TERMINAL_ID: "terminal" };
@@ -52,15 +98,18 @@ describe("Git commit hook 線上證據", () => {
       expect(record.env.PI_TOOL_CALL_ID).toBe("tool-exact");
       expect(record.reason).toBe("");
       expect(record.env).not.toHaveProperty("HC_TERMINAL_ID");
-    } finally { rmSync(repo, { recursive: true, force: true }); }
+
+      // 移除：三個 hook 都拿掉，自訂目錄回到空的。
+      expect((await removeHooks({ repo, exec })).status).toBe("removed");
+      expect(readdirSync(customHooks)).toEqual([]);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
   });
+
   test("Git 操作矩陣記錄 amend/rebase/cherry-pick/revert/conflict/no-ff merge", async () => {
-    const repo = mkdtempSync(path.join(os.tmpdir(), "reclaim-git-matrix-"));
-    const appHome = path.join(repo, "isolated-home");
+    const { repo, appHome } = setupRepo("reclaim-git-matrix-");
     try {
-      run("git", ["init", "-q", repo]);
-      run("git", ["-C", repo, "config", "user.email", "test@example.invalid"]);
-      run("git", ["-C", repo, "config", "user.name", "Test"]);
       const hooks = path.join(repo, "hooks");
       run("git", ["-C", repo, "config", "--local", "core.hooksPath", hooks]);
       expect((await installHooks({ repo, appHome, io, exec })).status).toBe("installed");
@@ -103,24 +152,22 @@ describe("Git commit hook 線上證據", () => {
       run("git", ["-C", repo, "switch", branch]);
       commitFile("main.txt", "main\n", "no-ff main");
       run("git", ["-C", repo, "merge", "--no-ff", "no-ff-side", "-m", "no-ff merge"]);
-      const recordsDir = path.join(appHome, "data/herdr-reclaim/commits");
-      const records = readdirSync(recordsDir).filter((file) => file.endsWith(".json")).map((file) => JSON.parse(readFileSync(path.join(recordsDir, file), "utf8")));
+
+      const records = recordsOf(appHome);
       expect(records.some((record) => record.sha === amended && record.hook === "post-rewrite")).toBe(true);
       expect(records.some((record) => record.hook === "post-rewrite" && record.rewrite.includes(" "))).toBe(true);
       expect(records.some((record) => record.hook === "post-merge")).toBe(true);
       expect(records.some((record) => record.hook === "post-commit" && record.sha === picked)).toBe(true);
-    } finally { rmSync(repo, { recursive: true, force: true }); }
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
   });
 });
 
-describe("真 hook 的提交時間", () => {
-  test("記下真正的提交事件時間：離線後才重播仍歸到當時的 generation，也不誤發研究", async () => {
-    const repo = mkdtempSync(path.join(os.tmpdir(), "reclaim-git-time-"));
-    const appHome = path.join(repo, "isolated-home");
+describe("真 hook 的提交時間與成果加成", () => {
+  test("記錄真正的提交時間；歸屬確定才發成果加成，重播只發一次", async () => {
+    const { repo, appHome } = setupRepo("reclaim-git-time-");
     try {
-      run("git", ["init", "-q", repo]);
-      run("git", ["-C", repo, "config", "user.email", "test@example.invalid"]);
-      run("git", ["-C", repo, "config", "user.name", "Test"]);
       run("git", ["-C", repo, "config", "--local", "core.hooksPath", path.join(repo, "hooks")]);
       expect((await installHooks({ repo, appHome, io, exec })).status).toBe("installed");
 
@@ -136,53 +183,106 @@ describe("真 hook 的提交時間", () => {
       expect(record.at).toBeGreaterThan(Date.now() - 60_000);
       expect(record.at).toBeLessThanOrEqual(Date.now());
 
-      // 讓「重播當下」明顯晚於提交時間：舊碼（at=0 → 用讀取當下）就會歸到之後才建立的代。
-      await Bun.sleep(1_200);
-
-      const cityId = run("git", ["-C", repo, "rev-parse", "--path-format=absolute", "--git-common-dir"]);
+      const commonDir = run("git", ["-C", repo, "rev-parse", "--path-format=absolute", "--git-common-dir"]);
       const checkout = realpathSync(repo);
       const commitAt = record.at;
-      const ledger = await new CityLedger({ io: createFileIo(), dir: path.join(appHome, "city"), cityId }).open();
-      const scenario = activity({
+      // 一支互動 root 的活動檔：一個在提交之前就結束的回合（否則收入會把 token 也算進來）。
+      const activity = {
+        schema: 1,
+        cli: "omp",
+        cliVersion: "test",
+        capabilities: { usage: true, parent: true, heartbeat: true, commitEnv: true },
         sessionId,
+        role: "root",
+        interactive: true,
         writerEpoch: "time-1",
         events: [
-          visitStart("v-time", commitAt - 120_000, { commonDir: cityId, checkout }),
-          { kind: "interval_open", at: commitAt - 120_000 },
-          {
-            kind: "usage",
-            at: commitAt - 60_000,
-            sourceEntryId: "time-entry",
-            usage: { openai: { sourceKey: `omp#${sessionId}#time-entry`, inputNonCache: 100_000, cacheRead: 0, cacheWrite: 0, output: 0, costKnown: 0, costUnknownEntries: 0 } },
-          },
-          { kind: "interval_close", at: commitAt + 300 },
+          { eventSeq: 1, kind: "visit_start", at: commitAt - 120_000, visit: { visitId: "v-time", cwd: checkout, commonDir, checkout } },
+          { eventSeq: 2, kind: "interval_open", at: commitAt - 120_000 },
+          { eventSeq: 3, kind: "usage", at: commitAt - 60_000, sourceEntryId: "time-entry", usage: { openai: { sourceKey: `omp#${sessionId}#time-entry`, inputNonCache: 100, cacheRead: 0, cacheWrite: 0, output: 0, costKnown: 0, costUnknownEntries: 0 } } },
+          { eventSeq: 4, kind: "interval_close", at: commitAt + 300 },
         ],
-      });
-      await ingestScenario(ledger, { activities: [scenario], repoFacts: { [cityId]: { hadHead: false } } }, cityId);
-      // 提交之後不久就撤回並重新派遣：重播（下面的 ingest）發生在兩者之後。
-      expect((await processLand(ledger, { rootSessionId: sessionId, generation: 1, action: "withdraw", at: commitAt + 500 })).status).toBe("applied");
-      expect((await redispatch(ledger, { rootSessionId: sessionId, at: commitAt + 500 })).status).toBe("applied");
+        updatedAt: commitAt + 300,
+      };
+      const dir = activityDir(appHome);
+      mkdirSync(path.join(dir, sessionId), { recursive: true });
+      writeFileSync(path.join(dir, sessionId, "time-1.json"), JSON.stringify(activity));
 
-      const activities = [...(await ledger.state()).activities.values()];
-      await ingestCommits({
-        ledger,
-        hooks: [record],
-        sources: [],
-        activities,
-        diffForCommit: async () => [{ status: "A", path: "src/app.js", resultBlob: "blob-time" }],
-      });
-      const state = await ledger.state();
-      expect(state.tileById.get(`${cityId}@@${sessionId}@@1`).harvestPoints).toBe(20);
-      expect(state.tileById.get(`${cityId}@@${sessionId}@@2`).harvestPoints).toBe(0);
+      const load = () => loadCity(
+        { ...createFileIo(), list: listFiles },
+        {
+          root: adapterRoot(appHome),
+          list: listFiles,
+          now: commitAt + 10_000,
+          activateAt: commitAt - 120_000,
+          diffForCommit: async () => [{ status: "A", path: "src/app.js", resultBlob: "blob-time" }],
+        },
+      );
+      const first = await load();
+      expect(first.city.city.resources).toEqual(ACHIEVEMENT_YIELD);
+      // 只有 100 token：不到一份建材，工作計量器只留餘數。
+      expect(first.city.city.work.tokens).toBe(100);
+      expect(first.city.city.resources).not.toHaveProperty("parchment", 1);
 
-      // 研究結算：這個回合裡有歸屬確定的 commit（時間真的落在回合內），所以不發羊皮卷。
-      await ingestResearch(ledger, {
-        activities: [...state.activities.values()],
-        commits: commitContexts({ hooks: [record], activities: [...state.activities.values()] }),
-        cityId,
-      });
-      expect((await ledger.state()).resources.parchment).toBe(0);
-      expect((await ledger.state()).research).toEqual({ tokens: 0 });
-    } finally { rmSync(repo, { recursive: true, force: true }); }
+      // 重播同一份證據：不再發、計量器不變。
+      const replayed = await load();
+      expect(replayed.city.city.resources).toEqual(ACHIEVEMENT_YIELD);
+      expect(replayed.city.city.work.tokens).toBe(100);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("沒有 session 證據的 commit 不發成果加成；啟用邊界之前的 commit 不補發", async () => {
+    const { repo, appHome } = setupRepo("reclaim-git-unknown-");
+    try {
+      run("git", ["-C", repo, "config", "--local", "core.hooksPath", path.join(repo, "hooks")]);
+      expect((await installHooks({ repo, appHome, io, exec })).status).toBe("installed");
+      const sessionId = "session-boundary";
+      writeFileSync(path.join(repo, "a.txt"), "a\n");
+      run("git", ["-C", repo, "add", "a.txt"]);
+      // 只有 terminal id：來源不明。
+      run("git", ["-C", repo, "commit", "-m", "terminal only"], { env: { ...process.env, HC_TERMINAL_ID: "t1" } });
+      const unknown = run("git", ["-C", repo, "rev-parse", "HEAD"]);
+      // 正常 commit（有 session）：但啟用邊界在之後，屬於「啟用前」。
+      writeFileSync(path.join(repo, "b.txt"), "b\n");
+      run("git", ["-C", repo, "add", "b.txt"]);
+      run("git", ["-C", repo, "commit", "-m", "before activation"], { env: { ...process.env, PI_SESSION_ID: sessionId } });
+      const before = run("git", ["-C", repo, "rev-parse", "HEAD"]);
+
+      const commonDir = run("git", ["-C", repo, "rev-parse", "--path-format=absolute", "--git-common-dir"]);
+      const checkout = realpathSync(repo);
+      const activity = {
+        schema: 1, cli: "omp", cliVersion: "test",
+        capabilities: { usage: true, parent: true, heartbeat: true, commitEnv: true },
+        sessionId, role: "root", interactive: true, writerEpoch: "b-1",
+        events: [
+          { eventSeq: 1, kind: "visit_start", at: 1, visit: { visitId: "v", cwd: checkout, commonDir, checkout } },
+          { eventSeq: 2, kind: "interval_open", at: 1 },
+          { eventSeq: 3, kind: "interval_close", at: 2 },
+        ],
+        updatedAt: 2,
+      };
+      mkdirSync(path.join(activityDir(appHome), sessionId), { recursive: true });
+      writeFileSync(path.join(activityDir(appHome), sessionId, "b-1.json"), JSON.stringify(activity));
+
+      const loaded = await loadCity(
+        { ...createFileIo(), list: listFiles },
+        {
+          root: adapterRoot(appHome),
+          list: listFiles,
+          now: Date.now(),
+          activateAt: Date.now() + 60_000, // 啟用邊界在兩個 commit 之後
+          diffForCommit: async (sha) => [{ status: "A", path: `src/${sha.slice(0, 2)}.js`, resultBlob: `blob-${sha.slice(0, 2)}` }],
+        },
+      );
+      expect(loaded.city.city.resources).toEqual({ wood: 0, stone: 0, iron: 0 });
+      // 兩筆都記在 commits/ 裡（帳本沒有它們的 entry，但證據都在）。
+      const records = recordsOf(appHome);
+      expect(records.some((record) => record.sha === unknown)).toBe(true);
+      expect(records.some((record) => record.sha === before)).toBe(true);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
   }, 30_000);
 });

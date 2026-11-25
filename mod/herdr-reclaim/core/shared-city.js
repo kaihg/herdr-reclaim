@@ -9,8 +9,8 @@
 // 所有 repo 的工作都進同一個計量器，而且沒有可歸屬 commit 的限制（那是 #24 的額外收成）。
 //
 // 這一票交付「工作 → 基本建材 + 常駐庫存」；明確成果的額外收成是 #24（`ingestAchievements`）。
-// 選址與預定地是 #25；備料到齊自動開工、到期完工是 #26（`advanceConstruction`）。舊版各城帳本
-// （`cities/<hash>/`）原封不動：共用帳本放在別的目錄，不讀也不改它們。
+// 選址與預定地是 #25；備料到齊自動開工、到期完工是 #26（`advanceConstruction`）。#22 之後
+// 程式只讀寫這一本帳本：舊版各城帳本（`cities/<hash>/`）原封不動留在磁碟上，不讀也不改它們。
 import { claimKey, planKey } from "./ledger.js";
 import { ACHIEVEMENT_YIELD, CITY_BUILDINGS, WORK_TOKENS_PER_UNIT, WORK_YIELD, affordable, workYieldOf } from "./rules.js";
 import { missingOf } from "./city-map.js";
@@ -20,8 +20,7 @@ import { createsTile, rootOf, roundsOf, sessionIndex } from "./research.js";
 
 /**
  * 共用城市的帳本身份。它不是 git common dir，所以不會與任何舊城（repo 路徑）相撞；
- * `sharedCityDir` 也刻意放在 `cities/` 之外，掃舊城的地方（main.js 的 cityIdsFromLedgers）
- * 因此不會把共用帳本當成一座舊城。
+ * `sharedCityDir` 也刻意放在 `cities/` 之外，掃舊目錄的地方不會把共用帳本當成一座舊城。
  */
 export const SHARED_CITY_ID = "shared";
 

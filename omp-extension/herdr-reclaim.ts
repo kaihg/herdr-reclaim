@@ -1,8 +1,8 @@
 // herdr-reclaim：omp 遠征 adapter（proposal §6.1／§6.2／§6.3；ticket #5）。
 //
-// 一個寫入者（sessionId + writerEpoch）寫一個活動檔，mod 讀它、寫進城帳本，成功之後才寫 ack：
-//   <root>/activity/<sessionId>/<writerEpoch>.json             這裡寫
-//   <root>/cities/<城的雜湊>/acks/<sessionId>/<epoch>.json     mod 寫；這裡只讀自己的 epoch
+// 一個寫入者（sessionId + writerEpoch）寫一個活動檔，mod 讀它、寫進共用城市的帳本，成功之後才寫 ack：
+//   <root>/activity/<sessionId>/<writerEpoch>.json        這裡寫
+//   <root>/shared/acks/<sessionId>/<epoch>.json           mod 寫；這裡只讀自己的 epoch
 // root = $HERDR_APP_HOME/data/herdr-reclaim，$HERDR_APP_HOME 預設 ~/.config/herdr-app
 // ——跟 mod 讀的是同一個根目錄，不設分離的 adapter state path。
 // 舊 epoch 的檔案留著（不刪），mod 之後仍可以離線重播（§6.2）。
@@ -127,7 +127,7 @@ const HEARTBEAT_MS = 60_000;
 const HERDR_APP_HOME = process.env.HERDR_APP_HOME || path.join(os.homedir(), ".config", "herdr-app");
 const ROOT = path.join(HERDR_APP_HOME, "data", "herdr-reclaim");
 const ACTIVITY_DIR = path.join(ROOT, "activity");
-const CITIES_DIR = path.join(ROOT, "cities");
+const SHARED_ACKS_DIR = path.join(ROOT, "shared", "acks");
 const SOURCES_DIR = path.join(ROOT, "sources");
 function detectCliVersion() {
   if (process.env.OMP_VERSION) return process.env.OMP_VERSION;
@@ -249,27 +249,17 @@ function logError(where: string, error: unknown) {
 }
 
 /**
- * mod 的 ack：只讀自己 epoch 的。ack 檔在每一座城的目錄底下（一座城一個帳本），
- * 所以要掃 cities/；掃不到、讀壞了都當成「還沒有 ack」。
+ * mod 的 ack：只讀自己 epoch 的。共用城市只有一本帳本（`shared/`），
+ * 讀不到、讀壞了都當成「還沒有 ack」。
  */
 function ackedEventSeq(sessionId: string, writerEpoch: string): number {
-  let acked = 0;
-  let cities: string[];
   try {
-    cities = fs.readdirSync(CITIES_DIR);
+    const text = fs.readFileSync(path.join(SHARED_ACKS_DIR, sessionId, `${writerEpoch}.json`), "utf8");
+    const ack = JSON.parse(text) as { ackedEventSeq?: number };
+    return typeof ack.ackedEventSeq === "number" ? ack.ackedEventSeq : 0;
   } catch {
     return 0;
   }
-  for (const city of cities) {
-    try {
-      const text = fs.readFileSync(path.join(CITIES_DIR, city, "acks", sessionId, `${writerEpoch}.json`), "utf8");
-      const ack = JSON.parse(text) as { ackedEventSeq?: number };
-      if (typeof ack.ackedEventSeq === "number") acked = Math.max(acked, ack.ackedEventSeq);
-    } catch {
-      continue;
-    }
-  }
-  return acked;
 }
 type EventPayload = { reason?: string; turnIndex?: number } | undefined;
 

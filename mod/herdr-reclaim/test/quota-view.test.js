@@ -9,7 +9,6 @@ import path from "node:path";
 import { QUOTA_TTL_MS } from "../core/provider-stats.js";
 import { quotaLines } from "../core/provider-stats.js";
 import { quotaView, readQuotaView } from "../core/quota-view.js";
-import { readTownFromLedger } from "../core/town.js";
 import { createFileIo } from "./fs-io.js";
 
 const AT = 1_795_082_918_586;
@@ -48,12 +47,6 @@ describe("額度模型依「現在」重新判定新鮮度", () => {
 
     // 還沒到期時重繪不會無故變成未知。
     expect(quotaView(view.snapshot, AT + 60_000).entries[0].unknown).toBe(false);
-  });
-
-  test("城鎮模型帶著同一份模型：重繪路徑拿得到原始快照重算", () => {
-    const town = readTownFromLedger({ expeditions: [], activities: [], quotas: quotaView(observed, AT) });
-    expect(town.quotas.snapshot).toBe(observed);
-    expect(quotaView(town.quotas.snapshot, AT + QUOTA_TTL_MS + 1).entries[0].unknown).toBe(true);
   });
 
   test("回報檔不存在或壞掉：模型仍是可重算的「未知」，不影響城鎮", async () => {

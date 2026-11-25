@@ -1,0 +1,117 @@
+// 正式載入路徑（#22）：活動檔 → 共用帳本 → 公開的共用城市讀取模型。
+//
+// 只有這條路：沒有各 repo 的舊帳本（`cities/`）、沒有遠征建格、沒有舊 commit 收成或研究。
+// `loadCity` 是 main.js 開機與 watch 變更時呼叫的那一個函式，也是測試走的那一個——
+// 兩者不能各自拼一條「差不多」的流程，否則整合層的行為沒有被任何測試釘住。
+//
+// 主機相依的部分（列目錄、跑 git）由呼叫端注入：
+//   `list(dir)`                列檔案（herdr 的 mod 沒有 listdir）
+//   `remoteMerges`             遠端合併的 sha（不可能有 session 歸屬，不發成果加成）
+//   `diffForCommit(sha, hook)` 一個 commit 的第一父節點差異（成果收成用）
+//   `now`                      推進施工用的現在時刻（測試給固定值）
+import { loadActivities, mergeActivities } from "./adapter.js";
+import { loadCommitEvidence } from "./commit-evidence.js";
+import { CityLedger } from "./ledger.js";
+import {
+  SHARED_CITY_ID, advanceConstruction, ingestAchievements, ingestIncome, readSharedCity, sharedCityDir,
+} from "./shared-city.js";
+
+/**
+ * 一次完整的重讀：adapter 的活動檔寫進帳本（§6.2），與帳本保存的那一份合併之後入帳
+ * （收入＋成果加成），再推進工期已到的完工，最後回傳公開讀取模型。
+ *
+ * `activities` 可以覆寫（main.js 先用 git 補齊未解析的 `visit.commonDir`）；沒有給就讀磁碟。
+ * `extraHooks` 是主機另外找到的提交證據（reflog），`remoteMerges` 是遠端合併的 sha。
+ * `activateAt` 只給測試：正式 runtime 由第一次啟用的當下決定。
+ */
+export async function loadCity(io, {
+  root, list, activities: given = null, extraHooks = [], remoteMerges = new Set(), diffForCommit, now = Date.now(), activateAt,
+} = {}) {
+  const fromDisk = given ?? await loadActivities({ ...io, list }, `${root}/activity`);
+  const ledger = await new CityLedger({ io, dir: sharedCityDir(root), cityId: SHARED_CITY_ID }).open();
+  await ledger.maybeCheckpoint();
+  // 磁碟上的新事件先寫進 journal，成功之後才寫 ack（adapter 下一次才敢 compact）。
+  await recordActivities(ledger, fromDisk);
+  const state = await ledger.state();
+  // adapter 的磁碟快照會被 ack compact；帳本保存的那一份才是完整的，兩邊取聯集。
+  const activities = mergeActivities([...state.activities.values(), ...fromDisk]);
+  await ingestIncome(ledger, { activities, activateAt });
+  const evidence = await loadCommitEvidence(io, root, list);
+  // 主機另外找到的 reflog 紀錄：同一個 sha、同一個 repo、同一種證據只留一筆。
+  const seen = new Set(evidence.hooks.map((record) => `${record.sha}@@${record.commonDir ?? ""}@@${record.hook}`));
+  for (const record of extraHooks) {
+    const key = `${record.sha}@@${record.commonDir ?? ""}@@${record.hook}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    evidence.hooks.push(record);
+  }
+  await ingestAchievements(ledger, { activities, ...evidence, remoteMerges, diffForCommit, activateAt });
+  await advanceConstruction(ledger, { now });
+  return {
+    city: readSharedCity(await ledger.state()),
+    activities,
+    evidence,
+    repositories: repositoriesOf(activities),
+  };
+}
+
+/**
+ * adapter 磁碟上的活動尾巴 → `activity` entry，並在 entry 成立之後寫 ack（§6.2）。
+ *
+ * 只送磁碟上的那一份（adapter ack 後會 compact 掉已入帳的事件）；帳本把事件併回舊快照，
+ * 所以 journal 保存的仍是完整的事件序列，重播看得到原本的 visit、區間與用量。同一份尾巴
+ * 重送是 duplicate（opId 含 writer epoch 與最後的 eventSeq），不會重寫內容檔；ack 補在同一個
+ * journal 位置。
+ */
+export async function recordActivities(ledger, activities) {
+  const results = [];
+  for (const record of activities ?? []) {
+    const events = record.events ?? [];
+    if (events.length === 0) continue; // 已全部 ack 的 compacted 快照沒有新事件
+    const lastEventSeq = events.reduce((latest, event) => Math.max(latest, event.eventSeq ?? 0), 0);
+    const result = await ledger.submit(() => ({
+      opId: `activity:${ledger.cityId}:${record.sessionId}@@${record.writerEpoch ?? ""}@@${lastEventSeq}`,
+      kind: "activity",
+      at: record.updatedAt ?? events[events.length - 1]?.at ?? 0,
+      cityId: ledger.cityId,
+      sessionId: record.sessionId,
+      writerEpoch: record.writerEpoch,
+      role: record.role ?? "root",
+      interactive: record.interactive === true,
+      parentSessionId: record.parentSessionId ?? null,
+      cli: record.cli ?? null,
+      updatedAt: record.updatedAt ?? 0,
+      lastEventSeq,
+      blobs: { events },
+    }));
+    results.push(result);
+    // §6.2：ack 在 journal 提交成功之後才寫。上一次中斷或重播時 entry 已經在，這裡補上同一筆
+    // （journalSeq 是 entry 的位置，不是這次嘗試的位置）。
+    if (result.status === "applied" || result.status === "duplicate") {
+      await ledger.writeAck({
+        sessionId: record.sessionId,
+        writerEpoch: record.writerEpoch,
+        ackedEventSeq: lastEventSeq,
+        journalSeq: result.journalSeq,
+      });
+    }
+  }
+  return results;
+}
+
+/**
+ * 活動碰到的 repo（`visit.checkout`），最近用過的在前面：自動收成的同意流程要對每一個 repo
+ * 問一次，而不是對「一座城」問——共用城市沒有自己的 checkout。
+ */
+export function repositoriesOf(activities = []) {
+  const latest = new Map();
+  for (const record of activities) {
+    for (const event of record.events ?? []) {
+      const checkout = event.visit?.checkout;
+      if (typeof checkout !== "string" || checkout === "") continue;
+      const at = Number(event.at ?? record.updatedAt ?? 0);
+      if (!(latest.get(checkout) >= at)) latest.set(checkout, at);
+    }
+  }
+  return [...latest].map(([checkout, at]) => ({ checkout, at })).sort((a, b) => b.at - a.at || a.checkout.localeCompare(b.checkout));
+}
