@@ -182,7 +182,7 @@ describe("Codex 活動重播到共用城市", () => {
       const city = await cityOf(appHome);
       // 只有 resp_ok 進計量器：一份建材 + 餘數 12。
       expect(city.work.tokens).toBe(12);
-      expect(city.resources).toEqual({ wood: START_RESOURCES.wood + 2, stone: START_RESOURCES.stone + 1, iron: START_RESOURCES.iron + 1 });
+      expect(city.resources).toEqual({ wood: START_RESOURCES.wood + 2 - 20, stone: START_RESOURCES.stone + 1 - 10, iron: START_RESOURCES.iron + 1 - 6 });
 
       const record = readRecord(path.join(activityDir(appHome), session, "u1.json"));
       // 未知的來源記進 usageSeen，下一次不會再試著發一次。

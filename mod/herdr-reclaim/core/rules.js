@@ -17,7 +17,12 @@
 export const UNIT_CONSTRUCTION_VERSION = 12;
 export const POPULATION_VERSION = 13;
 export const PRODUCTION_VERSION = 14;
-export const RULES_VERSION = PRODUCTION_VERSION;
+export const AUTO_CONSTRUCTION_VERSION = 15;
+export const RULES_VERSION = AUTO_CONSTRUCTION_VERSION;
+export const ROADSIDE_RANGE = 3;
+export const AUTO_INTERVAL_UNITS = 0;
+export const TOWN_UPGRADE_COSTS = { wood: 2600, stone: 2600, iron: 1300 };
+export const manualCount = queue => queue.length - Number(queue[0]?.auto === true);
 export const TERRAIN_VERSION = 2;
 export const START_ROAD_LENGTH = 1;
 export const START_RESOURCES = { wood: 70, stone: 35, iron: 6 };

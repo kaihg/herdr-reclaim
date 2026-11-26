@@ -80,7 +80,8 @@ async function cityAt(dir) {
 
 const stock = (city) => [city.resources.wood, city.resources.stone, city.resources.iron];
 const perUnit = [WORK_YIELD.wood, WORK_YIELD.stone, WORK_YIELD.iron];
-const times = (n) => perUnit.map((amount, i) => stock({ resources: START_RESOURCES })[i] + amount * n);
+// 開城後的前十四份：第一份付民居，工地尚未完工，不影響毛產。
+const times = (n) => perUnit.map((amount, i) => stock({ resources: START_RESOURCES })[i] + amount * n - (n ? [20, 10, 6][i] : 0));
 
 describe("共用城市的基本收入（#23）", () => {
   test("兩個專案的研究、沒有 commit 與交易，逐步取得各種基本建材；兩個 space 看到同一份庫存", async () => {
@@ -109,8 +110,7 @@ describe("共用城市的基本收入（#23）", () => {
     const city = await cityAt(dir);
     expect(stock(city)).toEqual(times(3));
     expect(city.work.tokens).toBe(0);
-    // 沒有指定任何建築，也不會有人替玩家花掉庫存。
-    expect(Object.keys(CITY_BUILDINGS).length).toBeGreaterThan(0);
+    expect(city.queue[0]).toMatchObject({ building: "house", auto: true, startedUnit: 1 });
     expect(stock(await cityAt(dir))).toEqual(times(3));
   });
 
@@ -290,10 +290,10 @@ const research = (sessionId, repo, n, from) => activity({
 const workload = (id, tokens) => activity({ sessionId: id, events: round(REPO_A, T(0), T(60_000), [
   usageEvent(T(1_000), id, { output: tokens }, { sessionId: id }),
 ]) });
-// 缺料與施工案例以明確的零庫存快照起步，不依賴正式新城的贈料。
+// 手動施工、維護與產量的固定情境沒有沿線土地，以隔離手動操作，不更換規則版本。
 const emptyStart = (ledger) => ledger.submit(() => ({
   opId: `work-start:${ledger.cityId}`, kind: "workStart", cityId: ledger.cityId, at: T(0),
-  terrainVersion: 1, roadArmLength: 1, resources: { wood: 0, stone: 0, iron: 0 },
+  terrainVersion: 1, roadArmLength: 0, resources: { wood: 0, stone: 0, iron: 0 },
 }));
 const fund = async (ledger, units, from = T(0)) => {
   await emptyStart(ledger);
@@ -343,17 +343,19 @@ describe("選址與預定佇列（#25、ADR 0003）", () => {
     for (const site of legalSites(fresh, "market")) {
       expect(siteCheck(fresh, "market", site).cells.every((cell) => revealed.has(`${cell.x},${cell.y}`))).toBe(true);
     }
-
-    // 不同專案、不同對話的工作入帳之後，選址還是同一張地圖：不依 session 配地、不另占格。
+    // 進帳只改動自動工地的占地；既有地圖不因工作來源改變。
     await settle(ledger, [
       activity({ sessionId: "a", events: round(REPO_A, T(0), T(60_000), [usageEvent(T(1_000), "a1", TEN_K, { sessionId: "a" })]) }),
       activity({ sessionId: "b", events: round(REPO_B, T(70_000), T(90_000), [usageEvent(T(71_000), "b1", TEN_K, { sessionId: "b" })]) }),
     ]);
     const worked = await cityAt(dir);
     expect(stock(worked)).toEqual(times(2));
-    expect(worked.queue).toEqual([]);
-    expect(keysOf(legalSites(worked, "market"))).toEqual(markets);
-    expect(keysOf(legalSites(worked, "house"))).toEqual(houses);
+    expect(worked.queue[0]).toMatchObject({ building: "house", auto: true });
+    for (const type of ["market", "house"]) {
+      const expected = legalSites(fresh, type).filter(site => !footprintCells(type, site).some(c =>
+        worked.queue[0].cells.some(p => p.x === c.x && p.y === c.y)));
+      expect(legalSites(worked, type)).toEqual(expected);
+    }
   });
 
   test("整棟占地落在草地、疏林、碎石就合法；一角碰到深水、峭壁、迷霧、城鎮中心或佇列中的預定地整棟都不能放", async () => {
@@ -946,7 +948,10 @@ describe("人口、人力與維護（#35）", () => {
       await settle(ledger, [], { activateAt: T(7 * 86_400_000) });
       expect(await cityAt(dir)).toEqual(before);
       await settle(ledger, [workload("income", 320_000)]);
-      expect(stock(await cityAt(dir))).toEqual(stock(before).map((v, i) => v + [62, 31, 31][i]));
+      // 第 6 份開始民居，第 20 份完工：32 份有一半按 N=1，一半按 N=2。
+      // 看實際入庫，不把同一筆內另付的建築配方算成維護。
+      const entries = (await ledger.scanSegments()).flatMap(s => s.entries);
+      expect(entries.filter(e => e.kind === "income").at(-1).resources).toEqual({ wood: 61, stone: 30, iron: 30 });
     }
     const buildings = Array.from({ length: 1500 }, () => ({ building: "outpost", cells: [] }));
     expect(readSharedCity({ buildings }).city.maintenance).toBe(50 / 101);
@@ -956,6 +961,7 @@ describe("人口、人力與維護（#35）", () => {
   test("完工順序分人，民居補足後復工", async () => {
     const dir = root("staff");
     const ledger = await sharedLedger(dir);
+    await ledger.submit(() => ({ opId: "found", kind: "workStart", cityId: ledger.cityId, at: AT, roadArmLength: 0, resources: START_RESOURCES }));
     await settle(ledger, [workload("備料", 200_000)]);
     await order(ledger, "market", at(3, 1));
     await order(ledger, "workshop", at(1, -2));
@@ -991,7 +997,7 @@ describe("人口、人力與維護（#35）", () => {
     for (const income of incomes) await settle(serial, [income]);
     const city = await cityAt(dir);
     expect(city).toEqual(await cityAt(serialDir));
-    expect(stock(city)).toEqual([79, 39, 14]);
+    expect(stock(city)).toEqual([19, 24, 14]); // 村落最缺石，採石場付清 60 木、15 石。
     const entries = (await serial.scanSegments()).flatMap(s => s.entries).filter(e => e.kind === "income");
     expect(entries.slice(-2).map(e => e.resources)).toEqual([{ wood: 2, stone: 1, iron: 1 }, { wood: 1, stone: 0, iron: 0 }]);
   });
@@ -999,7 +1005,7 @@ describe("人口、人力與維護（#35）", () => {
   test("長序列保留各材餘數", async () => {
     const dir = root("carry");
     let ledger = await sharedLedger(dir);
-    await settle(ledger, []);
+    await ledger.submit(() => ({ opId: "found", kind: "workStart", cityId: ledger.cityId, at: AT, roadArmLength: 0, resources: START_RESOURCES }));
     await order(ledger, "house", at(3, 1));
     await order(ledger, "house", at(2, 3));
     const ordered = await cityAt(dir);
@@ -1044,7 +1050,7 @@ describe("產出建築（#37）", () => {
     const mill = producer("lumberyard", 2, -3);
     expect(income([mill]).wood).toBe(5);
     const reserved = producer("house", 1, -4);
-    const queued = [reserved, producer("outpost", 1, -2)];
+    const queued = [reserved, producer("outpost", 1, -2)].map(p => ({ ...p, costs: CITY_BUILDINGS[p.building].costs }));
     expect(income([mill], { queue: queued }).wood).toBe(4);
     expect(income([mill, ...queued]).wood).toBe(4);
 
@@ -1108,7 +1114,7 @@ describe("產出建築（#37）", () => {
     expect(results.map(r => r.results[0].status)).toEqual(["applied", "applied"]);
     expect(results.some(r => r.results[0].attempts > 1)).toBe(true);
     const live = readSharedCity(await windows[0].state()).city;
-    expect(stock(live)).toEqual([47, 41, 24]);
+    expect(stock(live)).toEqual([27, 31, 18]); // 採石場完工後，民居接著付料。
     expect(await cityAt(dir)).toEqual(live);
   });
 
@@ -1127,7 +1133,7 @@ describe("產出建築（#37）", () => {
       JSON.stringify({ ...op, sources: [`old-${journalSeq}`], rulesVersion: 13, opId: `old-${journalSeq}`,
         cityId: SHARED_CITY_ID, at: AT, journalSeq }) + "\n").join(""));
     expect(stock(await cityAt(dir))).toEqual([250, 140, 59]);
-    await settle(await sharedLedger(dir), [workload("upgraded", 170_000)]);
+    await settle(await sharedLedger(dir, { rulesVersion: 14 }), [workload("upgraded", 170_000)]);
     expect(stock(await cityAt(dir))).toEqual([282, 156, 123]);
   });
 

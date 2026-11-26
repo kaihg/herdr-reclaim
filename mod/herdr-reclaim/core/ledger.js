@@ -30,6 +30,8 @@ import { BlobStore } from "./blobs.js";
 import { byteLen, canonicalJson, hashText } from "./bytes.js";
 import { casWrite, rejectUnlessConflict } from "./cas.js";
 import { PrefixIndex } from "./pages.js";
+import { applyConstruction, constructionIncome } from "./construction.js";
+import { AUTO_CONSTRUCTION_VERSION, manualCount } from "./rules.js";
 import { BUILD_QUEUE_LIMIT, BUILDINGS_V12, CITY_BUILDINGS, POPULATION_VERSION, PRODUCTION_VERSION, RESOURCES, RULES_VERSION, UNIT_CONSTRUCTION_VERSION, WORK_TOKENS_PER_UNIT, WORK_YIELD, affordable, isBuilding, recipeOf } from "./rules.js";
 import { buildingCount, creditUnits, grossYield } from "./economy.js";
 import { footprintCells, siteCheck } from "./city-map.js";
@@ -276,12 +278,25 @@ function projectIncome(state, tokens, rulesVersion = RULES_VERSION) {
   return { ...draft, income, work };
 }
 
-export const workYieldOf = (state, tokens) => projectIncome(state, tokens).income;
+function incomeAtVersion(state, tokens, version) {
+  return version >= AUTO_CONSTRUCTION_VERSION
+    ? constructionIncome(state, Number(tokens), version)
+    : projectIncome(state, Number(tokens), version);
+}
+
+export const workYieldOf = (state, tokens) => incomeAtVersion(state, tokens, RULES_VERSION).income;
+
+// 施工事件只能隨收入交易發布，不接受外部單獨下令。
+const constructionEvent = { precheck: () => "income_required", apply: applyConstruction };
 
 /**
  * 每一種 operation 的套用與前提檢查。entry 只要帶上自己的欄位即可，格式不用改。
  */
 export const KINDS = {
+  autoStart: constructionEvent,
+  autoComplete: constructionEvent,
+  manualStart: constructionEvent,
+  manualComplete: constructionEvent,
   /**
    * 共用城市的啟用邊界（#23）：只寫一次，記下第一次啟用的時間。之後才結束的工作回合才入帳；
    * 時間跟著 entry 存進 journal，重播不會改變。
@@ -313,13 +328,14 @@ export const KINDS = {
       if (op.cityId !== state.cityId) return "wrong_city";
       if (!Number.isSafeInteger(Number(op.tokens) + state.work.tokens) || !(Number(op.tokens) > 0)) return "invalid_income";
       if (!Array.isArray(op.sources) || op.sources.length === 0) return "missing_sources";
-      // 收成要跟「這筆提交之前」的計量器餘數相符：CAS 重試重新計算，驗的也是同一條規則。
-      if (!sameCosts(op.resources, workYieldOf(state, op.tokens))) return "rate_mismatch";
       if (op.sources.some((source) => state.claims.has(claimKey(op.cityId, source)))) return "source_exists";
       return null;
     },
     apply(state, entry) {
-      if (entry.rulesVersion >= POPULATION_VERSION) {
+      if (entry.rulesVersion >= AUTO_CONSTRUCTION_VERSION) {
+        adjust(state, entry.resources, 1);
+        Object.assign(state.work, entry.meter);
+      } else if (entry.rulesVersion >= POPULATION_VERSION) {
         const projected = projectIncome(state, entry.tokens, entry.rulesVersion);
         if (!sameCosts(entry.resources, projected.income)) throw new Error("收入與進帳前的城市不符");
         state.work = projected.work;
@@ -367,7 +383,7 @@ export const KINDS = {
   plan: {
     precheck(state, op) {
       if (op.cityId !== state.cityId) return "wrong_city";
-      if (state.queue.length >= BUILD_QUEUE_LIMIT) return "queue_full";
+      if (manualCount(state.queue) >= BUILD_QUEUE_LIMIT) return "queue_full";
       const def = CITY_BUILDINGS[op.building];
       if (!def) return "unknown_building";
       if (Number(op.w) !== def.footprint.w || Number(op.h) !== def.footprint.h) return "footprint_mismatch";
@@ -464,6 +480,7 @@ export const KINDS = {
       const item = queueItemOf(state, entry.plan);
       state.queue = state.queue.filter((other) => other !== item);
       if (item.paid) adjust(state, item.costs, 1);
+      if (entry.roadsideFull != null) state.work.roadsideFull = entry.roadsideFull;
       if (entry.rulesVersion >= UNIT_CONSTRUCTION_VERSION) startReadyHead(state, state.work.units ?? 0);
     },
   },
@@ -740,11 +757,22 @@ export class CityLedger {
       }
       const reason = KINDS[op.kind]?.precheck?.(state, op, blobs);
       if (reason) return { status: "rejected", reason, attempts: attempt };
+      const { blobs: _ignored, ...fields } = op;
+      let events = [];
+      if (op.kind === "income") {
+        const projected = incomeAtVersion(state, op.tokens, this.rulesVersion);
+        if (op.resources && !sameCosts(op.resources, projected.income)) return { status: "rejected", reason: "rate_mismatch", attempts: attempt };
+        fields.resources = projected.income;
+        if (projected.events) {
+          const { tokens, units, carry, roadsideFull } = projected.work;
+          fields.meter = { tokens, units, carry, roadsideFull };
+          events = projected.events;
+        }
+      }
 
       const content = blobs ? (await this.writeBlob(blobs)).hash : null;
       if (options.crash === "after-content") throw new CrashAfterContent(op.opId);
 
-      const { blobs: _ignored, ...fields } = op;
       const entry = {
         journalSeq: state.lastSeq + 1,
         at: op.at ?? Date.now(),
@@ -752,7 +780,15 @@ export class CityLedger {
         ...fields,
         content,
       };
-      const line = `${JSON.stringify(entry)}\n`;
+      // 連續序號、同一個 CAS：讀取者不會看到已領收入卻漏開工的半筆交易。
+      let line = `${JSON.stringify(entry)}\n`;
+      for (let i = 0; i < events.length; i++) {
+        const event = events[i];
+        event.journalSeq = entry.journalSeq + i + 1;
+        event.cityId = entry.cityId;
+        event.at = entry.at;
+        line += `${JSON.stringify(event)}\n`;
+      }
       const current = tail.text ?? "";
 
       // 這一段放不下下一筆（封段行也算在裡面）：先 CAS 附加封段行，再換段；
@@ -792,8 +828,9 @@ export class CityLedger {
       if (options.crash === "after-journal") throw new CrashAfterJournal(op.opId);
       // 這筆已經在 journal 裡了：直接套進快取，不用再讀一次。
       applyTo(state, entry, blobs);
+      for (const event of events) applyTo(state, event, null);
       this.cache.segment = tail.index;
-      this.cache.tail = { index: tail.index, text: `${current}${line}`, entries: tail.entries + 1 };
+      this.cache.tail = { index: tail.index, text: `${current}${line}`, entries: tail.entries + 1 + events.length };
       return { status: "applied", journalSeq: entry.journalSeq, opId: entry.opId, attempts: attempt };
     }
     return { ...last, attempts: MAX_ATTEMPTS };

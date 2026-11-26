@@ -76,7 +76,7 @@ export function footprintCells(building, { x, y }, footprint = CITY_BUILDINGS[bu
  * 回傳 `(building, anchor) => 預覽`；`siteCheck` 與 `legalSites` 都走這一個函式。
  * 占用只看已完工的建築與**整條佇列**（施工中與排隊中的預定地都算），所以佇列裡的兩項不會重疊。
  */
-function siteChecker(city) {
+export function siteChecker(city) {
   const revealed = revealedCells(city);
   const built = new Set((city?.buildings ?? []).flatMap((done) => done.cells.map(keyOf)));
   const planned = new Set((city?.queue ?? []).flatMap((item) => (item.cells ?? []).map(keyOf)));

@@ -33,6 +33,40 @@ function playerScreen(root) {
   return lines.join("|");
 }
 
+test("頂欄最缺與停工用語", () => {
+  const { town, tree } = open();
+  const house = { building: "house", label: "民居", x: 3, y: 1, w: 2, h: 1, cells: [{ x: 3, y: 1 }, { x: 4, y: 1 }] };
+  for (const [buildings, amounts, hint, full] of [
+    [[], [70, 35, 6], "缺人", false],
+    [[house], [2598, 2599, 1299], "缺木", false], // 三材同分
+    [[house], [2700, 2601, 1390], "缺石", true], // 皆有餘裕，石的緩衝最小
+    [[house], [2600, 2600, 0], "缺鐵", false],
+  ]) {
+    const [wood, stone, iron] = amounts;
+    town.town.shared = readSharedCity({ buildings, resources: { wood, stone, iron }, work: { roadsideFull: full } });
+    const screen = tree();
+    playerScreen(screen);
+    const lines = texts(findById(screen, "top"));
+    expect(lines.filter(s => /缺[人木石鐵]/.test(s))).toEqual([hint]);
+    expect(lines.includes("路旁沒有可蓋的地")).toBe(full);
+  }
+});
+
+test("最缺目標：村落、市鎮與手動隊首", () => {
+  const { town, tree } = open();
+  const house = { building: "house", label: "民居", x: 3, y: 1, w: 2, h: 1, cells: [{ x: 3, y: 1 }, { x: 4, y: 1 }] };
+  const library = { building: "library", label: "書庫", x: 2, y: 2, w: 2, h: 2,
+    cells: [{ x: 2, y: 2 }, { x: 3, y: 2 }, { x: 2, y: 3 }, { x: 3, y: 3 }], costs: { wood: 20, stone: 20, iron: 5 } };
+  for (const [era, queue, expected] of [
+    ["village", [], "缺石"], // 升市鎮：木、石、鐵需 40000/31、80320/31、41600/31 份。
+    ["town", [], "缺鐵"],    // 第二棟民居：23 木、12 石、7 鐵。
+    ["village", [library], "缺鐵"], // 隊首書庫只缺 5 鐵。
+  ]) {
+    town.town.shared = readSharedCity({ era, buildings: [house], queue, resources: { wood: 100, stone: 90, iron: 0 } });
+    expect(texts(findById(tree(), "top")).filter(s => /^缺[人木石鐵]$/.test(s))).toEqual([expected]);
+  }
+});
+
 test("新城外框與道路", () => {
   const { town, cx, tree } = open();
   town.town.shared = readSharedCity({ terrainVersion: 1 });
@@ -110,7 +144,7 @@ test("人口維護與缺人只用玩家用語", () => {
   buildings.push(building("house", "民居", 2, 3));
   town.town.shared = readSharedCity({ buildings });
   expect(playerScreen(findById(tree(), "top"))).toContain("人口 5/6|維護 8.33%");
-  expect(playerScreen(tree())).not.toContain("缺人");
+  expect(playerScreen(tree())).not.toContain("書庫・缺人");
 });
 
 describe("固定情境的分區與庫存", () => {

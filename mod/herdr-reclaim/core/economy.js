@@ -18,15 +18,15 @@ export function workforce(buildings) {
     if (jobs && demand > capacity) understaffed.add(b);
     else assigned += jobs;
   }
-  return { capacity, assigned, understaffed };
+  return { capacity, demand, assigned, understaffed };
 }
 
 /** 每個相符格歸第一棟，即使它已達上限也不轉給後來的產場。 */
-export function grossYield(city) {
-  if (!city.buildings.some(b => CITY_BUILDINGS[b.building]?.production)) return WORK_YIELD;
+export function grossYield(city, available) {
+  if (!available && !city.buildings.some(b => CITY_BUILDINGS[b.building]?.production)) return WORK_YIELD;
   const gross = { ...WORK_YIELD };
   const { understaffed } = workforce(city.buildings);
-  const available = revealedCells(city);
+  available ??= revealedCells(city);
   for (const cell of CENTER_CELLS) available.delete(keyOf(cell));
   for (const list of [city.buildings, city.queue]) {
     for (const item of list) for (const cell of item.cells) available.delete(keyOf(cell));

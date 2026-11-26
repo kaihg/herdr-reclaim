@@ -43,7 +43,7 @@ describe("載入鏈", () => {
     const screen = text(tree());
     expect(screen).toContain(`共用倉庫|${START_RESOURCES.wood}|木材|${START_RESOURCES.stone}|石材|${START_RESOURCES.iron}|鐵料`);
     expect(screen).not.toContain("讀取失敗");
-    expect(screen).toContain("沒有建設目標");
+    expect(screen).toContain("缺人");
   });
 
   test("帳本裡的一筆收入：重開就變成畫面上的庫存", async () => {
@@ -88,16 +88,12 @@ describe("選址到下令（真的寫進帳本）", () => {
     town.submitPlan({ building: "outpost", x: 10, y: 0, label: "哨站" }, cx);
     await waitFor(() => town.toast?.text?.includes("沒有預定"));
     expect(town.toast.text).toBe("沒有預定：有一角還在迷霧裡");
-    expect((await ledgerState(host.home)).queue).toEqual([]);
+    expect((await ledgerState(host.home)).queue).toEqual([]); // 哨站付料後僅剩 5 鐵，民居不能開工。
   });
 
   test("點選預定付料，重開工地不排完工計時器", async () => {
-    // 七份工作另收木 14、石 7、鐵 7。
-    await open();
-    const before = await ledgerState(host.home);
-    expect((await submitOp(host.home, incomeOp(70_000, "seed-house"))).status).toBe("applied");
-    const funded = await ledgerState(host.home);
-    expect(funded.resources.wood).toBe(before.resources.wood + 14);
+    // 起始庫存已能支付首棟；尚未進帳，不會先啟動沿線工地。
+    const funded = (await open()).town.town.shared.city;
     const { cx, town, tree } = await open();
     expect(text(tree())).toContain(`共用倉庫|${funded.resources.wood}|木材|${funded.resources.stone}|石材|${funded.resources.iron}|鐵料`);
 
@@ -129,7 +125,7 @@ describe("選址到下令（真的寫進帳本）", () => {
     const state = await ledgerState(host.home);
     expect(state.queue).toHaveLength(1);
     expect(state.queue[0]).toMatchObject({ building: "house", x: site.x, y: site.y, paid: true });
-    expect(state.queue[0].startedUnit).toBe(7);
+    expect(state.queue[0].startedUnit).toBe(0);
     expect([state.resources.wood, state.resources.stone]).toEqual([funded.resources.wood - 20, funded.resources.stone - 10]);
     const after = text(tree());
     expect(after).toContain("建設佇列（1/3）");

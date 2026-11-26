@@ -21,7 +21,7 @@ import { CasConflict, CityLedger } from "./core/ledger.js";
 import { quotaLines } from "./core/provider-stats.js";
 import { QUOTA_REFRESH_MS, QUOTA_SOURCE, claimQuotaAttempt, parseQuotaReport } from "./core/quota-source.js";
 import { quotaView, readQuotaView } from "./core/quota-view.js";
-import { CITY_BUILDINGS, RESOURCE_LABELS, RULES_VERSION } from "./core/rules.js";
+import { CITY_BUILDINGS, RESOURCE_LABELS, RULES_VERSION, manualCount } from "./core/rules.js";
 import { parseUi, selectionOf, serializeUi, withDev, withSelection } from "./core/selection.js";
 import {
   SHARED_CITY_ID, cancelPlan, placePlan, readSharedCity, sharedCityDir,
@@ -93,10 +93,10 @@ const poolOf = (shared) => (shared.queue ?? [])
     for (const [key, amount] of Object.entries(item.costs ?? {})) pool[key] = Number(pool[key] ?? 0) - Number(amount);
     return pool;
   }, { ...shared.resources });
-/** 頂欄那一行：先看佇列最前面那一項（施工中或排第一），都沒有就只存料。 */
+const shortageLabel = { people: "缺人", wood: "缺木", stone: "缺石", iron: "缺鐵" };
 const queueSummary = (city, dev) => {
   const head = city.queue?.[0];
-  return head ? queueLine(head, dev) : "沒有建設目標：只累積庫存";
+  return head ? queueLine(head, dev) : city.roadsideFull ? "路旁沒有可蓋的地" : "等下一份進帳施工";
 };
 /** 共用城市地圖的半徑：至少 MAP_RADIUS，涵蓋全部已揭開的格子，再多一圈迷霧當邊界。 */
 const sharedRadius = (revealed) => {
@@ -428,7 +428,8 @@ export default class Town extends View {
       .child(div().text_size(12.5).child(this.devMode
         ? `${shared.work.tokens}/${shared.work.unitTokens} token`
         : `${Math.floor(100 * shared.work.tokens / shared.work.unitTokens)}%`));
-    const target = div().text_size(10).text_color(t.muted).truncate().child(queueSummary(shared, this.devMode));
+    const target = v_flex().min_w(0).child(div().text_size(10).text_color(t.muted).truncate().child(queueSummary(shared, this.devMode)))
+      .when(shared.roadsideFull && shared.queue.length > 0, el => el.child(div().text_size(10).child("路旁沒有可蓋的地")));
     const center = stacked
       ? v_flex().flex_1().min_w(0).overflow_hidden().gap(2).child(stock).child(work).child(target)
       : h_flex().flex_1().min_w(0).overflow_hidden().items_center().justify_center().gap(14).child(stock).child(work).child(target);
@@ -450,7 +451,8 @@ export default class Town extends View {
           .child(div().text_size(10).text_color(t.dim).child("共用城市"))
           .child(div().text_size(stacked ? 13 : 17).font_semibold().truncate().child(shared.name))
           .child(div().text_size(11).child(`人口 ${shared.population.assigned}/${shared.population.capacity}`))
-          .child(div().text_size(11).child(`維護 ${Number((shared.maintenance * 100).toFixed(2))}%`)),
+          .child(div().text_size(11).child(`維護 ${Number((shared.maintenance * 100).toFixed(2))}%`))
+          .child(div().text_size(12).font_semibold().child(shortageLabel[shared.shortage])),
         center,
         v_flex()
           .w(blockW)
@@ -474,7 +476,7 @@ export default class Town extends View {
   /** 左側：建設佇列的摘要、可選的建築與額度。佇列明細在右側（可逐項取消）。 */
   sharedPanel(shared, t, cx, width) {
     const queue = shared.queue;
-    const full = queue.length >= shared.queueLimit;
+    const full = manualCount(queue) >= shared.queueLimit;
     return v_flex()
       .id("city-panel")
       .w(width)
@@ -487,7 +489,7 @@ export default class Town extends View {
       .border_r(1)
       .border_color(t.border)
       .children([
-        div().text_size(10).text_color(t.dim).child(`建設佇列（${queue.length}/${shared.queueLimit}）`),
+        div().text_size(10).text_color(t.dim).child(`建設佇列（${manualCount(queue)}/${shared.queueLimit}）`),
         div().text_size(13).font_semibold().truncate().child(queue.length ? queue[0].label : "選一棟建築"),
         div().text_size(9).text_color(t.muted).child(queue.length
           ? queueLine(queue[0], this.devMode)
@@ -506,7 +508,7 @@ export default class Town extends View {
   /** 一種建築：點下去進入選址；佇列滿了才不能選。 */
   buildingCard(shared, building, t, cx) {
     const selected = this.picking === building.name;
-    const locked = shared.queue.length >= shared.queueLimit;
+    const locked = manualCount(shared.queue) >= shared.queueLimit;
     const missing = missingOf(building.costs, shared.resources);
     const affordable = Object.keys(missing).length === 0;
     return v_flex()
@@ -535,8 +537,8 @@ export default class Town extends View {
 
   /** 選一種建築開始選址；佇列滿了才不能選（還在排隊的項目彼此不擋）。 */
   pickBuilding(shared, building, cx) {
-    if (shared.queue.length >= shared.queueLimit) {
-      this.showToast(`建設佇列已滿（${shared.queue.length}/${shared.queueLimit}）：先讓最前面那一項完工，或取消還沒開工的一項`, cx);
+    if (manualCount(shared.queue) >= shared.queueLimit) {
+      this.showToast(`建設佇列已滿（${manualCount(shared.queue)}/${shared.queueLimit}）：先讓最前面那一項完工，或取消還沒開工的一項`, cx);
       return;
     }
     this.picking = this.picking === building ? null : building;
@@ -637,7 +639,7 @@ export default class Town extends View {
     const def = cityBuildings(shared).find((building) => building.name === preview.building);
     const missing = def ? missingOf(def.costs, poolOf(shared)) : {};
     const ready = Object.keys(missing).length === 0;
-    const room = shared.queue.length < shared.queueLimit;
+    const room = manualCount(shared.queue) < shared.queueLimit;
     return [
       div().text_size(14).font_semibold().child(preview.label + locationLabel(preview, this.devMode)),
       fieldRow({ label: "用途", value: CITY_BUILDINGS[preview.building].purpose }, t),
@@ -652,7 +654,7 @@ export default class Town extends View {
       def ? div().text_size(9).text_color(ready ? t.done : t.muted)
         .child(ready ? "排在佇列後面也付得出來：輪到它就開工" : `排在目前佇列之後還缺 ${missingText(missing)}；${INCOME_HINT}，輪到它才付料`) : null,
       room ? null : div().text_size(9).text_color(t.blocked)
-        .child(`建設佇列已滿（${shared.queue.length}/${shared.queueLimit}）：先讓最前面那一項完工，或取消還沒開工的一項。`),
+        .child(`建設佇列已滿（${manualCount(shared.queue)}/${shared.queueLimit}）：先讓最前面那一項完工，或取消還沒開工的一項。`),
       preview.ok && room ? chipButton("預定這裡", t, (cx2) => this.submitPlan(preview, cx2)) : null,
       chipButton("取消選址", t, (cx2) => {
         this.preview = null;
@@ -664,7 +666,7 @@ export default class Town extends View {
   /** 施工中顯示剩餘份數；排隊中的項目顯示累計缺料，並可取消。 */
   queueSection(shared, t, cx) {
     return [
-      div().text_size(10).text_color(t.dim).child(`建設佇列 ${shared.queue.length}/${shared.queueLimit}`),
+      div().text_size(10).text_color(t.dim).child(`建設佇列 ${manualCount(shared.queue)}/${shared.queueLimit}`),
       ...shared.queue.map((item, index) => {
         const building = item.stage === "building";
         const missing = Object.keys(item.missing ?? {}).length > 0;
@@ -709,7 +711,7 @@ export default class Town extends View {
       div().text_size(9).text_color(t.muted).child(
         this.picking ? "這一格是整棟占地的左上角：在地圖點它就會顯示預覽。" : "選一棟建築之後，這裡會列出整棟占地的判斷。",
       ),
-      ...(shared.queue.length ? [div().text_size(9).text_color(t.dim).child(`建設佇列 ${shared.queue.length}/${shared.queueLimit}：${queueLine(shared.queue[0], this.devMode)}。`)] : []),
+      ...(shared.queue.length ? [div().text_size(9).text_color(t.dim).child(`建設佇列 ${manualCount(shared.queue)}/${shared.queueLimit}：${queueLine(shared.queue[0], this.devMode)}。`)] : []),
     ];
   }
 

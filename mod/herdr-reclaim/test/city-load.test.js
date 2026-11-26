@@ -87,9 +87,117 @@ const load = async (base) => {
   return { ...town, city: town.shared.city };
 };
 const stock = (city) => [city.resources.wood, city.resources.stone, city.resources.iron];
-const times = (n) => ["wood", "stone", "iron"].map((key) => START_RESOURCES[key] + WORK_YIELD[key] * n);
+const times = (n) => ["wood", "stone", "iron"].map((key, i) => START_RESOURCES[key] + WORK_YIELD[key] * n - [20, 10, 6][i]);
 
 const openCity = (base) => new CityLedger({ io: createFileIo(), dir: sharedCityDir(base), cityId: SHARED_CITY_ID }).open();
+
+test("分批同城", async () => {
+  async function play(every, rounds = 8, units = 13) {
+    const base = root();
+    try {
+      for (let i = 1; i <= rounds; i++) {
+        writeActivity(base, record("work", "e1", { rounds: i, units }));
+        if (i % every === 0) await load(base);
+      }
+      const { city } = await load(base);
+      expect(city.buildings[0]).toMatchObject({ auto: true, building: "house", startedUnit: 1, completedUnit: 15 });
+      expect(city.buildings[1]).toMatchObject({ auto: true, building: "quarry", startedUnit: 15, completedUnit: 33 });
+      await (await openCity(base)).checkpoint();
+      expect((await load(base)).city).toEqual(city);
+      return city;
+    } finally { fs.rmSync(base, { recursive: true, force: true }); }
+  }
+  const daily = await play(8);
+  expect(await play(1)).toEqual(daily);
+  expect(await play(3)).toEqual(daily);
+  expect(await play(1, 1, 104)).toEqual(daily);
+});
+
+test("雙窗與中斷", async () => {
+  for (const committed of [false, true]) {
+    const base = root();
+    try {
+      await load(base);
+      writeActivity(base, record("work", "e1", { units: 15 }));
+      const disk = createFileIo();
+      const io = { ...disk, async write(file, text, expected) {
+        if (file.includes("/journal/") && text.slice(expected?.length ?? 0).includes('\"kind\":\"autoComplete\"')) {
+          if (committed) await disk.write(file, text, expected);
+          throw new Error("施工中斷");
+        }
+        await disk.write(file, text, expected);
+      } };
+      await expect(loadCity(io, { root: base, list })).rejects.toThrow("施工中斷");
+      fs.rmSync(`${base}/activity`, { recursive: true });
+      const [a, b] = await Promise.all([load(base), load(base)]);
+      expect(a.city).toEqual(b.city);
+      expect(a.city.buildings.map(i => [i.building, i.completedUnit])).toEqual([["house", 15]]);
+      expect(a.city.queue[0]).toMatchObject({ auto: true, startedUnit: 15 });
+      const events = (await (await openCity(base)).scanSegments()).flatMap(s => s.entries).filter(e => e.kind.startsWith("auto"));
+      expect(events.map(e => [e.kind, e.unit])).toEqual([["autoStart", 1], ["autoComplete", 15], ["autoStart", 15]]);
+      expect(new Set(events.map(e => e.opId)).size).toBe(3);
+    } finally { fs.rmSync(base, { recursive: true, force: true }); }
+  }
+});
+
+test("逐格沿線與停工", async () => {
+  const base = root();
+  try {
+    writeActivity(base, record("full", "e1", { units: 3000 }));
+    const { city } = await load(base);
+    expect(city.roadsideFull).toBe(true);
+    expect(city.queue).toEqual([]);
+    const roads = [[0, -2], [2, 0], [0, 2], [-2, 0]];
+    const distances = city.buildings.map(b => b.cells.map(c => Math.min(...roads.map(([x, y]) => Math.max(Math.abs(c.x - x), Math.abs(c.y - y))))));
+    expect(distances.every(ds => ds.every(d => d <= 3))).toBe(true);
+    expect(distances.some(ds => ds.length >= 2 && Math.min(...ds) >= 2 && Math.max(...ds) === 3)).toBe(true);
+    writeActivity(base, record("again", "e2", { units: 100, from: AT + 200_000 }));
+    const later = (await load(base)).city;
+    expect(later.buildings).toEqual(city.buildings);
+    expect(later.resources.wood).toBeGreaterThan(city.resources.wood);
+  } finally { fs.rmSync(base, { recursive: true, force: true }); }
+});
+
+test("手動優先與保料", async () => {
+  for (const wood of [77, 80]) {
+    const base = root();
+    try {
+      const ledger = await openCity(base);
+      // 舊版已完工的民居不需鐵；用真實舊格式建立有人力但缺鐵的新施工線。
+      const plan = "house:3,1:0";
+      const history = [
+        { kind: "workStart", terrainVersion: 1, roadArmLength: 1, resources: { wood: wood + 20, stone: 100, iron: 0 } },
+        { kind: "plan", building: "house", x: 3, y: 1, w: 1, h: 1, costs: { wood: 20, stone: 10 } },
+        { kind: "construct", plan, buildMs: 1 }, { kind: "complete", plan, reveal: 2 },
+      ];
+      fs.writeFileSync(ledger.segmentPath(0), history.map((op, i) => JSON.stringify({ ...op, cityId: ledger.cityId,
+        rulesVersion: 11, at: 0, journalSeq: i, opId: `legacy-${i}` }) + "\n").join(""));
+      expect((await placePlan(ledger, { building: "library", x: -2, y: 2, at: AT })).status).toBe("applied");
+      writeActivity(base, record("work", "e1"));
+      const first = (await load(base)).city;
+      if (wood === 77) {
+        expect(first.queue.map(i => i.stage)).toEqual(["queued"]);
+        expect(first.resources.wood).toBe(78); // 已夠工坊 60，但不能動用書庫的 20。
+        expect(first.roadsideFull).toBe(false);
+      } else {
+        expect(first.queue.map(i => [i.building, i.stage])).toEqual([["workshop", "building"], ["library", "queued"]]);
+        expect(first.resources.wood).toBe(21);
+        const player = await openCity(base);
+        expect((await placePlan(player, { building: "market", x: 2, y: 2, at: AT + 1 })).status).toBe("applied");
+        expect((await load(base)).city.queue.map(i => [i.building, i.stage])).toEqual([
+          ["workshop", "building"], ["library", "queued"], ["market", "queued"],
+        ]);
+        writeActivity(base, record("more", "e2", { units: 10, from: AT + 100_000 }));
+        const waiting = (await load(base)).city;
+        expect(waiting.queue[1]).toMatchObject({ stage: "queued", missing: {} });
+        writeActivity(base, record("finish", "e3", { units: 11, from: AT + 200_000 }));
+        const next = (await load(base)).city;
+        expect(next.buildings.at(-1)).toMatchObject({ building: "workshop", completedUnit: 22 });
+        expect(next.queue[0]).toMatchObject({ building: "library", startedUnit: 22 });
+      }
+    } finally { fs.rmSync(base, { recursive: true, force: true }); }
+  }
+});
 
 test("整筆與拆份重播相同", async () => {
   async function play(rounds, units) {
@@ -300,8 +408,8 @@ describe("正式載入路徑：活動檔 → 共用城市", () => {
       // 六個回合，每回合一份基本收入。
       expect(stock(first.city)).toEqual(times(6));
       expect(first.city.work.tokens).toBe((6 * (7_000 + 3_000)) % WORK_TOKENS_PER_UNIT);
-      // 沒有遠征格、沒有預定地、沒有建築：只有共用城市的起始土地。
-      expect(first.city.queue).toEqual([]);
+      // 第一份只付一次民居配方；完工之前仍只有起始揭開區。
+      expect(first.city.queue.map(i => [i.building, i.startedUnit])).toEqual([["house", 1]]);
       expect(first.city.buildings).toEqual([]);
       expect(first.city.tiles).toBeUndefined();
       expect(revealedCells(first.city).size).toBe(81);
@@ -334,15 +442,13 @@ describe("正式載入路徑：活動檔 → 共用城市", () => {
   test("無進帳不完工", async () => {
     const base = root();
     try {
-      // 十份工作收木 20、石 10、鐵 10，足夠支付首棟民居。
-      writeActivity(base, record("solo", "solo-1", { rounds: 10 }));
-      const first = await load(base);
-      expect(stock(first.city)).toEqual(times(10));
-
+      await load(base);
       const ledger = await openCity(base);
-      expect((await placePlan(ledger, { building: "house", x: 3, y: 1, at: AT + 900_000 })).status).toBe("applied");
+      expect((await placePlan(ledger, { building: "house", x: 3, y: 1, at: AT })).status).toBe("applied");
+      writeActivity(base, record("solo", "solo-1", { rounds: 10 }));
       const building = await load(base);
-      expect(building.city.queue[0]).toMatchObject({ building: "house", stage: "building", remainingUnits: 14 });
+      expect(stock(building.city)).toEqual(times(10));
+      expect(building.city.queue[0]).toMatchObject({ building: "house", stage: "building", remainingUnits: 4 });
 
       const clock = spyOn(Date, "now").mockReturnValue(AT + 365 * 86_400_000);
       try {
@@ -350,14 +456,15 @@ describe("正式載入路徑：活動檔 → 共用城市", () => {
       } finally {
         clock.mockRestore();
       }
-      writeActivity(base, record("more", "e1", { units: 14, from: AT + 1_000_000 }));
+      writeActivity(base, record("more", "e1", { units: 4, from: AT + 1_000_000 }));
       const done = await load(base);
-      expect(done.city.queue).toEqual([]);
+      expect(done.city.queue[0]).toMatchObject({ auto: true, startedUnit: 14 });
       expect(done.city.buildings.map((entry) => [entry.building, entry.x, entry.y])).toEqual([["house", 3, 1]]);
       // 完工揭開新土地：正式路徑重讀之後，那一格是看得到的。
       expect(revealedCells(done.city).has("5,0")).toBe(true);
-      // 只做研究、沒有 commit：庫存只扣一次配方，沒有成果加成。
-      expect(stock(done.city)).toEqual([START_RESOURCES.wood + 28, START_RESOURCES.stone + 14, START_RESOURCES.iron + 18]);
+      for (const [i, k] of ["wood", "stone", "iron"].entries()) {
+        expect(done.city.resources[k] + (done.city.queue[0].costs[k] ?? 0)).toBe(times(14)[i]);
+      }
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
     }

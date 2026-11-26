@@ -11,7 +11,8 @@
 // 這一票交付「工作 → 基本建材 + 常駐庫存」。
 // 選址與佇列見 #25／#26、ADR 0003；#33 起，入庫、工地進度與隊首付料是同一筆帳。
 // 舊版各城帳本留在磁碟上，不讀也不改。
-import { claimKey, planKey, workYieldOf } from "./ledger.js";
+import { claimKey, planKey } from "./ledger.js";
+import { needs, roadsideSites } from "./roadside.js";
 import { BUILD_QUEUE_LIMIT, BUILDINGS_V12, CITY_BUILDINGS, POPULATION_VERSION, START_RESOURCES, START_ROAD_LENGTH, TERRAIN_VERSION, WORK_TOKENS_PER_UNIT, WORK_YIELD, isBuilding, recipeOf } from "./rules.js";
 import { buildingCount, maintenanceRate, workforce } from "./economy.js";
 import { missingOf } from "./city-map.js";
@@ -130,20 +131,7 @@ export async function ingestIncome(ledger, { activities = [], activateAt } = {})
   for (const settlement of settlements) {
     // 收成依「提交當下」的計量器餘數計算（不是單一回合的 token）：CAS 重試時重新讀到最新餘數，
     // 兩個視窗同時提交也不會有人把別人的餘數吃掉。entry 存的是實際發出的建材。
-    const result = await ledger.submit((current) => ({
-      opId: settlement.opId,
-      kind: "income",
-      at: settlement.at,
-      openAt: settlement.openAt,
-      cityId: settlement.cityId,
-      rootSessionId: settlement.rootSessionId,
-      sessionId: settlement.sessionId,
-      writerEpoch: settlement.writerEpoch,
-      round: settlement.round,
-      tokens: settlement.tokens,
-      sources: settlement.sources,
-      resources: workYieldOf(current, settlement.tokens),
-    }));
+    const result = await ledger.submit(() => ({ ...settlement, kind: "income" }));
     results.push(result);
   }
   return { settlements, results };
@@ -175,6 +163,9 @@ export function readSharedCity(state = {}) {
   });
   const buildings = state.buildings ?? [];
   const { capacity, assigned, understaffed } = workforce(buildings);
+  const resources = Object.fromEntries(Object.keys(WORK_YIELD).map(k => [k, Number(state.resources?.[k] ?? 0)]));
+  const city = { ...state, buildings, queue, resources };
+  const priority = needs(city);
   return {
     schema: 2,
     city: {
@@ -183,7 +174,9 @@ export function readSharedCity(state = {}) {
       terrainVersion: state.terrainVersion,
       terrainSeed: state.terrainSeed,
       roadArmLength: state.roadArmLength,
-      resources: Object.fromEntries(Object.keys(WORK_YIELD).map((key) => [key, Number(state.resources?.[key] ?? 0)])),
+      resources,
+      shortage: priority[0],
+      roadsideFull: !isBuilding(queue[0] ?? {}) && state.work?.roadsideFull === true,
       work: { tokens: Number(state.work?.tokens ?? 0), unitTokens: WORK_TOKENS_PER_UNIT },
       population: { assigned, capacity },
       maintenance: maintenanceRate(buildingCount(buildings)),
@@ -228,11 +221,16 @@ export async function placePlan(ledger, { building, x, y, at } = {}) {
  * 已開工的項目不能取消（`already_started`）；被拒的取消不寫任何東西，帳本與庫存都不動。
  */
 export async function cancelPlan(ledger, item) {
-  return ledger.submit(() => ({
-    opId: `cancel:${ledger.cityId}:${planKey(item)}`,
+  const plan = planKey(item);
+  return ledger.submit(current => ({
+    opId: `cancel:${ledger.cityId}:${plan}`,
     kind: "cancel",
     at: Date.now(),
     cityId: ledger.cityId,
-    plan: planKey(item),
+    plan,
+    // 只有已停工才需要重新判斷釋出的土地；重播沿用取消時的答案。
+    ...(current.work.roadsideFull ? { roadsideFull: !roadsideSites({
+      ...current, queue: current.queue.filter(p => planKey(p) !== plan),
+    })(["people"]) } : {}),
   }));
 }
