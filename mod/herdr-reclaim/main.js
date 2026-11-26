@@ -21,7 +21,7 @@ import { CasConflict, CityLedger } from "./core/ledger.js";
 import { quotaLines } from "./core/provider-stats.js";
 import { QUOTA_REFRESH_MS, QUOTA_SOURCE, claimQuotaAttempt, parseQuotaReport } from "./core/quota-source.js";
 import { quotaView, readQuotaView } from "./core/quota-view.js";
-import { CITY_BUILDINGS, RESOURCE_LABELS, ROAD, ROADSIDE_RANGE, RULES_VERSION, manualCount } from "./core/rules.js";
+import { CITY_BUILDINGS, RESOURCE_LABELS, ROAD, ROADSIDE_RANGE, RULES_VERSION, TOWN_UPGRADE_POPULATION, manualCount, populationGap } from "./core/rules.js";
 import { parseUi, selectionOf, serializeUi, withDev, withSelection } from "./core/selection.js";
 import {
   SHARED_CITY_ID, cancelPlan, placePlan, placeRoad, readSharedCity, sharedCityDir,
@@ -57,6 +57,7 @@ const SITE_PROBLEMS = {
 const INCOME_HINT = "繼續工作就會進帳";
 const PLAN_REASONS = {
   queue_full: "建設佇列已滿",
+  population_locked: "人口還不夠，請先增加民居",
   insufficient_resources: `建材還沒備齊，${INCOME_HINT}`,
   already_started: "已經開工，不能取消",
   no_plan: "佇列裡已經沒有這一項",
@@ -552,6 +553,8 @@ export default class Town extends View {
           : "選好建築後，地圖會標出全部合法位置；點一格看整棟預覽，再按「預定這裡」。"),
         chipButton("鋪路", t, cx2 => this.pickBuilding(shared, "road", cx2)),
         ...cityBuildings(shared).map((building) => this.buildingCard(shared, building, t, cx)),
+        div().text_size(10).text_color(t.muted).child(`升市鎮：人口 ${TOWN_UPGRADE_POPULATION}、書庫運作中${shared.population.capacity < TOWN_UPGRADE_POPULATION ? `；還差 ${TOWN_UPGRADE_POPULATION - shared.population.capacity} 人` : ""}`),
+        div().text_size(10).text_color(t.muted).child("大宅：升為市鎮後解鎖"),
         div().text_size(9).text_color(t.dim)
           .child(full ? "佇列已滿：先讓最前面那一項完工，或取消還沒開工的項目。" : "預定不動庫存：排到隊首、材料備齊才一次付清；還沒開工的項目可以取消。"),
         div().text_size(9).text_color(t.dim)
@@ -562,10 +565,11 @@ export default class Town extends View {
       ]);
   }
 
-  /** 一種建築：點下去進入選址；佇列滿了才不能選。 */
+  /** 未解鎖的卡片說明人口差額，不開放選址。 */
   buildingCard(shared, building, t, cx) {
     const selected = this.picking === building.name;
-    const locked = manualCount(shared.queue) >= shared.queueLimit;
+    const gap = populationGap(building.name, shared.population.capacity);
+    const locked = gap > 0 || manualCount(shared.queue) >= shared.queueLimit;
     const missing = missingOf(building.costs, shared.resources);
     const affordable = Object.keys(missing).length === 0;
     return v_flex()
@@ -575,16 +579,19 @@ export default class Town extends View {
       .gap(2)
       .p(7)
       .rounded(6)
-      .cursor_pointer()
+      .when(!gap, el => el.cursor_pointer())
       .bg(selected ? t.selected : t.surface)
       .border(1)
       .border_color(selected ? t.accent : t.border)
-      .hover((style) => style.bg(selected ? t.selected : t.hover))
-      .on_click((_event, cx2) => this.pickBuilding(shared, building.name, cx2))
+      .when(!gap, el => el.hover(style => style.bg(selected ? t.selected : t.hover))
+        .on_click((_event, cx2) => this.pickBuilding(shared, building.name, cx2)))
       .children([
         div().text_size(11.5).text_color(locked && !selected ? t.dim : t.foreground)
           .child(`${building.label}　${building.footprint.w}×${building.footprint.h}`),
         div().text_size(10).text_color(t.muted).child(CITY_BUILDINGS[building.name].purpose),
+        ...(building.name === "market" ? shared.marketTrades.map(({ from, spent, to, received }) =>
+          div().text_size(10).child(`市場換料：${RESOURCE_LABELS[from]} ${spent} 換${RESOURCE_LABELS[to]} ${received}`)) : []),
+        ...(gap ? [div().text_size(10).text_color(t.accent).child(`還差 ${gap} 人解鎖`)] : []),
         div().text_size(9).text_color(t.muted).truncate().child(costsText(building.costs)),
         div().text_size(9).text_color(t.muted).child(`完工揭開 ${building.reveal} 格`),
         div().text_size(9).text_color(affordable ? t.done : t.muted)

@@ -1,4 +1,4 @@
-import { CITY_BUILDINGS, WORK_YIELD } from "./rules.js";
+import { CITY_BUILDINGS, WORK_YIELD, populationCapacity } from "./rules.js";
 import { revealedCells, surfaceAt } from "./city-map.js";
 import { CENTER_CELLS, cellsWithin, keyOf } from "./grid.js";
 
@@ -8,7 +8,7 @@ const denominator = (n) => 2 * (n + 15);
 export const maintenanceRate = (n) => n / denominator(n);
 
 export function workforce(buildings) {
-  const capacity = buildings.reduce((n, b) => n + (CITY_BUILDINGS[b.building]?.residents ?? 0), 2);
+  const capacity = populationCapacity(buildings);
   let demand = 0, assigned = 0;
   const understaffed = new Set();
   // 清單是 journal 的完工順序。早完工的需求優先；晚完工的小棟也不能插隊。

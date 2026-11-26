@@ -31,7 +31,7 @@ import { byteLen, canonicalJson, hashText } from "./bytes.js";
 import { casWrite, rejectUnlessConflict } from "./cas.js";
 import { PrefixIndex } from "./pages.js";
 import { applyConstruction, constructionIncome } from "./construction.js";
-import { AUTO_CONSTRUCTION_VERSION, manualCount } from "./rules.js";
+import { AUTO_CONSTRUCTION_VERSION, MARKET_VERSION, manualCount, populationCapacity, populationGap } from "./rules.js";
 import { BUILD_QUEUE_LIMIT, BUILDINGS_V12, CITY_BUILDINGS, POPULATION_VERSION, PRODUCTION_VERSION, RESOURCES, RULES_VERSION, UNIT_CONSTRUCTION_VERSION, WORK_TOKENS_PER_UNIT, WORK_YIELD, affordable, isBuilding, recipeOf } from "./rules.js";
 import { buildingCount, creditUnits, grossYield } from "./economy.js";
 import { footprintCells, siteCheck } from "./city-map.js";
@@ -299,6 +299,16 @@ export const KINDS = {
   autoComplete: constructionEvent,
   manualStart: constructionEvent,
   manualComplete: constructionEvent,
+  marketTrade: {
+    ...constructionEvent,
+    apply(state, entry) {
+      applyConstruction(state, entry);
+      const totals = state.work.marketTrades ??= [];
+      const pair = totals.find(p => p.from === entry.from && p.to === entry.to);
+      if (pair) { pair.spent += entry.spent; pair.received += entry.received; }
+      else totals.push({ from: entry.from, to: entry.to, spent: entry.spent, received: entry.received });
+    },
+  },
   /**
    * 共用城市的啟用邊界（#23）：只寫一次，記下第一次啟用的時間。之後才結束的工作回合才入帳；
    * 時間跟著 entry 存進 journal，重播不會改變。
@@ -400,11 +410,12 @@ export const KINDS = {
    * `construct` 不再重複收費，取消時全額退回。新的 entry 沒有這個欄位。
    */
   plan: {
-    precheck(state, op) {
+    precheck(state, op, _blobs, version) {
       if (op.cityId !== state.cityId) return "wrong_city";
       if (manualCount(state.queue) >= BUILD_QUEUE_LIMIT) return "queue_full";
       const def = CITY_BUILDINGS[op.building];
       if (!def) return "unknown_building";
+      if (version >= MARKET_VERSION && populationGap(op.building, populationCapacity(state.buildings))) return "population_locked";
       if (Number(op.w) !== def.footprint.w || Number(op.h) !== def.footprint.h) return "footprint_mismatch";
       if (!sameCosts(op.costs, recipeOf(state, op.building))) return "recipe_mismatch";
       const preview = siteCheck(state, op.building, { x: op.x, y: op.y });
@@ -774,7 +785,7 @@ export class CityLedger {
       if (state.opSeqs.has(op.opId)) {
         return { status: "duplicate", opId: op.opId, journalSeq: state.opSeqs.get(op.opId), attempts: attempt };
       }
-      const reason = KINDS[op.kind]?.precheck?.(state, op, blobs);
+      const reason = KINDS[op.kind]?.precheck?.(state, op, blobs, this.rulesVersion);
       if (reason) return { status: "rejected", reason, attempts: attempt };
       const { blobs: _ignored, ...fields } = op;
       let events = [];

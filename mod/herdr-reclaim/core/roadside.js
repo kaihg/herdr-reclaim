@@ -1,7 +1,7 @@
 import { cellsWithin, keyOf } from "./grid.js";
 import { siteChecker, surfaceAt } from "./city-map.js";
 import { grossYield, workforce } from "./economy.js";
-import { CITY_BUILDINGS, ROADSIDE_RANGE, TOWN_UPGRADE_COSTS, isBuilding, recipeOf } from "./rules.js";
+import { CITY_BUILDINGS, ROADSIDE_RANGE, TOWN_UPGRADE_COSTS, isBuilding, populationCapacity, populationGap, recipeOf } from "./rules.js";
 
 const producers = { wood: "lumberyard", stone: "quarry", iron: "workshop" };
 
@@ -17,7 +17,7 @@ export function needs(city, gross) {
 }
 
 /** 土地只在占地或揭開範圍變動時重算；等料的每一份仍按當下庫存重排種類。 */
-export function roadsideSites(city, range = ROADSIDE_RANGE) {
+export function roadsideSites(city, range = ROADSIDE_RANGE, capacity = populationCapacity(city.buildings)) {
   const { revealed, covered, check } = siteChecker(city, range);
   const anchors = [];
   for (const key of revealed) if (covered.has(key)) {
@@ -56,7 +56,7 @@ export function roadsideSites(city, range = ROADSIDE_RANGE) {
     return winner;
   }
   return priority => {
-    for (const key of priority) if (producers[key]) {
+    for (const key of priority) if (producers[key] && !populationGap(producers[key], capacity)) {
       const site = best(producers[key]);
       if (site) return site;
     }

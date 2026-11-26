@@ -160,7 +160,8 @@ test("產場清單與詳情只用玩家用語", () => {
     ["lumberyard", "伐木場", /木材.*疏林/], ["quarry", "採石場", /石材.*碎石/], ["workshop", "工坊", /鐵料.*碎石.*峭壁/],
   ]) {
     const { town, cx, tree } = open();
-    town.town.shared = readSharedCity({ terrainVersion: 1 });
+    town.town.shared = readSharedCity({ terrainVersion: 1, buildings: Array.from({ length: 5 }, (_, i) =>
+      ({ building: "house", label: "民居", x: -4 + i, y: 4, cells: [{ x: -4 + i, y: 4 }] })) });
     const card = findById(tree(), `building-${type}`);
     expect(playerScreen(card)).toContain(label);
     expect(playerScreen(card)).toMatch(purpose);
@@ -172,6 +173,24 @@ test("產場清單與詳情只用玩家用語", () => {
     town.picking = null;
     town.pickSite(3, 1, cx);
     expect(playerScreen(findById(tree(), "detail"))).toMatch(purpose);
+  }
+});
+
+test("人口門檻與換料用語", () => {
+  const { town, cx, tree } = open();
+  for (const [type, houses, gap] of [["market", 2, 4], ["workshop", 4, 4], ["library", 9, 4]]) {
+    for (const n of [houses, houses + 1]) {
+      const buildings = Array.from({ length: n }, (_, x) => ({ building: "house", x, y: 4, cells: [{ x, y: 4 }] }));
+      town.town.shared = readSharedCity({ buildings, work: { marketTrades: [{ from: "wood", spent: 8, to: "stone", received: 4 }] } });
+      const screen = tree(), card = findById(screen, `building-${type}`);
+      expect(playerScreen(screen)).toContain("市場換料：木材 8 換石材 4");
+      expect(text(screen)).toContain("升市鎮：人口 86、書庫運作中");
+      expect(text(screen)).toContain("大宅：升為市鎮後解鎖");
+      expect(text(card).includes(`還差 ${gap} 人解鎖`)).toBe(n === houses);
+      card.handlers.click?.({}, cx);
+      expect(town.picking).toBe(n === houses ? null : type);
+      town.picking = null;
+    }
   }
 });
 

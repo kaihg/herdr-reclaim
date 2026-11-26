@@ -181,6 +181,7 @@ export function readSharedCity(state = {}) {
       roadsideFull: !isBuilding(queue[0] ?? {}) && state.work?.roadsideFull === true,
       work: { units: state.work?.units ?? 0, tokens: Number(state.work?.tokens ?? 0), unitTokens: WORK_TOKENS_PER_UNIT },
       population: { assigned, capacity },
+      marketTrades: (state.work?.marketTrades ?? []).map(pair => ({ ...pair })),
       maintenance: maintenanceRate(buildingCount(buildings)),
       queue,
       queueLimit: BUILD_QUEUE_LIMIT,

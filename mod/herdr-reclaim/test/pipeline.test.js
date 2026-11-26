@@ -200,17 +200,17 @@ describe("選址到下令（真的寫進帳本）", () => {
 
   test("庫存不夠也能先排進佇列：帳本不扣料，畫面寫還缺；取消之後乾乾淨淨", async () => {
     const { cx, town, tree } = await open();
-    // 起始材料可建第一座市場，付完之後不夠蓋第二座。
-    const buildMarket = () => findById(tree(), "building-market").handlers.click({}, cx);
-    buildMarket();
-    const firstSite = legalSites(town.town.shared.city, "market")[0];
+    // 起始材料足夠建第一座伐木場，不夠付第二座的成長配方。
+    const buildMill = () => findById(tree(), "building-lumberyard").handlers.click({}, cx);
+    buildMill();
+    const firstSite = legalSites(town.town.shared.city, "lumberyard")[0];
     town.pickSite(firstSite.x, firstSite.y, cx);
     findByText(tree(), "預定這裡").handlers.click({}, cx);
     await waitFor(() => town.town.shared.city.queue[0]?.stage === "building");
     const before = await ledgerState(host.home);
-    expect(before.resources.wood).toBeLessThan(40);
-    buildMarket();
-    const site = legalSites(town.town.shared.city, "market")[0];
+    expect(before.resources.wood).toBeLessThan(58);
+    buildMill();
+    const site = legalSites(town.town.shared.city, "lumberyard")[0];
     const tile = mapTiles(tree()).find((node) => node.props.id === `map-${site.x}-${site.y}`);
     tile.handlers.mouseDown.left({ local_position: { x: tile.props.w / 2, y: tile.props.h / 2 }, bounds: {} }, cx);
     const preview = text(tree());
@@ -224,8 +224,8 @@ describe("選址到下令（真的寫進帳本）", () => {
     expect(queued.stage).toBe("queued");
     expect(queued.paid).not.toBe(true);
     expect(queued.missing).toEqual({
-      wood: 40 - before.resources.wood,
-      stone: 20 - before.resources.stone,
+      wood: 58 - before.resources.wood,
+      stone: 29 - before.resources.stone,
     });
     // 指定位置不動庫存。
     const placed = await ledgerState(host.home);

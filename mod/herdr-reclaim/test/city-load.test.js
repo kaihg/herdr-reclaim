@@ -89,7 +89,7 @@ const load = async (base) => {
 const stock = (city) => [city.resources.wood, city.resources.stone, city.resources.iron];
 const times = (n) => ["wood", "stone", "iron"].map((key, i) => START_RESOURCES[key] + WORK_YIELD[key] * n - [20, 10, 6][i]);
 
-const openCity = (base) => new CityLedger({ io: createFileIo(), dir: sharedCityDir(base), cityId: SHARED_CITY_ID }).open();
+const openCity = (base, rulesVersion) => new CityLedger({ io: createFileIo(), dir: sharedCityDir(base), cityId: SHARED_CITY_ID, rulesVersion }).open();
 
 test("分批同城", async () => {
   async function play(every, rounds = 8, units = 13) {
@@ -159,23 +159,27 @@ test("逐格沿線與停工", async () => {
 });
 
 test("手動優先與保料", async () => {
-  for (const wood of [77, 80]) {
+  for (const [wood, houses] of [[77, 10], [80, 10], [80, 1]]) {
     const base = root();
     try {
       const ledger = await openCity(base);
-      // 舊版已完工的民居不需鐵；用真實舊格式建立有人力但缺鐵的新施工線。
-      const plan = "house:3,1:0";
-      const history = [
-        { kind: "workStart", terrainVersion: 1, roadArmLength: 1, resources: { wood: wood + 20, stone: 100, iron: 0 } },
-        { kind: "plan", building: "house", x: 3, y: 1, w: 1, h: 1, costs: { wood: 20, stone: 10 } },
-        { kind: "construct", plan, buildMs: 1 }, { kind: "complete", plan, reveal: 2 },
-      ];
+      // 十棟舊版民居提供人口 42；一棟的對照組沿用舊書庫預定，但新版不能自動蓋工坊。
+      const history = [{ kind: "workStart", terrainVersion: 1, roadArmLength: 1, resources: { wood: wood + 20 * houses, stone: 90 + 10 * houses, iron: 0 } }];
+      for (let i = 0; i < houses; i++) {
+        const x = 3 + i * 2, plan = `house:${x},1:0`;
+        history.push({ kind: "plan", building: "house", x, y: 1, w: 1, h: 1, costs: { wood: 20, stone: 10 } },
+          { kind: "construct", plan, buildMs: 1 }, { kind: "complete", plan, reveal: 2 });
+      }
       fs.writeFileSync(ledger.segmentPath(0), history.map((op, i) => JSON.stringify({ ...op, cityId: ledger.cityId,
         rulesVersion: 11, at: 0, journalSeq: i, opId: `legacy-${i}` }) + "\n").join(""));
-      expect((await placePlan(ledger, { building: "library", x: -2, y: 2, at: AT })).status).toBe("applied");
+      const planner = houses === 1 ? await openCity(base, 16) : ledger;
+      expect((await placePlan(planner, { building: "library", x: -2, y: 2, at: AT })).status).toBe("applied");
       writeActivity(base, record("work", "e1"));
       const first = (await load(base)).city;
-      if (wood === 77) {
+      if (houses === 1) {
+        expect(first.population.capacity).toBe(6);
+        expect(first.queue.map(i => [i.building, i.stage])).toEqual([["lumberyard", "building"], ["library", "queued"]]);
+      } else if (wood === 77) {
         expect(first.queue.map(i => i.stage)).toEqual(["queued"]);
         expect(first.resources.wood).toBe(78); // 已夠工坊 60，但不能動用書庫的 20。
         expect(first.roadsideFull).toBe(false);
@@ -204,7 +208,7 @@ test("整筆與拆份重播相同", async () => {
     const base = root();
     try {
       await load(base);
-      const ledger = await openCity(base);
+      const ledger = await openCity(base, 16); // 在舊版預定，跨版逐份施工。
       for (const [building, x, y] of [["house", 3, 1], ["market", 2, 2], ["library", -2, 2]]) {
         expect((await placePlan(ledger, { building, x, y, at: AT })).status).toBe("applied");
       }

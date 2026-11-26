@@ -18,12 +18,14 @@ export const UNIT_CONSTRUCTION_VERSION = 12;
 export const POPULATION_VERSION = 13;
 export const PRODUCTION_VERSION = 14;
 export const AUTO_CONSTRUCTION_VERSION = 15;
-export const RULES_VERSION = 16;
+export const MARKET_VERSION = 17;
+export const RULES_VERSION = MARKET_VERSION;
 // v16：以材料成本找路；橋的兩種材料等比增加。
 export const ROAD = { limit: 12, landWeight: 1, bridgeWeight: 5, wood: 4, stone: 8, cellsPerUnit: 2 };
 export const ROADSIDE_RANGE = 3;
 export const AUTO_INTERVAL_UNITS = 0;
 export const TOWN_UPGRADE_COSTS = { wood: 2600, stone: 2600, iron: 1300 };
+export const TOWN_UPGRADE_POPULATION = 86;
 export const manualCount = queue => queue.length - Number(queue[0]?.auto === true);
 export const TERRAIN_VERSION = 2;
 export const START_ROAD_LENGTH = 1;
@@ -59,12 +61,15 @@ export const CITY_BUILDINGS = {
     purpose: "生產木材，靠近疏林產量更高", production: { material: "wood", terrain: ["scrub"], cap: 3 } },
   quarry: { label: "採石場", footprint: { w: 2, h: 2 }, costs: { wood: 60, stone: 15 }, growth: 1.15, buildUnits: 18, reveal: 2, jobs: 2,
     purpose: "生產石材，靠近碎石地產量更高", production: { material: "stone", terrain: ["rubble"], cap: 3 } },
-  workshop: { ...BUILDINGS_V12.workshop, costs: { wood: 60, stone: 30 }, growth: 1.15, jobs: 3,
+  workshop: { ...BUILDINGS_V12.workshop, costs: { wood: 60, stone: 30 }, growth: 1.15, jobs: 3, unlockPopulation: 22,
     purpose: "生產鐵料，靠近碎石地或峭壁產量更高", production: { material: "iron", terrain: ["rubble", "cliff"], cap: 2 } },
-  market: { ...BUILDINGS_V12.market, jobs: 2, purpose: "目前只揭開周圍土地" },
-  library: { ...BUILDINGS_V12.library, jobs: 3, purpose: "目前只揭開周圍土地" },
+  market: { ...BUILDINGS_V12.market, jobs: 2, unlockPopulation: 14, purpose: "用多餘建材 2 換 1，先補隊首缺料" },
+  library: { ...BUILDINGS_V12.library, jobs: 3, unlockPopulation: 42, purpose: "目前只揭開周圍土地" },
   outpost: { ...BUILDINGS_V12.outpost, jobs: 0, purpose: "向遠處探勘，揭開更多土地" },
 };
+
+export const populationCapacity = buildings => buildings.reduce((n, b) => n + (CITY_BUILDINGS[b.building]?.residents ?? 0), 2);
+export const populationGap = (building, capacity) => Math.max(0, (CITY_BUILDINGS[building]?.unlockPopulation ?? 0) - capacity);
 
 /** 下令時固定配方；已排在前面的同種建築也算在棟次內。 */
 export function recipeOf(city, building) {
