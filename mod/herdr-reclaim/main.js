@@ -24,7 +24,7 @@ import { quotaView, readQuotaView } from "./core/quota-view.js";
 import { RESOURCE_LABELS, RULES_VERSION } from "./core/rules.js";
 import { parseUi, selectionOf, serializeUi, withDev, withSelection } from "./core/selection.js";
 import {
-  SHARED_CITY_ID, advanceConstruction, cancelPlan, placePlan, readSharedCity, sharedCityDir,
+  SHARED_CITY_ID, cancelPlan, placePlan, readSharedCity, sharedCityDir,
 } from "./core/shared-city.js";
 import { TERRAIN, cityBuildings, groundAt, legalSites, missingOf, revealedCells, siteCheck } from "./core/city-map.js";
 import { fixedSharedCity } from "./scenarios/shared-city.js";
@@ -57,8 +57,6 @@ const PLAN_REASONS = {
   unknown_building: "未知的建築種類",
   footprint_mismatch: "占地與規則表不符",
   recipe_mismatch: "配方與規則表不符",
-  start_mismatch: "開工時刻與規則不符",
-  duration_mismatch: "工期與規則表不符",
   site_fog: "有一角還在迷霧裡",
   site_water: "有一角是深水",
   site_cliff: "有一角是峭壁",
@@ -73,24 +71,15 @@ const missingText = (missing = {}) => {
   const text = Object.entries(missing).map(([key, amount]) => `${RESOURCE_LABELS[key]} ${amount}`).join("・");
   return text || "材料已齊";
 };
-/** 施工時間的顯示：當天只寫時刻，跨日才加日期（本機時區）。 */
-const clockText = (at) => {
-  const time = new Date(at);
-  const hm = `${String(time.getHours()).padStart(2, "0")}:${String(time.getMinutes()).padStart(2, "0")}`;
-  return time.toDateString() === new Date().toDateString() ? hm : `${time.getMonth() + 1}/${time.getDate()} ${hm}`;
-};
 /** 地面（`groundAt`）的標籤：工地與建築不是地形，另外說。 */
 const groundLabel = (ground) => (ground === "site" ? "工地" : ground === "building" ? "建築" : TERRAIN[ground]?.label ?? ground);
-/**
- * 佇列裡某一項的一行摘要（頂欄、提示）：施工中說何時完工；還沒開工的說還缺什麼，
- * 不缺口了就是排隊等前一項完工（`startsAt` 是預計開工時刻）。
- */
 const locationLabel = ({ x, y }, dev) => dev ? ` (${x}, ${y})` : "";
+const workLeft = (item) => `還要 ${item.remainingUnits} 份`;
 const queueLine = (item, dev) => (item.stage === "building"
-  ? `施工中：${item.label}${locationLabel(item, dev)}・${clockText(item.completesAt)} 完工`
+  ? `施工中：${item.label}${locationLabel(item, dev)}・${workLeft(item)}`
   : Object.keys(item.missing ?? {}).length > 0
     ? `備料中：${item.label}${locationLabel(item, dev)}・還缺 ${missingText(item.missing)}`
-    : `排隊中：${item.label}${locationLabel(item, dev)}・${clockText(item.startsAt)} 開工`);
+    : `排隊中：${item.label}${locationLabel(item, dev)}・材料已齊`);
 /**
  * 現在再加一項時真正可用的庫存：扣掉佇列裡還沒付款的配方。付款只在隊首發生，
  * 所以這個數字才是「排在隊尾的那一項還要等多少材料」。
@@ -297,7 +286,6 @@ export default class Town extends View {
           if (first) this.devMode = this.ui.dev;
           if (first) this.restoreSelection();
           this.note = null;
-          this.scheduleCompletion(cx);
         } catch (error) {
           this.town = null;
           this.note = `共用城市帳本讀取失敗：${error}`;
@@ -657,10 +645,7 @@ export default class Town extends View {
     ].filter(Boolean);
   }
 
-  /**
-   * 建設佇列：依開工順序逐項列出。施工中的一項顯示開工與完工時刻；
-   * 還沒開工的一項顯示還缺什麼（沿佇列累計）與預計開工時刻，隨時可以取消。
-   */
+  /** 施工中顯示剩餘份數；排隊中的項目顯示累計缺料，並可取消。 */
   queueSection(shared, t, cx) {
     return [
       div().text_size(10).text_color(t.dim).child(`建設佇列 ${shared.queue.length}/${shared.queueLimit}`),
@@ -683,14 +668,9 @@ export default class Town extends View {
             div().text_size(10).text_color(t.muted).child(`占地 ${item.w}×${item.h}${locationLabel(item, this.devMode)}`),
             fieldRow({ label: "配方", value: costsText(item.costs) }, t),
             ...(building
-              ? [
-                fieldRow({ label: "開工", value: clockText(item.startedAt) }, t),
-                fieldRow({ label: "完工", value: clockText(item.completesAt) }, t),
-              ]
+              ? [fieldRow({ label: "工期", value: workLeft(item) }, t)]
               : [
                 fieldRow({ label: "還缺", value: missing ? missingText(item.missing) : "材料已齊" }, t),
-                // 還缺材料時「預計開工」是不可信的過去時刻：等材料到了才會知道。
-                ...(missing ? [] : [fieldRow({ label: "預計開工", value: clockText(item.startsAt) }, t)]),
                 chipButton("取消", t, (cx2) => this.cancelItem(item, cx2)),
               ]),
           ]);
@@ -707,7 +687,7 @@ export default class Town extends View {
     return [
       div().text_size(14).font_semibold().child(`選取的土地${locationLabel(spot, this.devMode)}`),
       fieldRow({ label: "地面", value: ground ? groundLabel(ground) : "迷霧" }, t),
-      ...(done ? [fieldRow({ label: "建築", value: `${done.label}（${clockText(done.completedAt)} 完工）` }, t)] : []),
+      ...(done ? [fieldRow({ label: "建築", value: done.label }, t)] : []),
       div().text_size(9).text_color(t.muted).child(
         this.picking ? "這一格是整棟占地的左上角：在地圖點它就會顯示預覽。" : "選一棟建築之後，這裡會列出整棟占地的判斷。",
       ),
@@ -732,7 +712,6 @@ export default class Town extends View {
           this.picking = null;
           this.preview = null;
           text = `已預定：${label}${locationLabel({ x, y }, this.devMode)}；排到隊首、材料備齊才付料開工`;
-          this.scheduleCompletion(cx2);
         } else {
           text = `沒有預定：${PLAN_REASONS[result.reason] ?? result.reason ?? result.status}`;
         }
@@ -769,32 +748,6 @@ export default class Town extends View {
   async refreshShared() {
     const state = await (await openShared(this.io)).state();
     return { ...this.town, shared: readSharedCity(state) };
-  }
-
-  /** 施工計時：施工中那一項的完工時刻到了才推進；同一個完成時刻只排一次。 */
-  scheduleCompletion(cx) {
-    const building = this.town?.shared?.city?.queue?.find((item) => item.stage === "building");
-    if (!building || this.completionAt === building.completesAt) return;
-    this.completionAt = building.completesAt;
-    cx.timer.after(Math.max(0, building.completesAt - Date.now()) + 250, (cx2) => this.finishConstruction(cx2));
-  }
-
-  /** 完工推進：工期到了就完工，下一項接著開工；關著畫面的時間也算（見 `advanceConstruction`）。 */
-  finishConstruction(cx) {
-    // 這一次排程已經觸發：還沒完工（例如時鐘被往回調）時，下面的 scheduleCompletion 會重新排一次。
-    this.completionAt = null;
-    cx.spawn(async (cx2) => {
-      try {
-        const { completed } = await advanceConstruction(await openShared(this.io), { now: Date.now() });
-        this.town = await this.refreshShared();
-        const last = completed[completed.length - 1];
-        if (last) this.showToast(`${last.label}${locationLabel(last, this.devMode)} 完工，附近的土地揭開了`, cx2);
-        this.scheduleCompletion(cx2);
-      } catch (error) {
-        this.note = `完工推進失敗：${error}`;
-      }
-      cx2.notify();
-    });
   }
 
   /** 額度清單（§9）：已知的回報一行，未知的另起一行；不捏造數字。 */

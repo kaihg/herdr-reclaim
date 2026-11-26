@@ -30,7 +30,7 @@ import { BlobStore } from "./blobs.js";
 import { byteLen, canonicalJson, hashText } from "./bytes.js";
 import { casWrite, rejectUnlessConflict } from "./cas.js";
 import { PrefixIndex } from "./pages.js";
-import { BUILD_QUEUE_LIMIT, CITY_BUILDINGS, RESOURCES, RULES_VERSION, WORK_TOKENS_PER_UNIT, affordable, workYieldOf } from "./rules.js";
+import { BUILD_QUEUE_LIMIT, BUILDINGS_V12, CITY_BUILDINGS, RESOURCES, RULES_VERSION, UNIT_CONSTRUCTION_VERSION, WORK_TOKENS_PER_UNIT, affordable, isBuilding, workYieldOf } from "./rules.js";
 import { footprintCells, siteCheck } from "./city-map.js";
 
 export { byteLen, hashText };
@@ -139,11 +139,9 @@ const zeroResources = () => Object.fromEntries(RESOURCES.map((key) => [key, 0]))
 /**
  * 空狀態。`activities` 的順序就是 journal 的附加順序，重播結果因此可重現；
  * `opSeqs`／`claims` 是索引（§13.2）；
- * `work.tokens` 是共用城市（#23）還沒換成建材的有效工作進度（餘數）；`work.stockedAt` 是入庫
- * 建材裡最晚的一筆的時間——材料是排到隊首才付，所以開工時刻從這裡起算。
- * `queue` 是共用城市的建設佇列（ADR 0003）：依預定順序排列，同時只施工最前面那一項；
- * 每一項都有建築、錨點、配方與整片占地，開工時多出 `startedAt`／`buildMs`／`completesAt`。
- * `paid` 只在舊帳本裡出現（曾有一版在預定時就扣料），新的項目沒有這個欄位。
+ * `work.tokens` 是未換成建材的餘數；`work.units` 是新版施工累積的整份數。
+ * `queue` 依預定順序排列，只有隊首可開工。`startedUnit` 記開工的份數，`paid` 記是否已付款。
+ * 舊 journal 仍保留當時的開工與完工時刻。
  * `buildings` 是共用城市已完工的建築。
  */
 export function emptyState(cityId) {
@@ -191,20 +189,52 @@ function adjust(state, costs, sign) {
 /** 佇列裡找目標：開工、完工與取消都綁同一把鍵（`planKey`）。 */
 const queueItemOf = (state, key) => (state.queue ?? []).find((item) => planKey(item) === key) ?? null;
 
-/** 同時只能有一項在施工：佇列裡已經有一項開工，其他的就還沒輪到。 */
-const runningItemOf = (state, except = null) => (state.queue ?? [])
-  .find((item) => item !== except && item.startedAt != null) ?? null;
+/** v12：下令、取消或收到一份收入之後，付得起的隊首立即開工。 */
+function startReadyHead(state, unit) {
+  const item = state.queue[0];
+  if (!item || isBuilding(item)) return;
+  if (!item.paid) {
+    if (!affordable(item.costs, state.resources)) return;
+    adjust(state, item.costs, -1);
+    item.paid = true;
+  }
+  item.startedUnit = unit;
+}
 
-/**
- * 這一項的開工時刻：下令時刻、材料到齊時刻與前一項完工時刻取晚者。
- * - `stockedAt` 是入庫建材裡最晚的一筆：材料是排到隊首才付，所以開工不會早於材料真的到齊。
- * - `notBefore` 是前一項完工時寫下的下限——完工的項目會離開佇列，不記下來的話，
- *   下一項會誤以為自己可以從下令時刻開工，等於偷偷跳過前一項的工期。
+/** 同一筆 income 的純重播：沒有第二次寫入，也不會在 CAS 成功前改動城市。
+ * 每份入庫 → 舊工地完工判定 → 新隊首付料。佇列空了以後剩餘份數一次入庫。
  */
-export function startAtOf(state, item) {
-  const stocked = Number(state.work?.stockedAt ?? item.at);
-  const floor = Math.max(Number(item.at), stocked, Number(item.notBefore ?? item.at));
-  return Math.max(floor, Number(runningItemOf(state, item)?.completesAt ?? floor));
+function applyUnitIncome(state, entry, units) {
+  if (!units) return;
+  const before = state.work.units ?? 0;
+  state.work.units = before + units;
+  if (!state.queue.length) {
+    adjust(state, entry.resources, 1);
+    return;
+  }
+  // 用 entry 實際入庫的向量重播，不用今天的匯率重算舊收入。
+  const yieldPerUnit = Object.fromEntries(Object.entries(entry.resources).map(([key, amount]) => [key, amount / units]));
+  for (let i = 1; i <= units; i++) {
+    const item = state.queue[0];
+    if (!item) {
+      adjust(state, yieldPerUnit, units - i + 1);
+      break;
+    }
+    const unit = before + i;
+    adjust(state, yieldPerUnit, 1);
+    // v11 已開工的項目不重扣；收到第一份新版收入時，從完整的份制工期繼續。
+    if (item.startedAt != null && item.startedUnit == null) item.startedUnit = unit - 1;
+    const def = BUILDINGS_V12[item.building];
+    if (item.startedUnit != null && unit - item.startedUnit === def.buildUnits) {
+      state.queue.shift();
+      state.buildings.push({
+        building: item.building, label: item.label, x: item.x, y: item.y, w: item.w, h: item.h,
+        costs: item.costs, cells: item.cells, startedUnit: item.startedUnit, completedUnit: unit,
+        reveal: def.reveal, rulesVersion: entry.rulesVersion,
+      });
+    }
+    startReadyHead(state, unit);
+  }
 }
 
 /**
@@ -254,7 +284,11 @@ export const KINDS = {
     apply(state, entry) {
       const total = Number(state.work.tokens ?? 0) + Number(entry.tokens);
       state.work.tokens = total % WORK_TOKENS_PER_UNIT;
-      stockUp(state, entry);
+      if (entry.rulesVersion >= UNIT_CONSTRUCTION_VERSION) {
+        applyUnitIncome(state, entry, Math.floor(total / WORK_TOKENS_PER_UNIT));
+      } else {
+        stockUp(state, entry);
+      }
       for (const source of entry.sources ?? []) state.claims.set(claimKey(entry.cityId, source), entry.journalSeq);
     },
   },
@@ -314,27 +348,16 @@ export const KINDS = {
       };
       if (item.paid) adjust(state, item.costs, -1);
       state.queue.push(item);
+      if (entry.rulesVersion >= UNIT_CONSTRUCTION_VERSION) startReadyHead(state, state.work.units ?? 0);
     },
   },
 
   /**
-   * 開工（#26）：由城市自動送出。排到隊首、庫存足以支付整份配方時一次付清，從 `at` 起算工期。
-   * 一次只施工一項：佇列裡已經有一項開工時，其他的整筆被拒（`busy`）。
-   * 一個項目只開工一次：opId 綁住項目（`planKey`），兩個視窗同時達標、重開或重播都只算一次；
-   * 已經預扣過的舊版項目不再收費。工期只看建築種類（規則表），不看占地上的植被或碎石。
+   * v11 以前的開工、完工是獨立 entry。只重播，不再接受新提交。
    */
   construct: {
-    precheck(state, op) {
-      if (op.cityId !== state.cityId) return "wrong_city";
-      const item = queueItemOf(state, op.plan);
-      if (!item) return "no_plan";
-      if (item.startedAt != null) return "already_started";
-      if (runningItemOf(state, item)) return "busy";
-      if (!sameCosts(op.costs, item.costs)) return "recipe_mismatch";
-      if (Number(op.buildMs) !== CITY_BUILDINGS[item.building]?.buildMs) return "duration_mismatch";
-      if (Number(op.at) !== startAtOf(state, item)) return "start_mismatch";
-      if (!item.paid && !affordable(item.costs, state.resources)) return "insufficient_resources";
-      return null;
+    precheck() {
+      return "retired";
     },
     apply(state, entry) {
       const item = queueItemOf(state, entry.plan);
@@ -354,14 +377,8 @@ export const KINDS = {
    * 當時的揭開半徑，跟著 entry 存進建築，調整規則不改寫已揭開的土地。不支付、也不新增項目。
    */
   complete: {
-    precheck(state, op) {
-      if (op.cityId !== state.cityId) return "wrong_city";
-      const item = queueItemOf(state, op.plan);
-      if (!item) return "no_plan";
-      if (item.startedAt == null) return "not_started";
-      if (Number(op.at) !== Number(item.completesAt)) return "completion_mismatch";
-      if (Number(op.reveal) !== CITY_BUILDINGS[item.building]?.reveal) return "reveal_mismatch";
-      return null;
+    precheck() {
+      return "retired";
     },
     apply(state, entry) {
       const item = queueItemOf(state, entry.plan);
@@ -396,12 +413,13 @@ export const KINDS = {
       if (op.cityId !== state.cityId) return "wrong_city";
       const item = queueItemOf(state, op.plan);
       if (!item) return "no_plan";
-      return item.startedAt == null ? null : "already_started";
+      return isBuilding(item) ? "already_started" : null;
     },
     apply(state, entry) {
       const item = queueItemOf(state, entry.plan);
       state.queue = state.queue.filter((other) => other !== item);
       if (item.paid) adjust(state, item.costs, 1);
+      if (entry.rulesVersion >= UNIT_CONSTRUCTION_VERSION) startReadyHead(state, state.work.units ?? 0);
     },
   },
 

@@ -44,5 +44,5 @@ The first four must be green. The last one produces `report.html` for a person t
 - Real font metrics and layout: only the three `tools/ui-report.sh` pictures.
 - Whether `herdr-app shot` can capture a frame while the screen is locked: unverified. The script
   marks that run "視覺未驗" instead of failing, so the rest of the report still lands.
-- Behaviours that need wall-clock time (toast auto-dismiss, construction finishing): the tests
-  assert the state transition, not the duration.
+- Wall-clock effects such as toast auto-dismiss: tests assert the state transition, not the duration.
+  Construction advances with recorded work, so its exact remaining units are testable.

@@ -81,11 +81,14 @@ describe("固定情境的分區與庫存", () => {
     expect(mapTiles(tree()).length).toBeGreaterThan(20);
   });
 
-  test("佇列明細：施工中的一項顯示開工與完工，備料中的一項顯示還缺與取消", () => {
+  test("工期用份，不顯示時刻或工程詞", () => {
     const { tree } = open();
     const screen = text(tree());
     expect(screen).toContain("#1 哨站");
     expect(screen).toContain("#2 民居");
+    expect(screen).toContain("施工中：哨站・還要 3 份");
+    expect(screen).toContain("工期|還要 3 份");
+    expect(screen).not.toMatch(/預計開工|\d{1,2}:\d{2}|provider|session|token|shared-v2|帳本|座標|\(-?\d+, ?-?\d+\)/i);
     // 固定情境的庫存 12/8/3 不夠民居的 20/10：排隊中的那一項是備料中，還缺沿佇列累計。
     expect(screen).toContain("備料中");
     expect(screen).toContain("還缺|木材 8・石材 2");

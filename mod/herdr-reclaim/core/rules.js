@@ -11,7 +11,9 @@
 //   9  停止 commit 加碼（#28、ADR 0002）：不再產生成果收成；已落帳的照常重播
 //   10 建設佇列（ADR 0003）：同時多項預定（上限 3）、預定不動庫存、排到隊首才付料、未開工可取消（不退款）
 //   11 新城：開城時將地形版本、道路臂長與起始庫存寫進帳本。
-export const RULES_VERSION = 11;
+//   12 工期改以份計；每筆收入與它引發的施工變化同一次提交。
+export const UNIT_CONSTRUCTION_VERSION = 12;
+export const RULES_VERSION = UNIT_CONSTRUCTION_VERSION;
 export const TERRAIN_VERSION = 1;
 export const START_ROAD_LENGTH = 3;
 export const START_RESOURCES = { wood: 70, stone: 35, iron: 6 };
@@ -29,17 +31,21 @@ export const RESOURCE_LABELS = { wood: "木材", stone: "石材", iron: "鐵料"
 
 /**
  * #25：共用城市的建築表——占地是整片土地（不是屋頂大小），配方是備齊後才一次支付的完整材料。
- * #26：`buildMs` 是開工到完工的工期，`reveal` 是完工後往占地外揭開幾格（切比雪夫距離）。
+ * `buildUnits` 是開工後還需的工作份數；`reveal` 是完工後往占地外揭開幾格（切比雪夫距離）。
  * #27：哨站（`outpost`）沿用同一套流程，只是完工揭開的範圍更大。
  * 配方與工期只看建築種類，不看占地上是草地、疏林還是碎石（試玩參數）。
  */
-export const CITY_BUILDINGS = {
-  house: { label: "民居", footprint: { w: 1, h: 1 }, costs: { wood: 20, stone: 10 }, buildMs: 3 * 60_000, reveal: 2 },
-  workshop: { label: "工坊", footprint: { w: 2, h: 1 }, costs: { wood: 30, iron: 5 }, buildMs: 5 * 60_000, reveal: 2 },
-  market: { label: "市場", footprint: { w: 2, h: 2 }, costs: { wood: 40, stone: 20 }, buildMs: 8 * 60_000, reveal: 2 },
-  library: { label: "書庫", footprint: { w: 2, h: 2 }, costs: { wood: 20, stone: 20, iron: 5 }, buildMs: 8 * 60_000, reveal: 2 },
-  outpost: { label: "哨站", footprint: { w: 1, h: 1 }, costs: { wood: 25, stone: 15, iron: 5 }, buildMs: 6 * 60_000, reveal: 5 },
+export const BUILDINGS_V12 = {
+  house: { label: "民居", footprint: { w: 1, h: 1 }, costs: { wood: 20, stone: 10 }, buildUnits: 14, reveal: 2 },
+  workshop: { label: "工坊", footprint: { w: 2, h: 1 }, costs: { wood: 30, iron: 5 }, buildUnits: 21, reveal: 2 },
+  market: { label: "市場", footprint: { w: 2, h: 2 }, costs: { wood: 40, stone: 20 }, buildUnits: 12, reveal: 2 },
+  library: { label: "書庫", footprint: { w: 2, h: 2 }, costs: { wood: 20, stone: 20, iron: 5 }, buildUnits: 14, reveal: 2 },
+  outpost: { label: "哨站", footprint: { w: 1, h: 1 }, costs: { wood: 25, stone: 15, iron: 5 }, buildUnits: 4, reveal: 5 },
 };
+export const CITY_BUILDINGS = BUILDINGS_V12;
+
+/** 舊 journal 的開工記號是時刻；新版是份數（第零份也能下令開工）。 */
+export const isBuilding = (item) => item.startedUnit != null || item.startedAt != null;
 
 /** 庫存足以支付完整配方（§7.6：畫面只列這些）。 */
 export function affordable(costs, resources = {}) {

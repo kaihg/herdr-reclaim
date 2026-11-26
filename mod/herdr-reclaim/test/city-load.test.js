@@ -4,7 +4,7 @@
 //
 // 要證明的是：多個 repo、多個 session、`/new` 與 resume 只讓共用庫存增加，不產生任何
 // 遠征格，也不建立或改動 `cities/` 下的舊帳本；重新載入與重送同一份紀錄不雙算。
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -12,7 +12,7 @@ import { execFileSync } from "node:child_process";
 import { handleHook } from "../../../claude-hooks/herdr-reclaim-hook.ts";
 import { CityLedger } from "../core/ledger.js";
 import { adapterRoot } from "../core/adapter.js";
-import { SHARED_CITY_ID, sharedCityDir } from "../core/shared-city.js";
+import { SHARED_CITY_ID, placePlan, sharedCityDir } from "../core/shared-city.js";
 import { loadCity, townOf } from "../core/city-load.js";
 import { START_RESOURCES, WORK_TOKENS_PER_UNIT, WORK_YIELD } from "../core/rules.js";
 import { groundAt, revealedCells } from "../core/city-map.js";
@@ -27,14 +27,14 @@ const CHECKOUT_B = "/tmp/reclaim-load-b";
 const root = () => fs.mkdtempSync(path.join(os.tmpdir(), "reclaim-city-load-"));
 
 /** adapter 的活動檔：一支 session 一個 writer epoch 一個檔。 */
-const record = (sessionId, writerEpoch, { cli = "omp", role = "root", parentSessionId, repo = REPO_A, checkout = CHECKOUT_A, rounds = 1, from = AT, name } = {}) => {
+const record = (sessionId, writerEpoch, { cli = "omp", role = "root", parentSessionId, repo = REPO_A, checkout = CHECKOUT_A, rounds = 1, units = 1, from = AT, name } = {}) => {
   const events = [];
   for (let i = 0; i < rounds; i++) {
     const at = from + i * 100_000;
     events.push(
       { kind: "visit_start", at, visit: { visitId: `${sessionId}-${i}`, cwd: checkout, commonDir: repo, checkout } },
       { kind: "interval_open", at },
-      { kind: "usage", at: at + 1_000, sourceEntryId: `${sessionId}-${i}`, usage: { openai: { sourceKey: `omp#${sessionId}#${i}`, inputNonCache: 7_000, cacheRead: 0, cacheWrite: 0, output: 3_000, costKnown: 0, costUnknownEntries: 0 } } },
+      { kind: "usage", at: at + 1_000, sourceEntryId: `${sessionId}-${i}`, usage: { openai: { sourceKey: `omp#${sessionId}#${i}`, inputNonCache: 7_000 * units, cacheRead: 0, cacheWrite: 0, output: 3_000 * units, costKnown: 0, costUnknownEntries: 0 } } },
       { kind: "interval_close", at: at + 1_500 },
     );
   }
@@ -81,13 +81,73 @@ const list = async (dir) => {
  * （之前的歷史不補發），這裡要驗的是「活動進得來」，不是啟用邊界（那一條在 shared-city.test.js）。
  */
 const load = async (base) => {
-  const loaded = await loadCity(createFileIo(), { root: base, list, now: AT + 1_000_000, activateAt: AT - 1_000 });
+  const loaded = await loadCity(createFileIo(), { root: base, list, activateAt: AT - 1_000 });
   const town = townOf(loaded, null);
   expect(town.city).toBeUndefined(); // 畫面不讀 `town.city`；讀到 undefined 才不會被誤用
   return { ...town, city: town.shared.city };
 };
 const stock = (city) => [city.resources.wood, city.resources.stone, city.resources.iron];
 const times = (n) => ["wood", "stone", "iron"].map((key) => START_RESOURCES[key] + WORK_YIELD[key] * n);
+
+const openCity = (base) => new CityLedger({ io: createFileIo(), dir: sharedCityDir(base), cityId: SHARED_CITY_ID }).open();
+
+test("整筆與拆份重播相同", async () => {
+  async function play(rounds, units) {
+    const base = root();
+    try {
+      await load(base);
+      const ledger = await openCity(base);
+      for (const [building, x, y] of [["house", 4, 1], ["market", 2, 2], ["library", -2, 2]]) {
+        expect((await placePlan(ledger, { building, x, y, at: AT })).status).toBe("applied");
+      }
+      writeActivity(base, record("work", "e1", { rounds, units }));
+      const { city } = await load(base);
+      expect((await load(base)).city).toEqual(city);
+      return city;
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  }
+  const batch = await play(1, 28);
+  expect(await play(28, 1)).toEqual(batch);
+  expect(stock(batch)).toEqual([74, 41, 29]);
+  expect(batch.buildings.map((b) => [b.building, b.completedUnit])).toEqual([["house", 14], ["market", 26]]);
+  expect(batch.queue).toHaveLength(1);
+  expect(batch.queue[0]).toMatchObject({ building: "library", remainingUnits: 12 });
+  expect(revealedCells(batch).has("5,1")).toBe(true);
+});
+
+test("寫入前後中斷可重開", async () => {
+  for (const committed of [false, true]) {
+    const base = root();
+    try {
+      await load(base);
+      const ledger = await openCity(base);
+      await placePlan(ledger, { building: "house", x: 4, y: 1, at: AT });
+      await placePlan(ledger, { building: "outpost", x: 2, y: 3, at: AT });
+      writeActivity(base, record("work", "e1", { units: 16 }));
+      const disk = createFileIo();
+      const io = { ...disk, async write(file, text, expected) {
+        if (file.includes("/journal/") && text.slice(expected?.length ?? 0).includes('"kind":"income"')) {
+          if (committed) await disk.write(file, text, expected);
+          throw new Error("模擬中斷");
+        }
+        await disk.write(file, text, expected);
+      } };
+      await expect(loadCity(io, { root: base, list })).rejects.toThrow("模擬中斷");
+      // 活動可能已 ack 並 compact；只能依 journal 裡留存的工作恢復。
+      fs.rmSync(`${base}/activity`, { recursive: true });
+      const { city } = await load(base);
+      expect(city.buildings.map((b) => b.building)).toEqual(["house"]);
+      expect(city.queue).toHaveLength(1);
+      expect(city.queue[0]).toMatchObject({ building: "outpost", remainingUnits: 2 });
+      expect(stock(city)).toEqual([73, 42, 17]);
+      expect((await load(base)).city).toEqual(city);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  }
+});
 
 test("舊帳本隔離", async () => {
   const base = root();
@@ -264,31 +324,33 @@ describe("正式載入路徑：活動檔 → 共用城市", () => {
     }
   });
 
-  test("只做研究、沒有 commit 與交易也能備齊材料並蓋完：正式路徑會自動開工與完工", async () => {
+  test("無進帳不完工", async () => {
     const base = root();
     try {
-      const { placePlan, advanceConstruction } = await import("../core/shared-city.js");
-      const { CityLedger } = await import("../core/ledger.js");
-      const { SHARED_CITY_ID, sharedCityDir } = await import("../core/shared-city.js");
-      const openShared = () => new CityLedger({ io: createFileIo(), dir: sharedCityDir(base), cityId: SHARED_CITY_ID }).open();
       // 十個回合＝木 30、石 20、鐵 10：民居（木 20、石 10）的配方備得齊。
       writeActivity(base, record("solo", "solo-1", { rounds: 10 }));
       const first = await load(base);
       expect(stock(first.city)).toEqual(times(10));
 
-      const ledger = await openShared();
+      const ledger = await openCity(base);
       expect((await placePlan(ledger, { building: "house", x: 4, y: 1, at: AT + 900_000 })).status).toBe("applied");
       const building = await load(base);
-      expect(building.city.queue[0]).toMatchObject({ building: "house", stage: "building" });
+      expect(building.city.queue[0]).toMatchObject({ building: "house", stage: "building", remainingUnits: 14 });
 
-      await advanceConstruction(await openShared(), { now: building.city.queue[0].completesAt });
+      const clock = spyOn(Date, "now").mockReturnValue(AT + 365 * 86_400_000);
+      try {
+        expect((await load(base)).city).toEqual(building.city);
+      } finally {
+        clock.mockRestore();
+      }
+      writeActivity(base, record("more", "e1", { units: 14, from: AT + 1_000_000 }));
       const done = await load(base);
       expect(done.city.queue).toEqual([]);
       expect(done.city.buildings.map((entry) => [entry.building, entry.x, entry.y])).toEqual([["house", 4, 1]]);
       // 完工揭開新土地：正式路徑重讀之後，那一格是看得到的。
       expect(revealedCells(done.city).has("5,0")).toBe(true);
       // 只做研究、沒有 commit：庫存只扣一次配方，沒有成果加成。
-      expect(stock(done.city)).toEqual([START_RESOURCES.wood + 10, START_RESOURCES.stone + 10, START_RESOURCES.iron + 10]);
+      expect(stock(done.city)).toEqual([START_RESOURCES.wood + 52, START_RESOURCES.stone + 38, START_RESOURCES.iron + 24]);
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
     }
@@ -312,7 +374,7 @@ describe("正式載入路徑：活動檔 → 共用城市", () => {
 
       let diffAsked = 0;
       const loaded = await loadCity(createFileIo(), {
-        root: base, list, now: AT + 1_000_000, activateAt: AT - 1_000,
+        root: base, list, activateAt: AT - 1_000,
         diffForCommit: async () => { diffAsked++; return [{ status: "M", path: "src/a.js", blob: "blob1" }]; },
       });
       const city = townOf(loaded, null).shared.city;

@@ -17,8 +17,7 @@ const { default: Town } = await import("../main.js");
 beforeEach(() => fs.rmSync(host.home, { recursive: true, force: true }));
 
 /** 開一個視窗的等價物：`init` 之後等第一次載入完成（成功或失敗都會 notify 一次）。 */
-async function open() {
-  const cx = makeCx();
+async function open(cx = makeCx()) {
   const town = new Town();
   town.init({}, cx);
   await waitFor(() => Boolean(town.town?.shared) || Boolean(town.note?.includes("失敗")), {
@@ -61,7 +60,7 @@ describe("載入鏈", () => {
 });
 
 describe("選址到下令（真的寫進帳本）", () => {
-  test("點建築 → 點合法的一格 → 預定這裡：庫存夠就當場開工、付一次配方", async () => {
+  test("點選預定付料，重開工地不排完工計時器", async () => {
     // 先備料：七單位工作（木 21、石 14、鐵 7）足夠民居的 20/10。
     await open();
     const before = await ledgerState(host.home);
@@ -99,12 +98,17 @@ describe("選址到下令（真的寫進帳本）", () => {
     const state = await ledgerState(host.home);
     expect(state.queue).toHaveLength(1);
     expect(state.queue[0]).toMatchObject({ building: "house", x: site.x, y: site.y, paid: true });
-    expect(state.queue[0].startedAt).toBeDefined();
+    expect(state.queue[0].startedUnit).toBe(7);
     expect([state.resources.wood, state.resources.stone]).toEqual([funded.resources.wood - 20, funded.resources.stone - 10]);
     const after = text(tree());
     expect(after).toContain("建設佇列（1/3）");
     expect(after).toContain("#1 民居");
-    expect(after).toContain("施工中");
+    expect(after).toContain("施工中：民居・還要 14 份");
+    const reopened = makeCx();
+    const timers = [];
+    reopened.timer.after = (delay) => timers.push(delay);
+    expect(text((await open(reopened)).tree())).toContain("還要 14 份");
+    expect(timers).toEqual([]); // 載入施工中的城市，不應排程完工。
   });
 
   test("庫存不夠也能先排進佇列：帳本不扣料，畫面寫還缺；取消之後乾乾淨淨", async () => {

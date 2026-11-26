@@ -29,7 +29,7 @@ herdr 的開墾城鎮 mod。這個資料夾是 mod 本體：**一座共用城市
 | `ui/assets.js` | 建築 mock 的輪廓（向量，不影響數值） |
 | `scenarios/shared-city.js` | `herdr-app check` 的固定情境；正式 runtime 不拿它入帳 |
 | `test/city-load.test.js` | 正式載入路徑的整合測試：多 repo／多 session／`/new`／resume 只增加共用庫存、不建立 `cities/`、重載不雙算 |
-| `test/shared-city.test.js` | 共用城市：收入只入帳一次、選址與整棟預覽、佇列上限與 FIFO 付料、缺料預定、取消交還、到期完工、揭開與哨站、舊帳本遷移 |
+| `test/shared-city.test.js` | 共用城市：收入只入帳一次、選址與整棟預覽、佇列上限與 FIFO 付料、缺料預定、取消交還、逐份完工、揭開與哨站、舊 journal 重播 |
 | `test/ledger-storage.test.js` | 儲存層：完成依據、故障重試、CAS 競爭、換段、checkpoint 完整性、ack |
 | `test/ledger-capacity.test.js` | 長期帳本的容量（20,000 筆收入）：每個檔案 ≤ 256 KiB、checkpoint 查得回每一筆、兩條讀取路徑狀態一致 |
 | `test/codex-adapter.test.js` | 真 Codex adapter：hook → 活動檔（cached input 扣除、未知不補零）、ack compact 後控制狀態不遺失、進共用庫存計量器 |
@@ -47,7 +47,7 @@ mod 端由 `core/host-io.js` 把 herdr 的原生錯誤轉成 `CasConflict`（真
 
 - **journal entry 是操作完成的唯一依據**：只有內容檔、沒有 entry 的操作不算完成。
 - entry kind 只有共用城市用得到的幾種：`workStart`（啟用邊界）、`income`（基本收入）、
-  `plan`／`construct`／`complete`／`cancel`（建設佇列：預定、開工、完工、取消）與
+  `plan`／`cancel`（建設佇列的預定與取消；舊 `construct`／`complete` 只重播）與
   `activity`（活動合併）。
   舊版的 `achievement` 只重播、不再產生（#28），新的提交一律被拒。收成的資源向量由 entry
   自己帶，所以調整規則不改寫已落帳的結果。
@@ -94,10 +94,10 @@ mod 以 `find` 列活動檔，成功寫 journal 後按 epoch 寫 ack，並用 `w
   後的新 epoch 重送同一份工作只入帳一次。
 - **commit 不另外收成**（#28、ADR 0002）：收入只看工作量。舊帳本裡的 `achievement` 照常
   重播、庫存不變；新版不再讀 `commits/`、`sources/`，也不跑 `git reflog`、`git diff-tree`。
-- **建設佇列**（`placePlan`／`advanceConstruction`／`cancelPlan`，ADR 0003）：同時最多 3 項預定；
+- **建設佇列**（`placePlan`／`ingestIncome`／`cancelPlan`，ADR 0003、0006）：同時最多 3 項預定；
   指定位置**不動庫存**（缺料也能先排），一次只施工最前面那一項，排到隊首、材料備齊才一次付清
   並開工（付款只在隊首，後面的項目不能插隊）。還沒開工的項目可以取消，占地與名額交還。
-  完工揭開附近土地。重開、重播、兩個視窗同時推進都只有一筆開工、一筆完工。
+  每份入庫後推進舊工地，完工揭地，再讓備齊的隊首開工。開工那一份不計工期，沒進帳就不會完工。
 - 畫面（`main.js`）：上方是共用庫存、工作進度與佇列最前面那一項；左側是建築卡（占地、配方、
   完工揭開幾格）與佇列摘要；中間是地圖（預定地、工地、完工建築、選址預覽）；右側是整棟
   預覽與「預定這裡」，沒有預覽時是佇列明細（未開工的項目可取消）。

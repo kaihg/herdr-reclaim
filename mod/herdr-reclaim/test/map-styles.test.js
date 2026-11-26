@@ -50,7 +50,7 @@ describe("地圖樣式（mapCells）", () => {
   });
 
   test("施工中（已開工）的預定地畫成工地斜線，不是預定地虛線", () => {
-    const building = { ...PLAN, stage: "building", startedAt: 1, completesAt: 2 };
+    const building = { ...PLAN, stage: "building", startedUnit: 1 };
     const layout = mapCells({ queue: [building], buildings: [], revealed: revealedCells({ queue: [building], buildings: [] }), radius: RADIUS });
     expect(bucketOf(layout, "fills", "4,1")).toMatchObject({ kind: "slash", token: "working" });
     expect(bucketOf(layout, "outlines", "4,1")).toMatchObject({ token: "working", dash: null });

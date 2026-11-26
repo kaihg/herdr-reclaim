@@ -4,7 +4,7 @@
 // `siteCheck`：畫面說可以放，下令就不會被拒；畫面說不行，下令也進不了帳本。
 // 地圖本身固定（不依 repo、space、session 生成），玩家看到的是同一座城。
 import { CENTER, cellsWithin, gridDistance, isCenterCell, keyOf } from "./grid.js";
-import { CITY_BUILDINGS, START_ROAD_LENGTH } from "./rules.js";
+import { CITY_BUILDINGS, START_ROAD_LENGTH, isBuilding } from "./rules.js";
 
 /** 地形種類；`buildable` 的三種可以蓋，深水與峭壁不行（#22 的選址規則）。 */
 export const TERRAIN = {
@@ -79,7 +79,7 @@ const covers = (cells, { x, y }) => (cells ?? []).some((cell) => cell.x === x &&
  */
 export function groundAt(city, cell) {
   if ((city?.buildings ?? []).some((building) => covers(building.cells, cell))) return "building";
-  if ((city?.queue ?? []).some((item) => item.startedAt != null && covers(item.cells, cell))) return "site";
+  if ((city?.queue ?? []).some((item) => isBuilding(item) && covers(item.cells, cell))) return "site";
   return surfaceAt(city, cell);
 }
 

@@ -7,19 +7,18 @@
 //
 // 主機相依的部分由呼叫端注入：
 //   `list(dir)`  列檔案（herdr 的 mod 沒有 listdir）
-//   `now`        推進施工用的現在時刻（測試給固定值）
 import { loadActivities, mergeActivities } from "./adapter.js";
 import { CityLedger } from "./ledger.js";
-import { SHARED_CITY_ID, advanceConstruction, ingestIncome, readSharedCity, sharedCityDir } from "./shared-city.js";
+import { SHARED_CITY_ID, ingestIncome, readSharedCity, sharedCityDir } from "./shared-city.js";
 
 /**
  * 一次完整的重讀：adapter 的活動檔寫進帳本（§6.2），與帳本保存的那一份合併之後入帳，
- * 再推進工期已到的完工，最後回傳公開讀取模型。
+ * 每筆收入同時推進對應的工期，最後回傳公開讀取模型。
  *
  * `activities` 可以覆寫（測試給固定的事件）；沒有給就讀磁碟。
  * `activateAt` 只給測試：正式 runtime 由第一次啟用的當下決定。
  */
-export async function loadCity(io, { root, list, activities: given = null, now = Date.now(), activateAt } = {}) {
+export async function loadCity(io, { root, list, activities: given = null, activateAt } = {}) {
   const fromDisk = given ?? await loadActivities({ ...io, list }, `${root}/activity`);
   const ledger = await new CityLedger({ io, dir: sharedCityDir(root), cityId: SHARED_CITY_ID }).open();
   await ledger.maybeCheckpoint();
@@ -29,7 +28,6 @@ export async function loadCity(io, { root, list, activities: given = null, now =
   // adapter 的磁碟快照會被 ack compact；帳本保存的那一份才是完整的，兩邊取聯集。
   const activities = mergeActivities([...state.activities.values(), ...fromDisk]);
   await ingestIncome(ledger, { activities, activateAt });
-  await advanceConstruction(ledger, { now });
   return { city: readSharedCity(await ledger.state()), activities };
 }
 

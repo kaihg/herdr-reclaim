@@ -9,11 +9,10 @@
 // 所有 repo 的工作都進同一個計量器；commit 不再另外加碼（#28、ADR 0002）。
 //
 // 這一票交付「工作 → 基本建材 + 常駐庫存」。
-// 選址與建設佇列是 #25；只保留占地不扣料、排到隊首才付料、到期完工、未開工可取消是 #26 與 ADR 0003
-// （`advanceConstruction`／`cancelPlan`）。#22 之後程式只讀寫這一本帳本：舊版各城帳本
-// （`cities/<hash>/`）原封不動留在磁碟上，不讀也不改它們。
-import { claimKey, planKey, startAtOf } from "./ledger.js";
-import { BUILD_QUEUE_LIMIT, CITY_BUILDINGS, START_RESOURCES, START_ROAD_LENGTH, TERRAIN_VERSION, WORK_TOKENS_PER_UNIT, WORK_YIELD, affordable, workYieldOf } from "./rules.js";
+// 選址與佇列見 #25／#26、ADR 0003；#33 起，入庫、工地進度與隊首付料是同一筆帳。
+// 舊版各城帳本留在磁碟上，不讀也不改。
+import { claimKey, planKey } from "./ledger.js";
+import { BUILD_QUEUE_LIMIT, BUILDINGS_V12, CITY_BUILDINGS, START_RESOURCES, START_ROAD_LENGTH, TERRAIN_VERSION, WORK_TOKENS_PER_UNIT, WORK_YIELD, isBuilding, workYieldOf } from "./rules.js";
 import { missingOf } from "./city-map.js";
 import { createsTile, rootOf, roundsOf, sessionIndex } from "./research.js";
 
@@ -144,91 +143,14 @@ export async function ingestIncome(ledger, { activities = [], activateAt } = {})
       resources: workYieldOf(Number(current.work?.tokens ?? 0) + settlement.tokens),
     }));
     results.push(result);
-    // 這一筆收入可能剛好補齊舊版預定地的材料：入帳之後立刻檢查，不等畫面推進。
-    if (result.status === "applied") await startNext(ledger);
   }
   return { settlements, results };
 }
 
 /**
- * 佇列最前面那一項開工（#26、ADR 0003）：庫存足以支付整份配方時才送出一筆 construct，
- * 一次付清。付款只在隊首發生——後面的項目不能插隊，所以排在前面的項目等的材料不會被後面的
- * 吃掉。開工時刻交給帳本的 `startAtOf`：下令時刻、材料到齊時刻與前一項完工時刻取晚者。
- * opId 綁住項目，兩個視窗同時推進、重播或重開都只算一次；沒有項目或材料不夠時什麼都不做。
- */
-async function startNext(ledger) {
-  let picked = null;
-  const result = await ledger.submit((current) => {
-    const item = current.queue?.[0];
-    if (!item || item.startedAt != null) return null;
-    if (!item.paid && !affordable(item.costs, current.resources)) return null;
-    picked = item;
-    return {
-      opId: `construct:${ledger.cityId}:${planKey(item)}`,
-      kind: "construct",
-      at: startAtOf(current, item),
-      cityId: ledger.cityId,
-      plan: planKey(item),
-      building: item.building,
-      costs: { ...item.costs },
-      buildMs: CITY_BUILDINGS[item.building]?.buildMs,
-    };
-  });
-  return { ...result, item: picked };
-}
-
-/**
- * 施工中的那一項到期就完工（#26）：完工時間是開工加工期，不是 `now`。
- * 一次只有一項在施工，所以找的就是佇列裡唯一開工的那一項。
- */
-async function completeRunning(ledger, now) {
-  let picked = null;
-  const result = await ledger.submit((current) => {
-    const item = current.queue?.find((entry) => entry.startedAt != null);
-    if (!item || Number(item.completesAt) > Number(now)) return null;
-    picked = item;
-    return {
-      opId: `complete:${ledger.cityId}:${planKey(item)}`,
-      kind: "complete",
-      at: Number(item.completesAt),
-      cityId: ledger.cityId,
-      plan: planKey(item),
-      building: item.building,
-      reveal: CITY_BUILDINGS[item.building]?.reveal,
-    };
-  });
-  return { ...result, item: picked };
-}
-
-/**
- * 推進建設佇列（#26、ADR 0003）：一次只施工一項；前一項完工就把下一項推進到該開工的位置，
- * 直到沒有新動作。關著畫面的那段時間也算：回來時 `now` 已經過了整條佇列的工期，
- * 這裡會一次把能開工的開工、能完工的完工。多個視窗同時呼叫只會各有一筆 entry。
- * `completed` 是這次真的完工的項目（畫面用它顯示「哪一棟完工了」）。
- */
-export async function advanceConstruction(ledger, { now = Date.now() } = {}) {
-  const started = [];
-  const completed = [];
-  const brief = (item) => ({ building: item.building, label: item.label, x: item.x, y: item.y, at: Number(item.at) });
-  // 每一輪最多開工一項、完工一項；佇列上限就是輪數上限，沒有新動作就停。
-  for (let guard = 0; guard <= BUILD_QUEUE_LIMIT; guard++) {
-    const start = await startNext(ledger);
-    if (start.status === "applied") started.push(brief(start.item));
-    const finish = await completeRunning(ledger, now);
-    if (finish.status === "applied") {
-      completed.push(brief(finish.item));
-      continue;
-    }
-    if (start.status !== "applied") break;
-  }
-  return { started, completed };
-}
-
-/**
  * 公開的共用城市讀取模型：庫存、工作進度、建設佇列與已完工的建築。
  * 各 space 讀到的是同一份資料（同一個帳本），所以切 repo 或重開 herdr 庫存與佇列都一樣。
- * `queue` 依開工順序排列，`stage` 是 `queued`（排隊中，`startsAt` 是預計開工時刻）或
- * `building`（已開工，`completesAt` 完工）。
+ * `queue` 依開工順序排列；施工中的一項以 `remainingUnits` 表示還需幾份進帳。
  *
  * `missing` 沿佇列累計：排在前面的項目會先用掉庫存，所以第二項的「還缺」是扣掉前面幾項配方
  * 之後的差額，不是「現在庫存夠不夠」。付款只在隊首發生，這個數字就是它還要等多少材料。
@@ -237,11 +159,15 @@ export function readSharedCity(state = {}) {
   const pool = Object.fromEntries(Object.entries(state.resources ?? {}).map(([key, amount]) => [key, Number(amount ?? 0)]));
   const queue = (state.queue ?? []).map((item) => {
     const copy = { ...item, costs: { ...item.costs }, cells: (item.cells ?? []).map((cell) => ({ ...cell })) };
-    copy.stage = item.startedAt != null ? "building" : "queued";
-    copy.missing = item.startedAt == null ? missingOf(copy.costs, pool) : {};
-    copy.startsAt = copy.stage === "queued" ? startAtOf(state, item) : item.startedAt;
+    const running = isBuilding(item);
+    copy.stage = running ? "building" : "queued";
+    copy.missing = running ? {} : missingOf(copy.costs, pool);
+    if (running) {
+      const elapsed = item.startedUnit == null ? 0 : (state.work?.units ?? 0) - item.startedUnit;
+      copy.remainingUnits = BUILDINGS_V12[item.building].buildUnits - elapsed;
+    }
     // 這一項之後就輪到下一項：排隊中的配方先從池子裡扣掉（已開工的那一項早就付過了）。
-    if (item.startedAt == null) for (const [key, amount] of Object.entries(copy.costs)) pool[key] = Number(pool[key] ?? 0) - Number(amount);
+    if (!running) for (const [key, amount] of Object.entries(copy.costs)) pool[key] = Number(pool[key] ?? 0) - Number(amount);
     return copy;
   });
   return {
@@ -273,7 +199,7 @@ export function readSharedCity(state = {}) {
 export async function placePlan(ledger, { building, x, y, at } = {}) {
   const def = CITY_BUILDINGS[building];
   const when = Number.isFinite(Number(at)) ? Number(at) : Date.now();
-  const result = await ledger.submit(() => ({
+  return ledger.submit(() => ({
     opId: `plan:${ledger.cityId}:${building}:${x},${y}:${when}`,
     kind: "plan",
     at: when,
@@ -285,8 +211,6 @@ export async function placePlan(ledger, { building, x, y, at } = {}) {
     h: def?.footprint.h ?? 0,
     costs: { ...(def?.costs ?? {}) },
   }));
-  if (result.status === "applied") await startNext(ledger);
-  return result;
 }
 
 /**
