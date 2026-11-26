@@ -9,7 +9,7 @@
 // 所有 repo 的工作都進同一個計量器；commit 不再另外加碼（#28、ADR 0002）。
 //
 // 這一票交付「工作 → 基本建材 + 常駐庫存」。
-// 選址與建設佇列是 #25；預定即預扣、到期完工、未開工可取消是 #26 與 ADR 0003
+// 選址與建設佇列是 #25；只保留占地不扣料、排到隊首才付料、到期完工、未開工可取消是 #26 與 ADR 0003
 // （`advanceConstruction`／`cancelPlan`）。#22 之後程式只讀寫這一本帳本：舊版各城帳本
 // （`cities/<hash>/`）原封不動留在磁碟上，不讀也不改它們。
 import { claimKey, planKey, startAtOf } from "./ledger.js";
