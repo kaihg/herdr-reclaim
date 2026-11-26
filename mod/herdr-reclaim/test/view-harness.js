@@ -164,9 +164,11 @@ export function installHost({ checking = true, home } = {}) {
 
 /**
  * `Town` 的 `cx`：只實作 mod 用到的三件事（spawn／notify／timer）。
- * `spawn` 的 promise 留著，`settle()` 可以等它們跑完；`timer.after` 不排程（測試不驗時間）。
+ * 單次計時器只在測試呼叫 `nextTimer()` 時推進，不用等牆鐘。
  */
 export function makeCx() {
+  const timers = [];
+  let now = 0;
   const cx = {
     notifies: 0,
     waiters: [],
@@ -183,7 +185,14 @@ export function makeCx() {
       cx.notifies += 1;
       for (const resolve of cx.waiters.splice(0)) resolve();
     },
-    timer: { every() {}, after() {} },
+    timer: { every() {}, after(ms, run) { timers.push({ at: now + ms, run }); } },
+    nextTimer() {
+      timers.sort((a, b) => a.at - b.at);
+      const timer = timers.shift();
+      if (!timer) throw new Error("沒有待執行的畫面計時器");
+      now = timer.at;
+      timer.run(cx);
+    },
   };
   return cx;
 }

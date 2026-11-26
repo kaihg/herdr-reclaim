@@ -28,10 +28,52 @@ function open() {
 function playerScreen(root) {
   const lines = texts(root);
   expect(lines.filter((line) =>
-    /provider|session|agent|token|CLI|exit|omp usage|--json|openai-codex|shared-v2|帳本|座標|行會人力|額度|規則 v|量測|[（(]\s*-?\d+\s*[,，]\s*-?\d+\s*[)）]/i.test(line)
+    /provider|session|agent|token|CLI|exit|omp usage|--json|openai-codex|shared-v2|帳本|座標|journal|序號|行會人力|額度|規則 v|量測|[（(]\s*-?\d+\s*[,，]\s*-?\d+\s*[)）]/i.test(line)
   )).toEqual([]);
   return lines.join("|");
 }
+
+test("回訪逐棟、玩家用語與雙窗界線", () => {
+  const a = open(), b = open();
+  const outpost = { building: "outpost", label: "哨站", x: 4, y: 1, w: 1, h: 1, reveal: 5, cells: [{ x: 4, y: 1 }] };
+  const house = { building: "house", label: "民居", auto: true, x: 3, y: -2, w: 2, h: 1, reveal: 2,
+    cells: [{ x: 3, y: -2 }, { x: 4, y: -2 }] };
+  const model = (lastSeq, units, buildings) => readSharedCity({ lastSeq, work: { units }, buildings });
+  const screen = (view, shared) => {
+    if (shared) view.town.town.shared = shared;
+    const root = view.tree();
+    playerScreen(root);
+    return [text(findById(root, "visit-summary")), texts(findById(root, "map-view")).filter(s => /^(哨站|民居)$/.test(s))];
+  };
+  expect(screen(a, model(0, 0, []))).toEqual(["", []]);
+  expect(screen(b, model(5, 4, [outpost]))).toEqual(["", ["哨站"]]);
+  const current = model(9, 19, [outpost, house]);
+  const all = "上次查看後：進帳 19 份、完工 2 棟、揭開 67 格";
+  const last = "上次查看後：進帳 15 份、完工 1 棟、揭開 0 格";
+  expect(screen(a, current)).toEqual([all, []]);
+  expect(screen(b, current)).toEqual([last, ["哨站"]]);
+  a.cx.nextTimer();
+  expect(screen(a)).toEqual([all, ["哨站"]]);
+  expect(screen(b)).toEqual([last, ["哨站"]]);
+  a.cx.nextTimer();
+  expect(screen(a)).toEqual([all, ["哨站", "民居"]]);
+  b.cx.nextTimer();
+  expect(screen(b)).toEqual([last, ["哨站", "民居"]]);
+});
+
+test("無變化不顯示摘要", () => {
+  const { town, tree, cx } = open();
+  const show = (lastSeq, units) => {
+    town.town.shared = readSharedCity({ lastSeq, work: { units } });
+    return findById(tree(), "visit-summary");
+  };
+  expect(show(5, 3)).toBeNull(); // 第一次查看不播放以前的收入。
+  expect(show(6, 3)).toBeNull(); // 位置前進，但沒有新份數、建築或土地。
+  expect(text(show(7, 4))).toBe("上次查看後：進帳 1 份、完工 0 棟、揭開 0 格");
+  cx.nextTimer();
+  expect(findById(tree(), "visit-summary")).toBeNull();
+  expect(show(7, 4)).toBeNull();
+});
 
 test("頂欄最缺與停工用語", () => {
   const { town, tree } = open();

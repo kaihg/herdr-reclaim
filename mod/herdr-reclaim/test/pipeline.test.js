@@ -3,14 +3,14 @@
 // 這一層抓的是「只有真視窗才看得到」那類錯誤：模型接錯欄位、載入後畫面是空的、按下按鈕
 // 之後帳本沒有真的動。`herdr-app check` 做不到（它在 init 的第一個 await 就結束，見
 // mod/herdr-reclaim/README.md），電腦操作也做不到（它只看到像素，看不到帳本）。
-import { beforeEach, describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, spyOn, test } from "bun:test";
 import fs from "node:fs";
 
 import { TERRAIN, groundAt, legalSites } from "../core/city-map.js";
 import { RESOURCE_LABELS, START_RESOURCES } from "../core/rules.js";
 import { workYieldOf } from "../core/ledger.js";
 import {
-  findByText, findById, installHost, ledgerState, makeCx, mapTiles, submitOp, text, waitFor,
+  findByText, findById, installHost, ledgerDir, ledgerState, makeCx, mapTiles, submitOp, text, texts, waitFor,
 } from "./view-harness.js";
 
 const host = installHost({ checking: false });
@@ -57,6 +57,24 @@ describe("載入鏈", () => {
       expect(screen).toContain(`${state.resources[key]}|${RESOURCE_LABELS[key]}`);
     }
     expect(screen).not.toContain("讀取失敗");
+  });
+
+  test("重播回訪不寫帳本", async () => {
+    const { town, tree, cx } = await open();
+    tree(); // 建立這個視窗的查看界線。
+    expect((await submitOp(host.home, incomeOp(150_000))).status).toBe("applied");
+    const writes = spyOn(fs, "writeFileSync");
+    try {
+      town.town = await town.refreshShared();
+      const before = tree();
+      expect(text(findById(before, "visit-summary"))).toMatch(/^上次查看後：進帳 15 份、完工 1 棟、揭開 \d+ 格$/);
+      expect(texts(findById(before, "map-view"))).not.toContain("民居");
+      cx.nextTimer();
+      expect(texts(findById(tree(), "map-view"))).toContain("民居");
+      cx.nextTimer();
+      expect(findById(tree(), "visit-summary")).toBeNull();
+      expect(writes.mock.calls.filter(([file]) => String(file).startsWith(ledgerDir(host.home) + "/"))).toEqual([]);
+    } finally { writes.mockRestore(); }
   });
 });
 

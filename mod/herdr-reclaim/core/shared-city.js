@@ -168,6 +168,7 @@ export function readSharedCity(state = {}) {
   const priority = needs(city);
   return {
     schema: 2,
+    lastSeq: state.lastSeq ?? -1,
     city: {
       cityId: state.cityId ?? SHARED_CITY_ID,
       name: "共用城市",
@@ -177,7 +178,7 @@ export function readSharedCity(state = {}) {
       resources,
       shortage: priority[0],
       roadsideFull: !isBuilding(queue[0] ?? {}) && state.work?.roadsideFull === true,
-      work: { tokens: Number(state.work?.tokens ?? 0), unitTokens: WORK_TOKENS_PER_UNIT },
+      work: { units: state.work?.units ?? 0, tokens: Number(state.work?.tokens ?? 0), unitTokens: WORK_TOKENS_PER_UNIT },
       population: { assigned, capacity },
       maintenance: maintenanceRate(buildingCount(buildings)),
       queue,

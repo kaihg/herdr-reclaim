@@ -98,7 +98,7 @@ describe("共用城市的基本收入（#23）", () => {
     await settle(ledger, [inA, half]);
     const partial = await cityAt(dir);
     expect(stock(partial)).toEqual(times(1));
-    expect(partial.work).toEqual({ tokens: 5_000, unitTokens: WORK_TOKENS_PER_UNIT });
+    expect(partial.work).toEqual({ units: 1, tokens: 5_000, unitTokens: WORK_TOKENS_PER_UNIT });
 
     // 下一個回合跨過門檻：收成依計量器餘數補齊，不是只看這一回合的 token。
     const moreB = activity({

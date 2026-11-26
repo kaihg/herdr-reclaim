@@ -37,6 +37,8 @@ const MAX_RIGHT_W = 292;
 const TOP_H = 104;
 /** 操作結果小提示顯示多久（ms）。 */
 const TOAST_MS = 6000;
+const VISIT_STEP_MS = 450;
+const VISIT_BAR_H = 24;
 
 const RESOURCES = [
   { key: "wood", label: "木材", color: "ansi3" },
@@ -257,6 +259,8 @@ export default class Town extends View {
     this.ui = null;
     this.devMode = false;
     this.toast = null;
+    this.lastViewed = null;
+    this.visit = null;
     this.note = "正在查看共用城市…";
     this.devNote = null;
     this.metricsOpen = false;
@@ -337,13 +341,48 @@ export default class Town extends View {
     cx.notify();
   }
 
+  // 只在 render 消費重播結果：背景可載入多次，沒畫出來就不算查看。
+  // buildings 依完工順序只增不減；保留已畫出的棟數，不影響城市或選址。
+  updateVisit(snapshot, land, cx) {
+    const city = snapshot.city;
+    const previous = this.lastViewed;
+    if (snapshot !== previous?.snapshot) {
+      const prior = previous?.snapshot.city;
+      const playing = this.visit && this.visit.visible < prior.buildings.length;
+      if (prior && snapshot.lastSeq > previous.snapshot.lastSeq) {
+        const units = city.work.units - prior.work.units;
+        const built = city.buildings.length - prior.buildings.length;
+        const opened = land - previous.land;
+        if (units || built || opened) {
+          if (!playing) this.visit = { visible: prior.buildings.length };
+          this.visit.text = `上次查看後：進帳 ${units} 份、完工 ${built} 棟、揭開 ${opened} 格`;
+        } else if (!playing) this.visit = null;
+      } else if (!playing) this.visit = null;
+      this.lastViewed = { snapshot, land };
+    }
+    const visit = this.visit;
+    if (!visit || visit.waiting) return;
+    const step = visit.visible < city.buildings.length;
+    visit.waiting = true;
+    cx.timer.after(step ? VISIT_STEP_MS : TOAST_MS, (cx2) => {
+      if (this.visit !== visit) return;
+      if (step) visit.visible++;
+      else this.visit = null;
+      visit.waiting = false;
+      cx2.notify();
+    });
+  }
+
   render(cx) {
     // 顯示更新時重新判定額度是否過期（§9）：模型帶著原始快照，這裡用「現在」重算一次，
     // 所以只是選取／重繪（沒有重新抓取）也會在跨過 TTL／resetsAt 之後顯示未知。
     if (this.town?.quotas?.snapshot !== undefined) this.town.quotas = quotaView(this.town.quotas.snapshot);
     const started = Date.now();
     const t = theme();
-    const shared = this.town?.shared?.city ?? null;
+    let snapshot = this.town?.shared;
+    // 操作後重讀與背景載入可能交錯；較早的快照不能倒轉這個視窗的界線。
+    if (snapshot && snapshot.lastSeq < this.lastViewed?.snapshot.lastSeq) snapshot = this.lastViewed.snapshot;
+    const shared = snapshot?.city;
     if (!shared) {
       this.metrics.pending = null;
       return v_flex()
@@ -359,6 +398,8 @@ export default class Town extends View {
           : "共用城市等著開工：開始工作，第一批建材就會進倉。")))
         .child(chipButton(this.devMode ? "開發模式 ✓" : "開發模式", t, (cx2) => this.toggleDev(cx2)));
     }
+    const revealed = revealedCells(shared);
+    this.updateVisit(snapshot, revealed.size, cx);
     // 這一格 mod 有多寬決定兩側的欄寬；窄 pane 也看得到三個區塊。
     // on_size_change 給的是實際像素（含畫面縮放），版面用的 .w()/.left() 是 UI 像素。
     const zoom = zoomFactor();
@@ -367,7 +408,7 @@ export default class Town extends View {
     const leftW = Math.round(clamp(MIN_LEFT_W, width * 0.19, MAX_LEFT_W));
     const rightW = Math.round(clamp(MIN_RIGHT_W, width * 0.26, MAX_RIGHT_W));
     // 共用城市沒有底部動作列：庫存常駐頂欄，選址在左側與地圖上完成。
-    const mapArea = { width: Math.max(80, width - leftW - rightW), height: Math.max(80, height - TOP_H) };
+    const mapArea = { width: Math.max(80, width - leftW - rightW), height: Math.max(80, height - TOP_H - (this.visit ? VISIT_BAR_H : 0)) };
     const toastText = this.devMode ? this.toast?.devText ?? this.toast?.text : this.toast?.text;
     const root = v_flex()
       .id("root")
@@ -382,14 +423,16 @@ export default class Town extends View {
       })
       .children([
         this.sharedTopBar(shared, t, leftW, rightW, width),
+        ...(this.visit ? [div().id("visit-summary").flex_none().h(VISIT_BAR_H).px(12)
+          .bg(t.surface).text_color(t.foreground).child(this.visit.text)] : []),
         h_flex().flex_1().min_h(0).children([
-          this.sharedPanel(shared, t, cx, leftW),
+          this.sharedPanel(shared, t, cx, leftW, revealed.size),
           div()
             .flex_1()
             .min_w(0)
             .h_full()
             .relative()
-            .child(this.sharedMap(shared, t, cx, mapArea))
+            .child(this.sharedMap(shared, t, cx, mapArea, revealed))
             .when(this.metricsOpen && this.devMode, (element) => element.child(this.metricsPanel(t)))
             .when(Boolean(toastText), (element) => element.child(this.toastView(t, toastText))),
           this.sharedDetail(shared, t, rightW, cx),
@@ -474,7 +517,7 @@ export default class Town extends View {
   }
 
   /** 左側：建設佇列的摘要、可選的建築與額度。佇列明細在右側（可逐項取消）。 */
-  sharedPanel(shared, t, cx, width) {
+  sharedPanel(shared, t, cx, width, revealedCount) {
     const queue = shared.queue;
     const full = manualCount(queue) >= shared.queueLimit;
     return v_flex()
@@ -501,7 +544,7 @@ export default class Town extends View {
           .child("草地、疏林、碎石地可以蓋；深水、峭壁與迷霧不行。預覽與下令用同一條規則。"),
         ...(this.devMode ? this.quotaSection(t) : []),
         div().text_size(9).text_color(t.dim)
-          .child(`已揭開 ${revealedCells(shared).size} 格 · 建築 ${shared.buildings.length} 棟${this.devMode ? ` · 帳本 ${SHARED_CITY_ID}` : ""}`),
+          .child(`已揭開 ${revealedCount} 格 · 建築 ${shared.buildings.length} 棟${this.devMode ? ` · 帳本 ${SHARED_CITY_ID}` : ""}`),
       ]);
   }
 
@@ -550,8 +593,7 @@ export default class Town extends View {
    * 共用城市的地圖：相機與內容區跟著揭開的土地長（至少 MAP_RADIUS，外面多留一圈迷霧）：
    * 完工揭開的土地一定畫得出來、點得到。
    */
-  sharedMap(shared, t, cx, area) {
-    const revealed = revealedCells(shared);
+  sharedMap(shared, t, cx, area, revealed) {
     // `herdr-app check` 在 eval 裡渲染，時間預算比真的視窗緊：大圖（已揭開上百格）會被
     // 當成「interrupted」而讓 check 失敗，與載入好壞無關。檢查模式只畫中心附近，
     // 大圖的實際畫面由真的視窗驗證；runtime 仍然畫全部已揭開的土地。
@@ -577,7 +619,8 @@ export default class Town extends View {
       revealed,
       radius,
       queue: shared.queue,
-      buildings: shared.buildings,
+      buildings: this.visit && this.visit.visible < shared.buildings.length
+        ? shared.buildings.slice(0, this.visit.visible) : shared.buildings,
       terrainVersion: shared.terrainVersion,
       terrainSeed: shared.terrainSeed,
       roadArmLength: shared.roadArmLength,
