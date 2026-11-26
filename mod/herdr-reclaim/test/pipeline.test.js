@@ -99,14 +99,56 @@ describe("選址到下令（真的寫進帳本）", () => {
     expect(town.preview).toBeNull();
     const edge = findById(tree(), "map-9-0");
     edge.handlers.mouseDown.left({ local_position: { x: edge.props.w / 2, y: edge.props.h / 2 }, bounds: {} }, cx);
-    const visible = TERRAIN[groundAt(city, { x: 9, y: 0 })].label;
-    expect(text(findById(tree(), "detail"))).toContain(`${visible}|迷霧|配方`);
+    const edgeTerrain = TERRAIN[groundAt(city, { x: 9, y: 0 })];
+    expect(text(findById(tree(), "detail"))).toContain(`${edgeTerrain.buildable ? "離通車的道路超過 3 格，請先鋪路" : edgeTerrain.label}|迷霧|配方`);
     expect(findByText(tree(), "預定這裡")).toBeNull();
     // 即使繞過按鈕直接送出，帳本的拒絕原因也只能提到迷霧。
     town.submitPlan({ building: "outpost", x: 10, y: 0, label: "哨站" }, cx);
     await waitFor(() => town.toast?.text?.includes("沒有預定"));
     expect(town.toast.text).toBe("沒有預定：有一角還在迷霧裡");
     expect((await ledgerState(host.home)).queue).toEqual([]); // 哨站付料後僅剩 5 鐵，民居不能開工。
+  });
+
+  test("鋪路操作", async () => {
+    const { cx, town, tree } = await open();
+    const click = label => findByText(tree(), label).handlers.click({}, cx);
+    const pick = (x, y) => {
+      const tile = findById(tree(), `map-${x}-${y}`);
+      tile.handlers.mouseDown.left({ local_position: { x: tile.props.w / 2, y: tile.props.h / 2 }, bounds: {} }, cx);
+    };
+    const screen = () => {
+      const words = text(tree());
+      expect(words).not.toMatch(/provider|session|token|shared-v2|帳本|座標|journal|\(-?\d+,\s*-?\d+\)/i);
+      return words;
+    };
+    const before = await ledgerState(host.home);
+    click("鋪路");
+    expect(screen()).toContain("選起點");
+    pick(3, 1);
+    expect(screen()).toContain("請從已通車");
+    pick(0, -2);
+    expect(screen()).toContain("選終點");
+    pick(4, -2);
+    expect(screen()).toContain("終點是峭壁");
+    expect(findByText(tree(), "確認鋪路")).toBeNull();
+    pick(-2, -3);
+    expect(screen()).toContain("新鋪 3 格，其中橋 1 格");
+    expect(screen()).toContain("木材 28・石材 56");
+    expect(screen()).toContain("工期|2 份");
+    for (const id of ["preview-0--2", "preview-0--3", "preview--1--3", "preview--2--3"]) {
+      expect(findById(tree(), id)).not.toBeNull();
+    }
+    click("取消鋪路");
+    expect((await ledgerState(host.home)).lastSeq).toBe(before.lastSeq);
+    click("鋪路"); pick(0, -2); pick(-2, -3); click("確認鋪路");
+    await waitFor(() => town.town.shared.city.queue[0]?.building === "road");
+    expect(screen()).toContain("#1 道路");
+    expect(screen()).toContain("還缺 石材 21");
+    expect((await ledgerState(host.home)).resources).toEqual(before.resources);
+    click("取消");
+    await waitFor(() => !town.town.shared.city.queue.length);
+    expect(screen()).toContain("已取消：道路");
+    expect((await ledgerState(host.home)).resources).toEqual(before.resources);
   });
 
   test("點選預定付料，重開工地不排完工計時器", async () => {

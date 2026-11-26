@@ -29,7 +29,10 @@ export function grossYield(city, available) {
   available ??= revealedCells(city);
   for (const cell of CENTER_CELLS) available.delete(keyOf(cell));
   for (const list of [city.buildings, city.queue]) {
-    for (const item of list) for (const cell of item.cells) available.delete(keyOf(cell));
+    for (const item of list) {
+      // 預定路線會保留占地，但要等完工才取代原料地。
+      if (item.building !== "road") for (const cell of item.cells) available.delete(keyOf(cell));
+    }
   }
   for (const b of city.buildings) {
     const producer = CITY_BUILDINGS[b.building]?.production;

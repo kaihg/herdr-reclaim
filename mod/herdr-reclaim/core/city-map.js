@@ -4,7 +4,7 @@
 // `siteCheck`：畫面說可以放，下令就不會被拒；畫面說不行，下令也進不了帳本。
 // 地圖本身固定（不依 repo、space、session 生成），玩家看到的是同一座城。
 import { CENTER, cellsWithin, gridDistance, isCenterCell, keyOf } from "./grid.js";
-import { CITY_BUILDINGS, START_ROAD_LENGTH, isBuilding, recipeOf } from "./rules.js";
+import { CITY_BUILDINGS, ROADSIDE_RANGE, START_ROAD_LENGTH, isBuilding, recipeOf } from "./rules.js";
 import { terrainV1 } from "./terrain-v1.js";
 import { mixedTerrain, specialSiteAt } from "./terrain-v2.js";
 
@@ -27,11 +27,17 @@ export function terrainAt(cell, version = 1, seed) {
   throw new Error(`不支援的地形版本：${version}`);
 }
 
-export function surfaceAt(city, cell) {
+function completedRoad(city, cell) {
+  if (city?.roads?.[keyOf(cell)]) return true;
   if (cell.x === CENTER.x || cell.y === CENTER.y) {
     const distance = gridDistance(CENTER, cell);
-    if (distance > 1 && distance <= 1 + (city?.roadArmLength ?? START_ROAD_LENGTH)) return "road";
+    return distance > 1 && distance <= 1 + (city?.roadArmLength ?? START_ROAD_LENGTH);
   }
+  return false;
+}
+
+export function surfaceAt(city, cell) {
+  if (completedRoad(city, cell)) return "road";
   return terrainAt(cell, city?.terrainVersion, city?.terrainSeed);
 }
 
@@ -76,8 +82,15 @@ export function footprintCells(building, { x, y }, footprint = CITY_BUILDINGS[bu
  * 回傳 `(building, anchor) => 預覽`；`siteCheck` 與 `legalSites` 都走這一個函式。
  * 占用只看已完工的建築與**整條佇列**（施工中與排隊中的預定地都算），所以佇列裡的兩項不會重疊。
  */
-export function siteChecker(city) {
+export function siteChecker(city, range = ROADSIDE_RANGE) {
   const revealed = revealedCells(city);
+  const covered = new Set();
+  for (const key of revealed) {
+    const [x, y] = key.split(",").map(Number);
+    if (completedRoad(city, { x, y })) {
+      for (const c of cellsWithin({ x, y }, range)) covered.add(keyOf(c));
+    }
+  }
   const built = new Set((city?.buildings ?? []).flatMap((done) => done.cells.map(keyOf)));
   const planned = new Set((city?.queue ?? []).flatMap((item) => (item.cells ?? []).map(keyOf)));
   const check = (building, anchor) => {
@@ -92,12 +105,13 @@ export function siteChecker(city) {
       if (built.has(key)) return { ...cell, terrain, problem: "building" };
       if (planned.has(key)) return { ...cell, terrain, problem: "plan" };
       if (city?.terrainVersion === 2 && specialSiteAt(city.terrainSeed, cell)) return { ...cell, terrain, problem: "reserved" };
+      if (building !== "outpost" && !covered.has(key)) return { ...cell, terrain, problem: "off_road" };
       return { ...cell, terrain, problem: null };
     });
     const problems = cells.map((cell) => cell.problem).filter(Boolean);
     return { ok: problems.length === 0, building, label: def.label, x: anchor?.x, y: anchor?.y, cells, problems };
   };
-  return { revealed, check };
+  return { revealed, covered, check };
 }
 
 /**

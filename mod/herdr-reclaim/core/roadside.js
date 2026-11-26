@@ -1,4 +1,4 @@
-import { cellsWithin, gridDistance, keyOf } from "./grid.js";
+import { cellsWithin, keyOf } from "./grid.js";
 import { siteChecker, surfaceAt } from "./city-map.js";
 import { grossYield, workforce } from "./economy.js";
 import { CITY_BUILDINGS, ROADSIDE_RANGE, TOWN_UPGRADE_COSTS, isBuilding, recipeOf } from "./rules.js";
@@ -18,12 +18,13 @@ export function needs(city, gross) {
 
 /** 土地只在占地或揭開範圍變動時重算；等料的每一份仍按當下庫存重排種類。 */
 export function roadsideSites(city, range = ROADSIDE_RANGE) {
-  const { revealed, check } = siteChecker(city);
-  const known = [...revealed].map(key => { const [x, y] = key.split(",").map(Number); return { x, y }; });
-  const roads = known.filter(cell => surfaceAt(city, cell) === "road");
-  const anchors = known.filter(cell => roads.some(road => gridDistance(road, cell) <= range));
+  const { revealed, covered, check } = siteChecker(city, range);
+  const anchors = [];
+  for (const key of revealed) if (covered.has(key)) {
+    const [x, y] = key.split(",").map(Number);
+    anchors.push({ x, y });
+  }
   anchors.sort((a, b) => a.y - b.y || a.x - b.x);
-  const covered = new Set(anchors.map(keyOf));
   const available = new Set(revealed);
   grossYield(city, available); // 去除既有占地與產場已取得的資源
   const cache = new Map();
@@ -33,7 +34,7 @@ export function roadsideSites(city, range = ROADSIDE_RANGE) {
     let winner = null, bestBonus = -1, leastDamage = Infinity, leastAxis = Infinity;
     for (const anchor of anchors) {
       const { ok, cells } = check(building, anchor);
-      if (!ok || !cells.every(c => covered.has(keyOf(c)))) continue;
+      if (!ok) continue;
       const site = { building, ...anchor, ...footprint };
       let bonus = 0, damage = 0, axis = 0;
       for (const cell of cells) {

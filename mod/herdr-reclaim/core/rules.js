@@ -18,7 +18,9 @@ export const UNIT_CONSTRUCTION_VERSION = 12;
 export const POPULATION_VERSION = 13;
 export const PRODUCTION_VERSION = 14;
 export const AUTO_CONSTRUCTION_VERSION = 15;
-export const RULES_VERSION = AUTO_CONSTRUCTION_VERSION;
+export const RULES_VERSION = 16;
+// v16：以材料成本找路；橋的兩種材料等比增加。
+export const ROAD = { limit: 12, landWeight: 1, bridgeWeight: 5, wood: 4, stone: 8, cellsPerUnit: 2 };
 export const ROADSIDE_RANGE = 3;
 export const AUTO_INTERVAL_UNITS = 0;
 export const TOWN_UPGRADE_COSTS = { wood: 2600, stone: 2600, iron: 1300 };

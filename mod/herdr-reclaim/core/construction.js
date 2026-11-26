@@ -2,8 +2,10 @@ import { AUTO_INTERVAL_UNITS, BUILDINGS_V12, CITY_BUILDINGS, POPULATION_VERSION,
 import { buildingCount, creditUnits, grossYield } from "./economy.js";
 import { footprintCells } from "./city-map.js";
 import { needs, roadsideSites } from "./roadside.js";
+import { keyOf } from "./grid.js";
 
 const definition = item => (item.rulesVersion >= POPULATION_VERSION ? CITY_BUILDINGS : BUILDINGS_V12)[item.building];
+export const constructionUnits = item => item.building === "road" ? item.buildUnits : definition(item).buildUnits;
 
 /** 只套用已落帳的決定；重播不查地圖、不排種類，也不重算工期。 */
 export function applyConstruction(city, event) {
@@ -15,6 +17,10 @@ export function applyConstruction(city, event) {
   const item = city.queue[0];
   if (event.kind === "autoComplete" || event.kind === "manualComplete") {
     city.queue.shift();
+    if (item.building === "road") {
+      for (const cell of item.cells) city.roads[keyOf(cell)] = cell.terrain === "water" ? "bridge" : "road";
+      return;
+    }
     const { building, label, x, y, w, h, costs, cells, startedUnit } = item;
     city.buildings.push({ building, label, x, y, w, h, costs, cells, startedUnit,
       ...(item.auto ? { auto: true } : {}), completedUnit: event.unit, reveal: event.reveal, rulesVersion: event.rulesVersion });
@@ -46,14 +52,18 @@ export function constructionIncome(state, tokens, rulesVersion) {
     // 舊時制工地：第一次收到份數時接軌，不重扣已支付的配方。
     if (head?.startedAt != null && head.startedUnit == null) record("manualStart", unit, {});
     const running = head && isBuilding(head);
-    const finish = running ? head.startedUnit + definition(head).buildUnits : null;
+    const finish = running ? head.startedUnit + constructionUnits(head) : null;
     const span = running ? Math.min(end, finish) - unit : !head && state.work.since == null ? end - unit : 1;
     creditUnits(city.resources, income, carry, count, span, gross);
     unit += span;
     if (running) {
       if (unit < finish) continue;
-      record(head.auto ? "autoComplete" : "manualComplete", unit, { building: head.building, reveal: definition(head).reveal });
-      count++; gross = grossYield(city); sites = null;
+      const road = head.building === "road";
+      // 模擬交易時不能修改 CAS 前的城市；首次通車才複製道路表。
+      if (road && city.roads === state.roads) city.roads = { ...state.roads };
+      record(head.auto ? "autoComplete" : "manualComplete", unit, { building: head.building, reveal: road ? 0 : definition(head).reveal });
+      if (!road) count++;
+      gross = grossYield(city); sites = null;
       head = city.queue[0];
     }
     if (head && (head.paid || affordable(head.costs, city.resources))) {

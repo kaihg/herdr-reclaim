@@ -21,12 +21,13 @@ import { CasConflict, CityLedger } from "./core/ledger.js";
 import { quotaLines } from "./core/provider-stats.js";
 import { QUOTA_REFRESH_MS, QUOTA_SOURCE, claimQuotaAttempt, parseQuotaReport } from "./core/quota-source.js";
 import { quotaView, readQuotaView } from "./core/quota-view.js";
-import { CITY_BUILDINGS, RESOURCE_LABELS, RULES_VERSION, manualCount } from "./core/rules.js";
+import { CITY_BUILDINGS, RESOURCE_LABELS, ROAD, ROADSIDE_RANGE, RULES_VERSION, manualCount } from "./core/rules.js";
 import { parseUi, selectionOf, serializeUi, withDev, withSelection } from "./core/selection.js";
 import {
-  SHARED_CITY_ID, cancelPlan, placePlan, readSharedCity, sharedCityDir,
+  SHARED_CITY_ID, cancelPlan, placePlan, placeRoad, readSharedCity, sharedCityDir,
 } from "./core/shared-city.js";
-import { TERRAIN, cityBuildings, groundAt, legalSites, missingOf, revealedCells, siteCheck } from "./core/city-map.js";
+import { TERRAIN, cityBuildings, groundAt, missingOf, revealedCells, siteCheck } from "./core/city-map.js";
+import { previewRoad, roadStart } from "./core/roads.js";
 import { fixedSharedCity } from "./scenarios/shared-city.js";
 import { sharedMapView } from "./ui/map.js";
 
@@ -51,6 +52,7 @@ const RESOURCES = [
 const SITE_PROBLEMS = {
   road: "道路", fog: "迷霧", water: "深水", cliff: "峭壁", center: "城鎮中心", building: "已有建築", plan: "預定地", unknown_building: "未知建築",
   reserved: "地標預留地",
+  off_road: `離通車的道路超過 ${ROADSIDE_RANGE} 格，請先鋪路`,
 };
 const INCOME_HINT = "繼續工作就會進帳";
 const PLAN_REASONS = {
@@ -69,6 +71,15 @@ const PLAN_REASONS = {
   site_building: "有一角已有建築",
   site_plan: "有一角是預定地",
   site_reserved: "有一角是地標預留地",
+  site_off_road: SITE_PROBLEMS.off_road,
+  road_start: "請從已通車的道路或城鎮中心邊緣出發",
+  road_fog: "終點還沒揭開",
+  road_cliff: "終點是峭壁，不能鋪路",
+  road_exists: "終點已經是道路",
+  road_occupied: "終點已有建築或預定地",
+  road_blocked: "沒有可通行的路線：請避開峭壁、迷霧與占地",
+  road_length: `這條路超過 ${ROAD.limit} 個新格，請選近一點的終點`,
+  road_changed: "路線已改變，請重新確認",
 };
 const costsText = (costs = {}) => Object.entries(costs)
   .map(([key, amount]) => `${RESOURCE_LABELS[key]} ${amount}`).join("・");
@@ -399,6 +410,8 @@ export default class Town extends View {
         .child(chipButton(this.devMode ? "開發模式 ✓" : "開發模式", t, (cx2) => this.toggleDev(cx2)));
     }
     const revealed = revealedCells(shared);
+    const route = this.picking === "road" && this.roadFrom && this.preview
+      ? previewRoad(shared, this.roadFrom, this.preview) : null;
     this.updateVisit(snapshot, revealed.size, cx);
     // 這一格 mod 有多寬決定兩側的欄寬；窄 pane 也看得到三個區塊。
     // on_size_change 給的是實際像素（含畫面縮放），版面用的 .w()/.left() 是 UI 像素。
@@ -432,10 +445,10 @@ export default class Town extends View {
             .min_w(0)
             .h_full()
             .relative()
-            .child(this.sharedMap(shared, t, cx, mapArea, revealed))
+            .child(this.sharedMap(shared, t, cx, mapArea, revealed, route))
             .when(this.metricsOpen && this.devMode, (element) => element.child(this.metricsPanel(t)))
             .when(Boolean(toastText), (element) => element.child(this.toastView(t, toastText))),
-          this.sharedDetail(shared, t, rightW, cx),
+          this.sharedDetail(shared, t, rightW, cx, route),
         ]),
       ]);
     this.finishMeasure(started);
@@ -537,6 +550,7 @@ export default class Town extends View {
         div().text_size(9).text_color(t.muted).child(queue.length
           ? queueLine(queue[0], this.devMode)
           : "選好建築後，地圖會標出全部合法位置；點一格看整棟預覽，再按「預定這裡」。"),
+        chipButton("鋪路", t, cx2 => this.pickBuilding(shared, "road", cx2)),
         ...cityBuildings(shared).map((building) => this.buildingCard(shared, building, t, cx)),
         div().text_size(9).text_color(t.dim)
           .child(full ? "佇列已滿：先讓最前面那一項完工，或取消還沒開工的項目。" : "預定不動庫存：排到隊首、材料備齊才一次付清；還沒開工的項目可以取消。"),
@@ -585,6 +599,7 @@ export default class Town extends View {
       return;
     }
     this.picking = this.picking === building ? null : building;
+    this.roadFrom = null;
     this.preview = null;
     cx.notify();
   }
@@ -593,7 +608,7 @@ export default class Town extends View {
    * 共用城市的地圖：相機與內容區跟著揭開的土地長（至少 MAP_RADIUS，外面多留一圈迷霧）：
    * 完工揭開的土地一定畫得出來、點得到。
    */
-  sharedMap(shared, t, cx, area, revealed) {
+  sharedMap(shared, t, cx, area, revealed, route) {
     // `herdr-app check` 在 eval 裡渲染，時間預算比真的視窗緊：大圖（已揭開上百格）會被
     // 當成「interrupted」而讓 check 失敗，與載入好壞無關。檢查模式只畫中心附近，
     // 大圖的實際畫面由真的視窗驗證；runtime 仍然畫全部已揭開的土地。
@@ -613,8 +628,6 @@ export default class Town extends View {
     this.mapArea = { width: area.width, height: area.height };
     this.camera = { ...this.camera, ...clampCamera(this.camera, size, area) };
     this.focusCell = null;
-    // 選址只有在佇列已滿時停下（別的視窗搶先扣走材料由帳本裁決，畫面下不了令時只顯示原因）。
-    const selecting = Boolean(this.picking);
     return sharedMapView({
       revealed,
       radius,
@@ -624,6 +637,9 @@ export default class Town extends View {
       terrainVersion: shared.terrainVersion,
       terrainSeed: shared.terrainSeed,
       roadArmLength: shared.roadArmLength,
+      roads: shared.roads,
+      roadPicking: this.picking === "road",
+      preview: this.picking === "road" && this.roadFrom ? { cells: [this.roadFrom, ...(route?.path ?? [])] } : null,
       theme: t,
       tile,
       camera: this.camera,
@@ -643,7 +659,17 @@ export default class Town extends View {
    */
   pickSite(x, y, cx) {
     const shared = this.town?.shared?.city;
-    if (!shared || !revealedCells(shared).has(`${x},${y}`)) return;
+    if (!shared) return;
+    const known = revealedCells(shared).has(`${x},${y}`);
+    if (this.picking === "road") {
+      const cell = { x, y };
+      if (this.roadFrom) this.preview = cell;
+      else if (known && roadStart(shared, cell)) this.roadFrom = cell;
+      else { this.showToast(PLAN_REASONS.road_start, cx); return; }
+      cx.notify();
+      return;
+    }
+    if (!known) return;
     this.mark("pick");
     if (this.picking) {
       this.preview = { x, y };
@@ -654,8 +680,9 @@ export default class Town extends View {
   }
 
   /** 右側：整棟預覽與「預定這裡」；沒有預覽時顯示建設佇列或選取格的地形。 */
-  sharedDetail(shared, t, width, cx) {
-    const preview = this.picking && this.preview ? siteCheck(shared, this.picking, this.preview) : null;
+  sharedDetail(shared, t, width, cx, route) {
+    const road = this.picking === "road";
+    const preview = !road && this.picking && this.preview ? siteCheck(shared, this.picking, this.preview) : null;
     const spot = this.selection?.cityId === SHARED_CITY_ID && this.selection.kind === "site" ? this.selection : null;
     return v_flex()
       .id("detail")
@@ -669,12 +696,30 @@ export default class Town extends View {
       .border_l(1)
       .border_color(t.border)
       .children([
-        div().text_size(10).text_color(t.dim).child(preview ? "整棟預覽" : "選址與建設"),
-        ...(preview
+        div().text_size(10).text_color(t.dim).child(road ? "鋪路" : preview ? "整棟預覽" : "選址與建設"),
+        ...(road ? this.roadSection(shared, t, route) : preview
           ? this.previewSection(preview, t, shared, cx)
           : (shared.queue.length ? this.queueSection(shared, t, cx) : this.spotSection(shared, spot, t))),
         this.note ? div().text_size(9).text_color(t.muted).child(this.note) : null,
       ].filter(Boolean));
+  }
+
+  roadSection(shared, t, route) {
+    const room = manualCount(shared.queue) < shared.queueLimit;
+    return [
+      div().font_semibold().child(route ? "道路預覽" : this.roadFrom ? "選終點：點已揭開的土地" : "選起點：點道路或城鎮中心邊緣"),
+      ...(route?.ok ? [
+        div().child(`新鋪 ${route.newCount} 格，其中橋 ${route.path.filter(c => c.terrain === "water").length} 格`),
+        fieldRow({ label: "總成本", value: costsText(route.costs) }, t),
+        fieldRow({ label: "工期", value: `${route.buildUnits} 份` }, t),
+        room ? chipButton("確認鋪路", t, cx => this.submitPlan({ building: "road", label: "道路", ...route.end, route }, cx))
+          : div().child(PLAN_REASONS.queue_full),
+      ] : route ? [div().text_color(t.blocked).child(PLAN_REASONS[route.reason])] : []),
+      chipButton("取消鋪路", t, cx => {
+        this.picking = this.preview = this.roadFrom = null;
+        cx.notify();
+      }),
+    ];
   }
 
   /** 整棟預覽＋下令：配方、還缺什麼、佇列還有沒有位置，都先講清楚再按「預定這裡」。 */
@@ -726,8 +771,9 @@ export default class Town extends View {
             h_flex().gap(6).items_center()
               .child(div().text_size(12).font_semibold().child(`#${index + 1} ${item.label}`))
               .child(statusBadge(building ? "施工中" : missing ? "備料中" : "排隊中", t)),
-            div().text_size(10).text_color(t.muted).child(`占地 ${item.w}×${item.h}${locationLabel(item, this.devMode)}`),
-            fieldRow({ label: "用途", value: CITY_BUILDINGS[item.building].purpose }, t),
+            div().text_size(10).text_color(t.muted).child(item.building === "road" ? `新鋪 ${item.cells.length} 格`
+              : `占地 ${item.w}×${item.h}${locationLabel(item, this.devMode)}`),
+            fieldRow({ label: "用途", value: item.building === "road" ? "通車後，沿線土地可以蓋建築" : CITY_BUILDINGS[item.building].purpose }, t),
             fieldRow({ label: "配方", value: costsText(item.costs) }, t),
             ...(building
               ? [fieldRow({ label: "工期", value: workLeft(item) }, t)]
@@ -748,7 +794,7 @@ export default class Town extends View {
       : null;
     return [
       div().text_size(14).font_semibold().child(`選取的土地${locationLabel(spot, this.devMode)}`),
-      fieldRow({ label: "地面", value: ground ? groundLabel(ground) : "迷霧" }, t),
+      fieldRow({ label: "地面", value: ground === "road" && shared.roads?.[`${spot.x},${spot.y}`] === "bridge" ? "橋" : ground ? groundLabel(ground) : "迷霧" }, t),
       ...(done ? [fieldRow({ label: "建築", value: done.label }, t),
         fieldRow({ label: "用途", value: CITY_BUILDINGS[done.building].purpose }, t)] : []),
       div().text_size(9).text_color(t.muted).child(
@@ -770,7 +816,9 @@ export default class Town extends View {
       let text;
       let devText;
       try {
-        const result = await placePlan(await openShared(this.io), { building, x, y, at: startedAt });
+        const ledger = await openShared(this.io);
+        const result = building === "road" ? await placeRoad(ledger, preview.route, startedAt)
+          : await placePlan(ledger, { building, x, y, at: startedAt });
         if (result.status === "applied" || result.status === "duplicate") {
           this.town = await this.refreshShared();
           this.picking = null;
@@ -778,6 +826,7 @@ export default class Town extends View {
           text = `已預定：${label}；排到隊首、材料備齊才付料開工`;
           devText = text + locationLabel({ x, y }, true);
         } else {
+          if (building === "road") this.town = await this.refreshShared();
           text = `沒有預定：${PLAN_REASONS[result.reason] ?? "請重新選址再試"}`;
           devText = `${text} (${result.reason ?? result.status})`;
         }

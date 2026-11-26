@@ -19,8 +19,8 @@ const slash = (token, width, gap) => ({ kind: "slash", token, width, gap });
  *   marks    預覽格（`{ spot, blocked }`）與完工建築（`{ spot, recipe }`）：各自畫
  *   preview  整片預覽（畫面用來把伸進迷霧的那一角畫成阻擋色）
  */
-export function mapCells({ revealed, queue = [], buildings = [], terrainVersion, terrainSeed, roadArmLength, legal = [], preview = null, selected = null, radius }) {
-  const city = { queue, buildings, terrainVersion, terrainSeed, roadArmLength };
+export function mapCells({ revealed, queue = [], buildings = [], terrainVersion, terrainSeed, roadArmLength, roads, legal = [], preview = null, selected = null, radius }) {
+  const city = { queue, buildings, terrainVersion, terrainSeed, roadArmLength, roads };
   const planCells = new Set((queue ?? []).flatMap((item) => (item.cells ?? []).map((cell) => keyOf(cell))));
   const previewCells = new Map((preview?.cells ?? []).map((cell) => [keyOf(cell), cell]));
   const legalAnchors = new Set(legal.map((site) => keyOf(site)));
@@ -45,7 +45,7 @@ export function mapCells({ revealed, queue = [], buildings = [], terrainVersion,
       const marked = previewCells.get(key);
       if (marked) {
         // 預覽最多一整棟（≤ 4 格），照舊一格一條，才能逐格顯示「為什麼不能放」。
-        marks.push({ kind: "preview", spot, blocked: Boolean(marked.problem) });
+        marks.push({ kind: "preview", spot, blocked: Boolean(marked.problem), bridge: marked.terrain === "water" && !marked.problem });
         continue;
       }
       const ground = groundAt(city, spot);
@@ -64,6 +64,11 @@ export function mapCells({ revealed, queue = [], buildings = [], terrainVersion,
       if (planCells.has(key)) {
         fillOf("plan", solid("accent", 0.22), spot);
         outlineOf("plan", "accent", [4, 3], spot);
+        continue;
+      }
+      if (ground === "road" && roads?.[key] === "bridge") {
+        fillOf("bridge", slash("ansi4", 2, 4), spot);
+        outlineOf("bridge", "muted", null, spot);
         continue;
       }
       const terrain = TERRAIN[ground];

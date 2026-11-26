@@ -189,6 +189,18 @@ test("人口維護與缺人只用玩家用語", () => {
   expect(playerScreen(tree())).not.toContain("書庫・缺人");
 });
 
+test("沿線預覽", () => {
+  const { town, tree, cx } = open();
+  town.town.shared = readSharedCity({ terrainVersion: 1 });
+  findById(tree(), "building-house").handlers.click({}, cx);
+  town.pickSite(3, 4, cx); // 一格離路三格，另一格四格。
+  expect(playerScreen(findById(tree(), "detail"))).toContain("離通車的道路超過 3 格，請先鋪路");
+  expect(findByText(tree(), "預定這裡")).toBeNull();
+  findById(tree(), "building-outpost").handlers.click({}, cx);
+  town.pickSite(4, 4, cx);
+  expect(playerScreen(findById(tree(), "detail"))).toContain("預定這裡");
+});
+
 describe("固定情境的分區與庫存", () => {
   test("三個區塊都在，庫存、佇列與施工中的那一項照模型顯示", () => {
     const { tree } = open();

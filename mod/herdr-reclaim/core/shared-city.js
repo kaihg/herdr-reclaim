@@ -13,7 +13,8 @@
 // 舊版各城帳本留在磁碟上，不讀也不改。
 import { claimKey, planKey } from "./ledger.js";
 import { needs, roadsideSites } from "./roadside.js";
-import { BUILD_QUEUE_LIMIT, BUILDINGS_V12, CITY_BUILDINGS, POPULATION_VERSION, START_RESOURCES, START_ROAD_LENGTH, TERRAIN_VERSION, WORK_TOKENS_PER_UNIT, WORK_YIELD, isBuilding, recipeOf } from "./rules.js";
+import { BUILD_QUEUE_LIMIT, CITY_BUILDINGS, START_RESOURCES, START_ROAD_LENGTH, TERRAIN_VERSION, WORK_TOKENS_PER_UNIT, WORK_YIELD, isBuilding, recipeOf } from "./rules.js";
+import { constructionUnits } from "./construction.js";
 import { buildingCount, maintenanceRate, workforce } from "./economy.js";
 import { missingOf } from "./city-map.js";
 import { createsTile, rootOf, roundsOf, sessionIndex } from "./research.js";
@@ -154,8 +155,7 @@ export function readSharedCity(state = {}) {
     copy.missing = running ? {} : missingOf(copy.costs, pool);
     if (running) {
       const elapsed = item.startedUnit == null ? 0 : (state.work?.units ?? 0) - item.startedUnit;
-      const defs = item.rulesVersion >= POPULATION_VERSION ? CITY_BUILDINGS : BUILDINGS_V12;
-      copy.remainingUnits = defs[item.building].buildUnits - elapsed;
+      copy.remainingUnits = constructionUnits(item) - elapsed;
     }
     // 這一項之後就輪到下一項：排隊中的配方先從池子裡扣掉（已開工的那一項早就付過了）。
     if (!running) for (const [key, amount] of Object.entries(copy.costs)) pool[key] = Number(pool[key] ?? 0) - Number(amount);
@@ -175,6 +175,7 @@ export function readSharedCity(state = {}) {
       terrainVersion: state.terrainVersion,
       terrainSeed: state.terrainSeed,
       roadArmLength: state.roadArmLength,
+      roads: { ...state.roads },
       resources,
       shortage: priority[0],
       roadsideFull: !isBuilding(queue[0] ?? {}) && state.work?.roadsideFull === true,
@@ -213,6 +214,14 @@ export async function placePlan(ledger, { building, x, y, at } = {}) {
     w: def?.footprint.w ?? 0,
     h: def?.footprint.h ?? 0,
     costs: recipeOf(current, building),
+  }));
+}
+
+/** 只送玩家確認的那份預覽；另一個視窗搶先改變路徑時，由帳本拒絕。 */
+export async function placeRoad(ledger, { start, end, path, costs, buildUnits }, at = Date.now()) {
+  return ledger.submit(() => ({
+    opId: `road:${ledger.cityId}:${start.x},${start.y}:${end.x},${end.y}:${at}`, kind: "roadPlan",
+    cityId: ledger.cityId, at, start, end, path, costs, buildUnits,
   }));
 }
 

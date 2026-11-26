@@ -13,7 +13,7 @@
 // 樣式聚成幾條路徑（core/map-style.js 決定每一格落哪一桶），每一幀不是一格一條路徑。
 import { Background, PathBuilder, div } from "gpui-kit";
 
-import { CENTER, CENTER_CELLS, MAP_RADIUS, cellAtEvent, contentSize, isCenterCell, keyOf, neighbors, originInContent, projectTile } from "../core/grid.js";
+import { CENTER, CENTER_CELLS, MAP_RADIUS, cellAtEvent, cellAtOffset, contentSize, eventPoint, isCenterCell, keyOf, neighbors, originInContent, projectTile } from "../core/grid.js";
 import { mapCells } from "../core/map-style.js";
 import { buildingOf, buildingPolygons } from "./assets.js";
 
@@ -27,21 +27,22 @@ const paintOf = (style, t) => (style.kind === "slash"
 
 export function sharedMapView({
   revealed, queue = [], buildings = [], legal = [], preview = null, selected = null, theme: t, tile, camera,
-  terrainVersion, terrainSeed, roadArmLength,
+  terrainVersion, terrainSeed, roadArmLength, roads, roadPicking = false,
   radius = MAP_RADIUS, onPick, onPan, viewport = null,
 }) {
   const origin = originInContent(radius, tile);
   const base = basePaths(radius, tile);
-  const layout = mapCells({ revealed, queue, buildings, terrainVersion, terrainSeed, roadArmLength, legal, preview, selected, radius });
+  const layout = mapCells({ revealed, queue, buildings, terrainVersion, terrainSeed, roadArmLength, roads, legal, preview, selected, radius });
   const spotOf = (cell) => projectTile(cell, tile);
   const marks = layout.marks.map((mark) => {
     if (mark.kind === "building") {
       return buildingMarkAt(buildingOf({ building: mark.recipe }), tile, t.done, mark.spot, origin, camera);
     }
     // 預覽：可以放是完成色、不能放是阻擋色。
-    const color = t[mark.blocked ? "blocked" : "done"];
+    const color = t[mark.blocked ? "blocked" : mark.bridge ? "ansi4" : "done"];
     const spot = spotOf(mark.spot);
     return div()
+      .id(`preview-${mark.spot.x}-${mark.spot.y}`)
       .absolute()
       .left(camera.x + origin.left + spot.left)
       .top(camera.y + origin.top + spot.top)
@@ -77,6 +78,12 @@ export function sharedMapView({
     ...layout.fills.map(({ cells, ...style }) => fullPath(filled(cells, tile, origin), paintOf(style, t), size, camera)),
     fullPath(base.outline, t.border, size, camera),
     ...layout.outlines.map(({ token, dash, cells }) => fullPath(stroked(cells, tile, origin, dash), t[token] ?? t.border, size, camera)),
+    ...(roadPicking ? [div().absolute().size_full().on_mouse_down("left", (event, cx) => {
+      const p = eventPoint(event.local_position, event.bounds, { w: viewport.width });
+      if (!p) return;
+      const spot = cellAtOffset({ x: p.x - camera.x - origin.left, y: p.y - camera.y - origin.top }, tile);
+      if (Math.abs(spot.dx) <= radius && Math.abs(spot.dy) <= radius) onPick({ x: spot.dx, y: spot.dy }, cx);
+    })] : []),
     ...centerBlock(t, tile, origin, radius, onPick, camera),
     ...marks,
     ...click,

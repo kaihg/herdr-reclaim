@@ -35,6 +35,7 @@ import { AUTO_CONSTRUCTION_VERSION, manualCount } from "./rules.js";
 import { BUILD_QUEUE_LIMIT, BUILDINGS_V12, CITY_BUILDINGS, POPULATION_VERSION, PRODUCTION_VERSION, RESOURCES, RULES_VERSION, UNIT_CONSTRUCTION_VERSION, WORK_TOKENS_PER_UNIT, WORK_YIELD, affordable, isBuilding, recipeOf } from "./rules.js";
 import { buildingCount, creditUnits, grossYield } from "./economy.js";
 import { footprintCells, siteCheck } from "./city-map.js";
+import { previewRoad } from "./roads.js";
 
 export { byteLen, hashText };
 
@@ -159,6 +160,7 @@ export function emptyState(cityId) {
     work: { tokens: 0, since: null, stockedAt: null },
     queue: [],
     buildings: [],
+    roads: {},
   };
 }
 
@@ -368,6 +370,23 @@ export const KINDS = {
     },
   },
 
+  roadPlan: {
+    precheck(state, op) {
+      if (op.cityId !== state.cityId) return "wrong_city";
+      if (manualCount(state.queue) >= BUILD_QUEUE_LIMIT) return "queue_full";
+      const route = previewRoad(state, op.start, op.end);
+      if (!route.ok) return route.reason;
+      // CAS 重試不能偷偷換掉玩家看到的路線或報價。
+      return sameCosts(op.costs, route.costs) && op.buildUnits === route.buildUnits &&
+        canonicalJson(op.path) === canonicalJson(route.path) ? null : "road_changed";
+    },
+    apply(state, entry) {
+      const { end, path, at, costs, buildUnits, rulesVersion } = entry;
+      state.queue.push({ building: "road", label: "道路", x: end.x, y: end.y, at, costs, buildUnits, rulesVersion,
+        cells: path.filter(c => c.terrain !== "road"), paid: false });
+      startReadyHead(state, state.work.units ?? 0);
+    },
+  },
   /**
    * 建設佇列的一項（#25、ADR 0003）：玩家選定建築與錨點，整片占地成為預定地。
    * **指定位置不動庫存**——材料夠不夠是備料與施工（#26）的事，缺料時照樣可以先排進佇列，
@@ -892,6 +911,7 @@ export class CityLedger {
       // 共用城市的建築會一直增加：清單放內容檔（可切塊），manifest 只留固定長度的雜湊；
       // 沒有建築時就不寫內容檔。
       buildings: state.buildings.length > 0 ? (await this.blobs.putValue(state.buildings)).hash : null,
+      roads: Object.keys(state.roads).length ? (await this.blobs.putValue(state.roads)).hash : null,
       // 每一組索引的內容摘要（固定幾個 16 進位字串；不隨資料量成長）。
       digests: Object.fromEntries(Object.entries(built).map(([part, result]) => [part, result.digest])),
       counts: {
@@ -985,6 +1005,7 @@ export class CityLedger {
       state.work = manifest.work ?? state.work;
       state.queue = manifest.queue ?? state.queue;
       state.buildings = manifest.buildings ? await this.blobs.getValue(manifest.buildings) : state.buildings;
+      if (manifest.roads) state.roads = await this.blobs.getValue(manifest.roads);
       return { state, segment: manifest.segment };
     } catch (error) {
       // 內容不符、頁面壞掉、內容檔（blob）對不上雜湊…都是「這份 checkpoint 不可信」。
