@@ -87,7 +87,7 @@ describe("OMP extension 寫入遠征活動檔", () => {
     expect(usage.usage.openai.sourceKey).toBe("omp#root-id#source-1");
     expect(usage.usage.openai.inputNonCache).toBe(5);
 
-    const ack = path.join(isolatedHome, "data", "herdr-reclaim", "shared", "acks", "root-id", `${rootFirst.writerEpoch}.json`);
+    const ack = path.join(isolatedHome, "data", "herdr-reclaim", "shared-v2", "acks", "root-id", `${rootFirst.writerEpoch}.json`);
     fs.mkdirSync(path.dirname(ack), { recursive: true });
     fs.writeFileSync(ack, JSON.stringify({ ackedEventSeq: usage.eventSeq, journalSeq: 3 }));
     fire("agent_start", {}, root);

@@ -19,7 +19,8 @@ const slash = (token, width, gap) => ({ kind: "slash", token, width, gap });
  *   marks    預覽格（`{ spot, blocked }`）與完工建築（`{ spot, recipe }`）：各自畫
  *   preview  整片預覽（畫面用來把伸進迷霧的那一角畫成阻擋色）
  */
-export function mapCells({ revealed, queue = [], buildings = [], legal = [], preview = null, selected = null, radius }) {
+export function mapCells({ revealed, queue = [], buildings = [], terrainVersion, roadArmLength, legal = [], preview = null, selected = null, radius }) {
+  const city = { queue, buildings, terrainVersion, roadArmLength };
   const planCells = new Set((queue ?? []).flatMap((item) => (item.cells ?? []).map((cell) => keyOf(cell))));
   const previewCells = new Map((preview?.cells ?? []).map((cell) => [keyOf(cell), cell]));
   const legalAnchors = new Set(legal.map((site) => keyOf(site)));
@@ -47,7 +48,7 @@ export function mapCells({ revealed, queue = [], buildings = [], legal = [], pre
         marks.push({ kind: "preview", spot, blocked: Boolean(marked.problem) });
         continue;
       }
-      const ground = groundAt({ queue, buildings }, spot);
+      const ground = groundAt(city, spot);
       if (ground === "building") {
         fillOf("done", solid("done", 0.3), spot);
         outlineOf("done", "done", null, spot);

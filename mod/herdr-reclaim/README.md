@@ -62,7 +62,7 @@ mod 端由 `core/host-io.js` 把 herdr 的原生錯誤轉成 `CasConflict`（真
   才 compact 已確認的事件。
 
 資料在 `appHome()/data/herdr-reclaim/`：`activity/<sessionId>/<writerEpoch>.json` 是 adapter
-寫入的活動檔；`shared/` 是共用城市的帳本（舊版各 repo 城的 `cities/` 程式不再讀寫）。
+寫入的活動檔；新城使用 `shared-v2/`，舊帳本 `shared/` 與 `cities/` 留在原地，不讀也不改。
 `quotas.json`（同一個資料目錄）是額度回報檔：內容是 provider 明確回報的額度，
 形狀與 `spikes/s5/observed.json` 相同（`omp usage --json --redact` 的輸出：`generatedAt`、
 `reports[].fetchedAt`、`reports[].limits[].amount` 與 `window.resetsAt`）。mod 啟動時與每 5 分鐘
@@ -161,8 +161,8 @@ tools/ui-report.sh            # 測試＋check＋三個寬度的截圖 → repor
 
 截圖失敗（螢幕鎖定、app 起不來）只會讓那一列標成「視覺未驗」，報告照樣產出；`bun test` 或
 `check` 失敗才回非 0。像素不是 gate：時間文字、動畫每一輪都不同，圖只給人看排版與截斷。
-報告目錄的 `home/data/herdr-reclaim/` 就是那一次的資料：第一次開會出現 `shared/head.json`、
-`shared/journal/0.json`、`shared/blobs/*.json`、`shared/acks/*` 與 `ui.json`，**不會**出現舊版的
+報告目錄的 `home/data/herdr-reclaim/` 就是那一次的資料：第一次開會出現 `shared-v2/head.json`、
+`shared-v2/journal/0.json`、`shared-v2/blobs/*.json`、`shared-v2/acks/*` 與 `ui.json`，**不會**出現舊版的
 `cities/`；關掉再開同一份 journal（位元組不變）重建出同一座城。
 
 ### 真的要在視窗裡點（少見）

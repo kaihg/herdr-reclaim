@@ -8,6 +8,7 @@ import fs from "node:fs";
 import { loadCity } from "../core/city-load.js";
 import { CityLedger } from "../core/ledger.js";
 import { SHARED_CITY_ID, sharedCityDir } from "../core/shared-city.js";
+import { START_RESOURCES } from "../core/rules.js";
 import { createFileIo } from "./fs-io.js";
 
 const CITY = "/tmp/omp-adapter-fixture/.git";
@@ -105,7 +106,7 @@ describe("OMP 活動重播到共用城市", () => {
       // entry-1 在 root 的兩個 epoch 都出現，只發一次：10 + 5 + child 3 + fork 2 = 20。
       // print 的 99 不計（非互動）。
       expect(loaded.city.city.work.tokens).toBe(20);
-      expect(loaded.city.city.resources).toEqual({ wood: 0, stone: 0, iron: 0 });
+      expect(loaded.city.city.resources).toEqual(START_RESOURCES);
       // 五個 writer epoch 都有一筆 activity entry。
       const state = await (await openShared(base)).state();
       expect([...state.activities.keys()].sort()).toEqual([

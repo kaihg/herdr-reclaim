@@ -10,8 +10,7 @@
 // 這裡不驗證「未知的 element 方法」：沒實作的鏈式方法會靜默通過。那一層由
 // `herdr-app check` 負責（它會指名未知的 element 方法），所以兩者都要跑。
 //
-// `window.paint_path`（地圖的原生路徑）換成一個什麼都接、什麼都回自己的替身：路徑內容屬於
-// 像素層，這裡只確認它有沒有被呼叫，不看畫出來的形狀。
+// 保留繪圖路徑的頂點與顏色，讓 view 測試能檢查地形外框，不依賴像素。
 import { mock } from "bun:test";
 import fs from "node:fs";
 import path from "node:path";
@@ -21,14 +20,14 @@ import { CityLedger } from "../core/ledger.js";
 import { SHARED_CITY_ID, sharedCityDir } from "../core/shared-city.js";
 import { createFileIo } from "./fs-io.js";
 
-/** 一個什麼都接的替身：任何方法、屬性都回自己，可以無限鏈式呼叫。 */
-function chainable() {
-  const self = new Proxy(function () {}, {
-    get: (_target, key) => (key === "then" ? undefined : () => self),
-    apply: () => self,
-    construct: () => self,
-  });
-  return self;
+function pathBuilder() {
+  const polygons = [];
+  return {
+    add_polygon(points) { polygons.push(points); return this; },
+    close() { return this; },
+    dash_array() { return this; },
+    build() { return polygons; },
+  };
 }
 
 /**
@@ -122,15 +121,15 @@ export function installHost({ checking = true, home } = {}) {
   const root = home ?? path.join("/tmp", "herdr-reclaim-view", `${process.pid}-${Math.random().toString(36).slice(2)}`);
   if (!home) fs.rmSync(root, { recursive: true, force: true });
 
-  globalThis.window = new Proxy({}, { get: (_target, key) => (key === "then" ? undefined : chainable()) });
+  globalThis.window = { paint_path: (path, color) => Object.assign(element("path"), { path, color }) };
   // 主題只當成「每個 token 都是一個顏色字串」：畫面文字與版面才是測試要看的東西。
   const theme = new Proxy({}, { get: (_target, key) => String(key) });
 
   mock.module("gpui-kit", () => ({
     View: class {},
     div: () => element("div"),
-    Background: { solid: () => ({ opacity() { return this; } }), pattern_slash: () => ({}) },
-    PathBuilder: chainable(),
+    Background: { solid: (token) => ({ token, opacity() { return this; } }), pattern_slash: () => ({}) },
+    PathBuilder: { fill: pathBuilder, stroke: pathBuilder },
   }));
   mock.module("gpui-base", () => ({
     h_flex: () => element("h"),

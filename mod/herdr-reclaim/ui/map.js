@@ -13,7 +13,7 @@
 // 樣式聚成幾條路徑（core/map-style.js 決定每一格落哪一桶），每一幀不是一格一條路徑。
 import { Background, PathBuilder, div } from "gpui-kit";
 
-import { CENTER, CENTER_CELLS, MAP_RADIUS, cellAtEvent, contentSize, keyOf, originInContent, projectTile } from "../core/grid.js";
+import { CENTER, CENTER_CELLS, MAP_RADIUS, cellAtEvent, contentSize, isCenterCell, keyOf, neighbors, originInContent, projectTile } from "../core/grid.js";
 import { mapCells } from "../core/map-style.js";
 import { buildingOf, buildingPolygons } from "./assets.js";
 
@@ -27,11 +27,12 @@ const paintOf = (style, t) => (style.kind === "slash"
 
 export function sharedMapView({
   revealed, queue = [], buildings = [], legal = [], preview = null, selected = null, theme: t, tile, camera,
+  terrainVersion, roadArmLength,
   radius = MAP_RADIUS, onPick, onPan, viewport = null,
 }) {
   const origin = originInContent(radius, tile);
   const base = basePaths(radius, tile);
-  const layout = mapCells({ revealed, queue, buildings, legal, preview, selected, radius });
+  const layout = mapCells({ revealed, queue, buildings, terrainVersion, roadArmLength, legal, preview, selected, radius });
   const spotOf = (cell) => projectTile(cell, tile);
   const marks = layout.marks.map((mark) => {
     if (mark.kind === "building") {
@@ -51,7 +52,7 @@ export function sharedMapView({
         tilePath(PathBuilder.stroke(1.5).add_polygon(localDiamond(tile)).close().build(), color, tile),
       ]);
   });
-  const click = layout.open.map((spot) => cellBox(spot, tile, origin, radius, onPick, camera));
+  const click = layout.open.filter((spot) => !isCenterCell(spot)).map((spot) => cellBox(spot, tile, origin, radius, onPick, camera));
   // 預覽伸進迷霧的那一角：不揭開地形，只把「這一格不能放」畫出來（不建立點擊區）。
   const veil = [];
   for (const cell of layout.preview) {
@@ -207,35 +208,25 @@ function cellBox(cell, tile, origin, radius, onPick, camera) {
     });
 }
 
-/**
- * 城鎮中心是 2×2 四格：每一格自己收事件（點哪一格都是選到城鎮中心），外圈用強調色描出
- * 整塊的輪廓。每格只畫朝外的兩條邊（頂點序列由 CENTER_EDGES 決定），中間的十字線是細線。
- */
-const CENTER_EDGES = {
-  "0,0": ["left", "top", "right"],
-  "1,0": ["top", "right", "bottom"],
-  "0,1": ["bottom", "left", "top"],
-  "1,1": ["right", "bottom", "left"],
-};
-
+/** 每格只描與中心以外的土地相接的邊；東西南北四個角各有兩條外框。 */
 function centerBlock(t, tile, origin, radius, onPick, camera) {
   const points = localDiamond(tile);
-  const vertex = { top: points[0], right: points[1], bottom: points[2], left: points[3] };
-  const cells = CENTER_CELLS.map((cellSpot) => cellBox(cellSpot, tile, origin, radius, onPick, camera).children([
-    tilePath(fillPath(points), t.selected, tile),
-    tilePath(PathBuilder.stroke(1).add_polygon(points).close().build(), t.muted, tile),
-    tilePath(
-      PathBuilder.stroke(2.5).add_polygon(CENTER_EDGES[keyOf(cellSpot)].map((name) => vertex[name]), false).build(),
-      t.accent,
-      tile,
-    ),
-  ]));
-  // 標籤壓在整塊的正中央（四格交會的那個頂點）；沒有事件，不擋點擊。
+  const cells = CENTER_CELLS.map((spot) => {
+    const box = cellBox(spot, tile, origin, radius, onPick, camera)
+      .child(tilePath(fillPath(points), t.selected, tile))
+      .child(tilePath(PathBuilder.stroke(1).add_polygon(points).close().build(), t.muted, tile));
+    neighbors(spot).forEach((neighbor, i) => {
+      if (!isCenterCell(neighbor)) box.child(tilePath(
+        PathBuilder.stroke(2.5).add_polygon([points[i], points[(i + 1) % 4]], false).build(), t.accent, tile,
+      ));
+    });
+    return box;
+  });
   const anchor = projectTile(CENTER, tile);
   const label = div()
     .absolute()
     .left(camera.x + origin.left + anchor.left)
-    .top(camera.y + origin.top + anchor.top + tile.h - labelSize(tile) - 1)
+    .top(camera.y + origin.top + anchor.top + (tile.h - labelSize(tile)) / 2)
     .w(tile.w)
     .text_center()
     .text_size(labelSize(tile) + 1)

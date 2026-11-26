@@ -136,7 +136,7 @@ if [ -n "$MOD_PANE" ]; then
 
   # 等 mod 第一次載入完成：帳本頭檔出現之後它就會重繪。
   for _ in $(seq 1 60); do
-    [ -f "$HERDR_APP_HOME/data/herdr-reclaim/shared/head.json" ] && break
+    [ -f "$HERDR_APP_HOME/data/herdr-reclaim/shared-v2/head.json" ] && break
     sleep 0.25
   done
   sleep 0.5

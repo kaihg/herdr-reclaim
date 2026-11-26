@@ -3,11 +3,8 @@
 // 這一支是純函式（不碰 I/O、不 import 帳本），所以預覽與帳本前提檢查用的是**同一個**
 // `siteCheck`：畫面說可以放，下令就不會被拒；畫面說不行，下令也進不了帳本。
 // 地圖本身固定（不依 repo、space、session 生成），玩家看到的是同一座城。
-//
-// 起始揭開區是城鎮中心周圍一塊 8×8 的土地（東北角還罩著迷霧），足以在隔一格的位置
-// 放下 2×2 的市場。
-import { isCenterCell } from "./grid.js";
-import { CITY_BUILDINGS } from "./rules.js";
+import { CENTER, cellsWithin, gridDistance, isCenterCell, keyOf } from "./grid.js";
+import { CITY_BUILDINGS, START_ROAD_LENGTH } from "./rules.js";
 
 /** 地形種類；`buildable` 的三種可以蓋，深水與峭壁不行（#22 的選址規則）。 */
 export const TERRAIN = {
@@ -16,15 +13,10 @@ export const TERRAIN = {
   rubble: { label: "碎石地", buildable: true, token: "ansi3" },
   water: { label: "深水", buildable: false, token: "ansi4" },
   cliff: { label: "峭壁", buildable: false, token: "ansi8" },
+  road: { label: "道路", buildable: false, token: "muted" },
 };
 
-/**
- * 起始揭開區：城鎮中心周圍 x、y 都在 -3..4 的一塊土地，東北角（x + y > 7）還罩著迷霧。
- * 這塊地開城就看得到，玩家不必先開墾就能選址（#22：起始可見土地足以留白選址）。
- */
-const START = { minX: -3, maxX: 4, minY: -3, maxY: 4, fogLine: 7 };
-
-const inStartRect = (x, y) => x >= START.minX && x <= START.maxX && y >= START.minY && y <= START.maxY;
+const START_KEYS = [...cellsWithin(CENTER, 4)].map(keyOf);
 
 /** 起始區內手繪的地形（其餘是草地）；用固定的座標釘住，測試與畫面看到的是同一份。 */
 const PAINTED = new Map([
@@ -50,14 +42,19 @@ function hashedTerrain(x, y) {
 }
 
 /** 一格的地形（不看迷霧；迷霧由 `siteCheck` 另外判斷，不洩漏迷霧裡有什麼）。 */
-export function terrainAt({ x, y }) {
-  if (inStartRect(x, y)) return PAINTED.get(`${x},${y}`) ?? "grass";
+export function terrainAt({ x, y }, version = 1) {
+  if (version !== 1) throw new Error(`不支援的地形版本：${version}`);
+  // 第一版手繪區不隨起始視野改變；外圍仍用原來的雜湊。
+  if (x >= -3 && x <= 4 && y >= -3 && y <= 4) return PAINTED.get(`${x},${y}`) ?? "grass";
   return hashedTerrain(x, y);
 }
 
-/** 一格是否在起始揭開區：起始區扣掉東北角的迷霧線。之後完工的建築再往外揭（`revealedCells`）。 */
-export function isRevealed({ x, y }) {
-  return inStartRect(x, y) && x + y <= START.fogLine;
+function surfaceAt(city, cell) {
+  if (cell.x === CENTER.x || cell.y === CENTER.y) {
+    const distance = gridDistance(CENTER, cell);
+    if (distance > 1 && distance <= 1 + (city?.roadArmLength ?? START_ROAD_LENGTH)) return "road";
+  }
+  return terrainAt(cell, city?.terrainVersion);
 }
 
 /**
@@ -66,22 +63,13 @@ export function isRevealed({ x, y }) {
  * 都只透過這一個集合判斷迷霧，所以 `city` 可以是帳本狀態或公開的讀取模型（兩者的 `buildings` 同形）。
  */
 export function revealedCells(city) {
-  const keys = new Set();
-  for (let x = START.minX; x <= START.maxX; x++) {
-    for (let y = START.minY; y <= START.maxY; y++) {
-      if (isRevealed({ x, y })) keys.add(`${x},${y}`);
-    }
-  }
+  const keys = new Set(START_KEYS);
   for (const building of city?.buildings ?? []) {
-    const reach = Number(building.reveal ?? 0);
-    for (let x = building.x - reach; x < building.x + building.w + reach; x++) {
-      for (let y = building.y - reach; y < building.y + building.h + reach; y++) keys.add(`${x},${y}`);
-    }
+    for (const cell of cellsWithin(building, building.reveal ?? 0)) keys.add(keyOf(cell));
   }
   return keys;
 }
 
-const keyOf = (cell) => `${cell.x},${cell.y}`;
 const covers = (cells, { x, y }) => (cells ?? []).some((cell) => cell.x === x && cell.y === y);
 
 /**
@@ -92,7 +80,7 @@ const covers = (cells, { x, y }) => (cells ?? []).some((cell) => cell.x === x &&
 export function groundAt(city, cell) {
   if ((city?.buildings ?? []).some((building) => covers(building.cells, cell))) return "building";
   if ((city?.queue ?? []).some((item) => item.startedAt != null && covers(item.cells, cell))) return "site";
-  return terrainAt(cell);
+  return surfaceAt(city, cell);
 }
 
 /** 一棟建築在某個錨點（左上角）佔用的整片格子，順序固定：先 x 再 y。 */
@@ -121,7 +109,7 @@ function siteChecker(city) {
     const cells = footprintCells(building, anchor).map((cell) => {
       const key = keyOf(cell);
       if (!revealed.has(key)) return { ...cell, terrain: null, problem: "fog" };
-      const terrain = terrainAt(cell);
+      const terrain = surfaceAt(city, cell);
       if (!TERRAIN[terrain].buildable) return { ...cell, terrain, problem: terrain };
       if (isCenterCell(cell)) return { ...cell, terrain, problem: "center" };
       if (built.has(key)) return { ...cell, terrain, problem: "building" };

@@ -15,7 +15,7 @@ import { h_flex, v_flex } from "gpui-base";
 import { appHome, checking, exec, home, readTextFile, settings, theme, watchFolder, writeTextFile } from "herdr";
 import { ADAPTER_DIR, activityDir, adapterRoot, loadActivities } from "./core/adapter.js";
 import { loadCity, townOf } from "./core/city-load.js";
-import { MAP_RADIUS, cameraFor, clampCamera, contentSize, panCamera } from "./core/grid.js";
+import { CENTER, MAP_RADIUS, gridDistance, cameraFor, clampCamera, contentSize, panCamera } from "./core/grid.js";
 import { hostIo } from "./core/host-io.js";
 import { CasConflict, CityLedger } from "./core/ledger.js";
 import { quotaLines } from "./core/provider-stats.js";
@@ -47,7 +47,7 @@ const RESOURCES = [
 
 /** 選址被拒的原因（帳本的前提檢查）：畫面上只翻成人看得懂的一句話。 */
 const SITE_PROBLEMS = {
-  fog: "迷霧", water: "深水", cliff: "峭壁", center: "城鎮中心", building: "已有建築", plan: "預定地", unknown_building: "未知建築",
+  road: "道路", fog: "迷霧", water: "深水", cliff: "峭壁", center: "城鎮中心", building: "已有建築", plan: "預定地", unknown_building: "未知建築",
 };
 const PLAN_REASONS = {
   queue_full: "建設佇列已滿",
@@ -62,6 +62,7 @@ const PLAN_REASONS = {
   site_fog: "有一角還在迷霧裡",
   site_water: "有一角是深水",
   site_cliff: "有一角是峭壁",
+  site_road: "有一角是道路",
   site_center: "有一角是城鎮中心",
   site_building: "有一角已有建築",
   site_plan: "有一角是預定地",
@@ -84,11 +85,12 @@ const groundLabel = (ground) => (ground === "site" ? "工地" : ground === "buil
  * 佇列裡某一項的一行摘要（頂欄、提示）：施工中說何時完工；還沒開工的說還缺什麼，
  * 不缺口了就是排隊等前一項完工（`startsAt` 是預計開工時刻）。
  */
-const queueLine = (item) => (item.stage === "building"
-  ? `施工中：${item.label} (${item.x}, ${item.y})・${clockText(item.completesAt)} 完工`
+const locationLabel = ({ x, y }, dev) => dev ? ` (${x}, ${y})` : "";
+const queueLine = (item, dev) => (item.stage === "building"
+  ? `施工中：${item.label}${locationLabel(item, dev)}・${clockText(item.completesAt)} 完工`
   : Object.keys(item.missing ?? {}).length > 0
-    ? `備料中：${item.label} (${item.x}, ${item.y})・還缺 ${missingText(item.missing)}`
-    : `排隊中：${item.label} (${item.x}, ${item.y})・${clockText(item.startsAt)} 開工`);
+    ? `備料中：${item.label}${locationLabel(item, dev)}・還缺 ${missingText(item.missing)}`
+    : `排隊中：${item.label}${locationLabel(item, dev)}・${clockText(item.startsAt)} 開工`);
 /**
  * 現在再加一項時真正可用的庫存：扣掉佇列裡還沒付款的配方。付款只在隊首發生，
  * 所以這個數字才是「排在隊尾的那一項還要等多少材料」。
@@ -100,16 +102,16 @@ const poolOf = (shared) => (shared.queue ?? [])
     return pool;
   }, { ...shared.resources });
 /** 頂欄那一行：先看佇列最前面那一項（施工中或排第一），都沒有就只存料。 */
-const queueSummary = (city) => {
+const queueSummary = (city, dev) => {
   const head = city.queue?.[0];
-  return head ? queueLine(head) : "沒有建設目標：只累積庫存";
+  return head ? queueLine(head, dev) : "沒有建設目標：只累積庫存";
 };
 /** 共用城市地圖的半徑：至少 MAP_RADIUS，涵蓋全部已揭開的格子，再多一圈迷霧當邊界。 */
 const sharedRadius = (revealed) => {
   let reach = 0;
   for (const key of revealed) {
     const [x, y] = key.split(",").map(Number);
-    reach = Math.max(reach, Math.abs(x), Math.abs(y));
+    reach = Math.max(reach, gridDistance(CENTER, { x, y }));
   }
   return Math.max(MAP_RADIUS, reach + 1);
 };
@@ -164,7 +166,7 @@ async function ensureActivityDir(io) {
   }
 }
 
-/** 共用城市的帳本（ADR-0001）：放在 `shared/`，所有 space 開的是同一份。 */
+/** 共用城市的帳本（ADR-0001）：使用新城目錄，所有 space 開的是同一份。 */
 function openShared(io) {
   return new CityLedger({ io, dir: sharedCityDir(adapterRoot(appHome())), cityId: SHARED_CITY_ID }).open();
 }
@@ -357,7 +359,7 @@ export default class Town extends View {
         .gap(8)
         .bg(t.canvas)
         .text_color(t.muted)
-        .child(div().child(this.note ?? "共用城市還沒啟用：先開一個互動的 agent session，讓本機的工作進帳。"));
+        .child(div().child(this.note ?? "共用城市還沒啟用：開始工作後，建材就會進倉。"));
     }
     // 這一格 mod 有多寬決定兩側的欄寬；窄 pane 也看得到三個區塊。
     // on_size_change 給的是實際像素（含畫面縮放），版面用的 .w()/.left() 是 UI 像素。
@@ -425,7 +427,7 @@ export default class Town extends View {
       .items_center()
       .child(div().text_size(10).text_color(t.dim).child("工作"))
       .child(div().text_size(12.5).child(`${shared.work.tokens}/${shared.work.unitTokens}`));
-    const target = div().text_size(10).text_color(t.muted).truncate().child(queueSummary(shared));
+    const target = div().text_size(10).text_color(t.muted).truncate().child(queueSummary(shared, this.devMode));
     const center = stacked
       ? v_flex().flex_1().min_w(0).overflow_hidden().gap(2).child(stock).child(work).child(target)
       : h_flex().flex_1().min_w(0).overflow_hidden().items_center().justify_center().gap(14).child(stock).child(work).child(target);
@@ -487,7 +489,7 @@ export default class Town extends View {
         div().text_size(10).text_color(t.dim).child(`建設佇列（${queue.length}/${shared.queueLimit}）`),
         div().text_size(13).font_semibold().truncate().child(queue.length ? queue[0].label : "選一棟建築"),
         div().text_size(9).text_color(t.muted).child(queue.length
-          ? queueLine(queue[0])
+          ? queueLine(queue[0], this.devMode)
           : "選好建築後，地圖會標出全部合法位置；點一格看整棟預覽，再按「預定這裡」。"),
         ...cityBuildings().map((building) => this.buildingCard(shared, building, t, cx)),
         div().text_size(9).text_color(t.dim)
@@ -496,7 +498,7 @@ export default class Town extends View {
           .child("草地、疏林、碎石地可以蓋；深水、峭壁與迷霧不行。預覽與下令用同一條規則。"),
         ...this.quotaSection(t),
         div().text_size(9).text_color(t.dim)
-          .child(`已揭開 ${revealedCells(shared).size} 格 · 建築 ${shared.buildings.length} 棟 · 帳本 ${SHARED_CITY_ID}`),
+          .child(`已揭開 ${revealedCells(shared).size} 格 · 建築 ${shared.buildings.length} 棟${this.devMode ? ` · 帳本 ${SHARED_CITY_ID}` : ""}`),
       ]);
   }
 
@@ -554,7 +556,7 @@ export default class Town extends View {
       : sharedRadius(revealed);
     const tile = tileSize(area);
     const size = contentSize(radius, tile);
-    const anchor = this.focusCell ?? this.anchorCell ?? { x: 0.5, y: 0.5 };
+    const anchor = this.focusCell ?? this.anchorCell ?? CENTER;
     const resized = area.width !== this.mapArea?.width || area.height !== this.mapArea?.height;
     const moved = this.focusCell || !this.camera || this.camera.radius !== radius || resized;
     if (moved) {
@@ -572,6 +574,8 @@ export default class Town extends View {
       radius,
       queue: shared.queue,
       buildings: shared.buildings,
+      terrainVersion: shared.terrainVersion,
+      roadArmLength: shared.roadArmLength,
       theme: t,
       tile,
       camera: this.camera,
@@ -632,12 +636,12 @@ export default class Town extends View {
     const ready = Object.keys(missing).length === 0;
     const room = shared.queue.length < shared.queueLimit;
     return [
-      div().text_size(14).font_semibold().child(`${preview.label} (${preview.x}, ${preview.y})`),
+      div().text_size(14).font_semibold().child(preview.label + locationLabel(preview, this.devMode)),
       h_flex().gap(6).items_center()
         .child(statusBadge(preview.ok ? "可以放" : "不能放", t))
         .child(div().text_size(10).text_color(t.muted).child(preview.ok ? "整片占地都在可建的土地上" : "整棟都不能放")),
       ...preview.cells.map((cell) => h_flex().gap(6).items_center()
-        .child(div().text_size(9).text_color(t.dim).child(`(${cell.x}, ${cell.y})`))
+        .when(this.devMode, (row) => row.child(div().text_size(9).text_color(t.dim).child(locationLabel(cell, true))))
         .child(div().text_size(10).text_color(cell.problem ? t.blocked : t.muted)
           .child(cell.problem ? SITE_PROBLEMS[cell.problem] ?? cell.problem : TERRAIN[cell.terrain]?.label ?? "迷霧"))),
       def ? fieldRow({ label: "配方", value: costsText(def.costs) }, t) : null,
@@ -676,7 +680,7 @@ export default class Town extends View {
             h_flex().gap(6).items_center()
               .child(div().text_size(12).font_semibold().child(`#${index + 1} ${item.label}`))
               .child(statusBadge(building ? "施工中" : missing ? "備料中" : "排隊中", t)),
-            div().text_size(10).text_color(t.muted).child(`(${item.x}, ${item.y})、占地 ${item.w}×${item.h}`),
+            div().text_size(10).text_color(t.muted).child(`占地 ${item.w}×${item.h}${locationLabel(item, this.devMode)}`),
             fieldRow({ label: "配方", value: costsText(item.costs) }, t),
             ...(building
               ? [
@@ -701,13 +705,13 @@ export default class Town extends View {
       ? shared.buildings.find((building) => building.cells.some((cell) => cell.x === spot.x && cell.y === spot.y))
       : null;
     return [
-      div().text_size(14).font_semibold().child(`(${spot.x}, ${spot.y})`),
+      div().text_size(14).font_semibold().child(`選取的土地${locationLabel(spot, this.devMode)}`),
       fieldRow({ label: "地面", value: ground ? groundLabel(ground) : "迷霧" }, t),
       ...(done ? [fieldRow({ label: "建築", value: `${done.label}（${clockText(done.completedAt)} 完工）` }, t)] : []),
       div().text_size(9).text_color(t.muted).child(
         this.picking ? "這一格是整棟占地的左上角：在地圖點它就會顯示預覽。" : "選一棟建築之後，這裡會列出整棟占地的判斷。",
       ),
-      ...(shared.queue.length ? [div().text_size(9).text_color(t.dim).child(`建設佇列 ${shared.queue.length}/${shared.queueLimit}：${queueLine(shared.queue[0])}。`)] : []),
+      ...(shared.queue.length ? [div().text_size(9).text_color(t.dim).child(`建設佇列 ${shared.queue.length}/${shared.queueLimit}：${queueLine(shared.queue[0], this.devMode)}。`)] : []),
     ];
   }
 
@@ -727,7 +731,7 @@ export default class Town extends View {
           this.town = await this.refreshShared();
           this.picking = null;
           this.preview = null;
-          text = `已預定：${label} (${x}, ${y})；排到隊首、材料備齊才付料開工`;
+          text = `已預定：${label}${locationLabel({ x, y }, this.devMode)}；排到隊首、材料備齊才付料開工`;
           this.scheduleCompletion(cx2);
         } else {
           text = `沒有預定：${PLAN_REASONS[result.reason] ?? result.reason ?? result.status}`;
@@ -749,7 +753,7 @@ export default class Town extends View {
         const result = await cancelPlan(await openShared(this.io), item);
         if (result.status === "applied" || result.status === "duplicate") {
           this.town = await this.refreshShared();
-          text = `已取消：${item.label} (${item.x}, ${item.y})`;
+          text = `已取消：${item.label}${locationLabel(item, this.devMode)}`;
         } else {
           text = `沒有取消：${PLAN_REASONS[result.reason] ?? result.reason ?? result.status}`;
         }
@@ -784,7 +788,7 @@ export default class Town extends View {
         const { completed } = await advanceConstruction(await openShared(this.io), { now: Date.now() });
         this.town = await this.refreshShared();
         const last = completed[completed.length - 1];
-        if (last) this.showToast(`${last.label} (${last.x}, ${last.y}) 完工，附近的土地揭開了`, cx2);
+        if (last) this.showToast(`${last.label}${locationLabel(last, this.devMode)} 完工，附近的土地揭開了`, cx2);
         this.scheduleCompletion(cx2);
       } catch (error) {
         this.note = `完工推進失敗：${error}`;
@@ -797,7 +801,7 @@ export default class Town extends View {
   quotaSection(t) {
     const lines = quotaLines(this.town?.quotas);
     return [
-      div().text_size(10).text_color(t.dim).child("行會人力（provider 回報）"),
+      div().text_size(10).text_color(t.dim).child(this.devMode ? "行會人力（provider 回報）" : "行會人力"),
       ...lines.map((line) => div().text_size(9).text_color(line.known ? t.muted : t.dim).child(line.text)),
     ];
   }

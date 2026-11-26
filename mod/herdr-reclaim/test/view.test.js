@@ -6,6 +6,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { selectionOf } from "../core/selection.js";
+import { SHARED_CITY_ID, readSharedCity } from "../core/shared-city.js";
 import { RULES_VERSION } from "../core/rules.js";
 import {
   findByText, findById, installHost, makeCx, mapTiles, resize, text, texts,
@@ -21,6 +22,52 @@ function open() {
   town.init({}, cx);
   return { cx, town, tree: () => town.render(cx) };
 }
+
+test("新城外框與道路", () => {
+  const { town, cx, tree } = open();
+  town.town.shared = readSharedCity({ terrainVersion: 1, roadArmLength: 3 });
+  const screen = tree();
+  const tiles = mapTiles(screen);
+  expect(tiles).toHaveLength(81);
+  const map = findById(screen, "map-view");
+  const roads = map.kids.find((node) => node.color?.token === "muted");
+  const roadCenters = roads.path.map((polygon) => {
+    const [x, y] = polygon[0];
+    return [x + roads.props.left, y + roads.props.top];
+  });
+  const expectedRoads = [];
+  for (let x = -4; x <= 4; x++) for (let y = -4; y <= 4; y++) {
+    const tile = findById(map, `map-${x}-${y}`);
+    expect(tile).not.toBeNull();
+    if (Math.abs(x) <= 1 && Math.abs(y) <= 1) {
+      const p = [[tile.props.w / 2, 0], [tile.props.w, tile.props.h / 2], [tile.props.w / 2, tile.props.h], [0, tile.props.h / 2]];
+      const exposed = [y === -1, x === 1, y === 1, x === -1];
+      expect(tile.kids.filter((edge) => edge.color === "accent").map((edge) => edge.path[0]))
+        .toEqual(p.flatMap((point, i) => exposed[i] ? [[point, p[(i + 1) % 4]]] : []));
+      town.picking = "house";
+      town.pickSite(x, y, cx);
+      expect(text(tree())).toContain("不能放");
+      expect(findByText(tree(), "預定這裡")).toBeNull();
+    } else if (x === 0 || y === 0) {
+      expectedRoads.push([tile.props.left + tile.props.w / 2, tile.props.top]);
+    }
+  }
+  expect(roadCenters.sort()).toEqual(expectedRoads.sort());
+});
+
+test("道路文字", () => {
+  const { town, cx, tree } = open();
+  town.town.shared = readSharedCity({ terrainVersion: 1, roadArmLength: 3 });
+  const tile = findById(tree(), "map-0--4");
+  tile.handlers.mouseDown.left({ local_position: { x: tile.props.w / 2, y: tile.props.h / 2 }, bounds: {} }, cx);
+  expect(text(tree())).toContain("地面|道路");
+  findById(tree(), "building-house").handlers.click({}, cx);
+  town.pickSite(0, -4, cx);
+  const screen = text(tree());
+  expect(screen).toContain("道路");
+  expect(screen).toContain("不能放");
+  expect(screen).not.toMatch(/provider|session|token|shared-v2|帳本|座標|\(-?\d+, ?-?\d+\)/i);
+});
 
 describe("固定情境的分區與庫存", () => {
   test("三個區塊都在，庫存、佇列與施工中的那一項照模型顯示", () => {
@@ -71,8 +118,8 @@ describe("按下之後", () => {
     const tile = mapTiles(tree()).find((node) => /^map-(-?\d+)-(-?\d+)$/.test(node.props.id));
     const [, x, y] = tile.props.id.match(/^map-(-?\d+)-(-?\d+)$/).map(Number);
     tile.handlers.mouseDown.left({ local_position: { x: tile.props.w / 2, y: tile.props.h / 2 }, bounds: {} }, cx);
-    expect(town.selection).toEqual({ kind: "site", cityId: "shared", x, y });
-    expect(selectionOf(town.ui, "shared")).toEqual({ kind: "site", cityId: "shared", x, y });
+    expect(town.selection).toEqual({ kind: "site", cityId: SHARED_CITY_ID, x, y });
+    expect(selectionOf(town.ui, SHARED_CITY_ID)).toEqual({ kind: "site", cityId: SHARED_CITY_ID, x, y });
   });
 
   test("佇列還沒滿時點建築：進入選址（不用先等前一項蓋完）", () => {

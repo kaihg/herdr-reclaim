@@ -291,11 +291,11 @@ function logError(root: string, where: string, error: unknown) {
 }
 
 /**
- * mod 的 ack：只讀自己 epoch 的。共用城市只有一本帳本（`shared/`），
+ * mod 的 ack：只讀自己 epoch 的。共用城市只有一本帳本（`shared-v2/`），
  * 讀不到、讀壞了都當成「還沒有 ack」。
  */
 function ackedEventSeq(root: string, sessionId: string, epoch: string): number {
-  const file = path.join(root, "shared", "acks", safeName(sessionId), `${safeName(epoch)}.json`);
+  const file = path.join(root, "shared-v2", "acks", safeName(sessionId), `${safeName(epoch)}.json`);
   const ack = readJson(file);
   return ack && typeof ack.ackedEventSeq === "number" ? ack.ackedEventSeq : 0;
 }

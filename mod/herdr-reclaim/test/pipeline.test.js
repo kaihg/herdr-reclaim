@@ -3,16 +3,18 @@
 // 這一層抓的是「只有真視窗才看得到」那類錯誤：模型接錯欄位、載入後畫面是空的、按下按鈕
 // 之後帳本沒有真的動。`herdr-app check` 做不到（它在 init 的第一個 await 就結束，見
 // mod/herdr-reclaim/README.md），電腦操作也做不到（它只看到像素，看不到帳本）。
-import { describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, test } from "bun:test";
+import fs from "node:fs";
 
 import { legalSites } from "../core/city-map.js";
-import { RESOURCE_LABELS, workYieldOf } from "../core/rules.js";
+import { RESOURCE_LABELS, START_RESOURCES, workYieldOf } from "../core/rules.js";
 import {
   findByText, findById, installHost, ledgerState, makeCx, mapTiles, submitOp, text, waitFor,
 } from "./view-harness.js";
 
 const host = installHost({ checking: false });
 const { default: Town } = await import("../main.js");
+beforeEach(() => fs.rmSync(host.home, { recursive: true, force: true }));
 
 /** 開一個視窗的等價物：`init` 之後等第一次載入完成（成功或失敗都會 notify 一次）。 */
 async function open() {
@@ -26,10 +28,10 @@ async function open() {
 }
 
 const incomeOp = (tokens, id = "test") => (state) => ({
-  opId: `income:shared:${id}`,
+  opId: `income:${state.cityId}:${id}`,
   kind: "income",
   at: 1_800_000_000_000,
-  cityId: "shared",
+  cityId: state.cityId,
   tokens,
   sources: [id],
   resources: workYieldOf(Number(state.work.tokens ?? 0) + tokens),
@@ -39,12 +41,13 @@ describe("載入鏈", () => {
   test("空 home：帳本自己開一份空的城，畫面沒有讀取失敗", async () => {
     const { tree } = await open();
     const screen = text(tree());
-    expect(screen).toContain("共用倉庫|0|木材|0|石材|0|鐵料");
+    expect(screen).toContain(`共用倉庫|${START_RESOURCES.wood}|木材|${START_RESOURCES.stone}|石材|${START_RESOURCES.iron}|鐵料`);
     expect(screen).not.toContain("讀取失敗");
     expect(screen).toContain("沒有建設目標");
   });
 
   test("帳本裡的一筆收入：重開就變成畫面上的庫存", async () => {
+    await open();
     const result = await submitOp(host.home, incomeOp(10_000));
     expect(result.status).toBe("applied");
     const state = await ledgerState(host.home);
@@ -60,6 +63,7 @@ describe("載入鏈", () => {
 describe("選址到下令（真的寫進帳本）", () => {
   test("點建築 → 點合法的一格 → 預定這裡：庫存夠就當場開工、付一次配方", async () => {
     // 先備料：七單位工作（木 21、石 14、鐵 7）足夠民居的 20/10。
+    await open();
     const before = await ledgerState(host.home);
     expect((await submitOp(host.home, incomeOp(70_000, "seed-house"))).status).toBe("applied");
     const funded = await ledgerState(host.home);
@@ -105,12 +109,17 @@ describe("選址到下令（真的寫進帳本）", () => {
 
   test("庫存不夠也能先排進佇列：帳本不扣料，畫面寫還缺；取消之後乾乾淨淨", async () => {
     const { cx, town, tree } = await open();
+    // 起始材料可建第一座市場，付完之後不夠蓋第二座。
+    const buildMarket = () => findById(tree(), "building-market").handlers.click({}, cx);
+    buildMarket();
+    const firstSite = legalSites(town.town.shared.city, "market")[0];
+    town.pickSite(firstSite.x, firstSite.y, cx);
+    findByText(tree(), "預定這裡").handlers.click({}, cx);
+    await waitFor(() => town.town.shared.city.queue[0]?.stage === "building");
     const before = await ledgerState(host.home);
-    // 上一支測試留下的庫存只夠再排一項，不夠付第二棟民居（20/10）。
-    expect(before.resources.wood).toBeLessThan(20);
-
-    findByText(tree(), "民居　1×1").handlers.click({}, cx);
-    const site = legalSites(town.town.shared.city, "house")[0];
+    expect(before.resources.wood).toBeLessThan(40);
+    buildMarket();
+    const site = legalSites(town.town.shared.city, "market")[0];
     const tile = mapTiles(tree()).find((node) => node.props.id === `map-${site.x}-${site.y}`);
     tile.handlers.mouseDown.left({ local_position: { x: tile.props.w / 2, y: tile.props.h / 2 }, bounds: {} }, cx);
     const preview = text(tree());
@@ -124,8 +133,8 @@ describe("選址到下令（真的寫進帳本）", () => {
     expect(queued.stage).toBe("queued");
     expect(queued.paid).not.toBe(true);
     expect(queued.missing).toEqual({
-      wood: 20 - before.resources.wood,
-      stone: 10 - before.resources.stone,
+      wood: 40 - before.resources.wood,
+      stone: 20 - before.resources.stone,
     });
     // 指定位置不動庫存。
     const placed = await ledgerState(host.home);

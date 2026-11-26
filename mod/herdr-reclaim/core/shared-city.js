@@ -13,7 +13,7 @@
 // （`advanceConstruction`／`cancelPlan`）。#22 之後程式只讀寫這一本帳本：舊版各城帳本
 // （`cities/<hash>/`）原封不動留在磁碟上，不讀也不改它們。
 import { claimKey, planKey, startAtOf } from "./ledger.js";
-import { BUILD_QUEUE_LIMIT, CITY_BUILDINGS, WORK_TOKENS_PER_UNIT, WORK_YIELD, affordable, workYieldOf } from "./rules.js";
+import { BUILD_QUEUE_LIMIT, CITY_BUILDINGS, START_RESOURCES, START_ROAD_LENGTH, TERRAIN_VERSION, WORK_TOKENS_PER_UNIT, WORK_YIELD, affordable, workYieldOf } from "./rules.js";
 import { missingOf } from "./city-map.js";
 import { createsTile, rootOf, roundsOf, sessionIndex } from "./research.js";
 
@@ -21,11 +21,11 @@ import { createsTile, rootOf, roundsOf, sessionIndex } from "./research.js";
  * 共用城市的帳本身份。它不是 git common dir，所以不會與任何舊城（repo 路徑）相撞；
  * `sharedCityDir` 也刻意放在 `cities/` 之外，掃舊目錄的地方不會把共用帳本當成一座舊城。
  */
-export const SHARED_CITY_ID = "shared";
+export const SHARED_CITY_ID = "shared-v2";
 
-/** 共用帳本的目錄：`<adapterRoot>/shared`（`<adapterRoot>/cities/` 是舊版各城帳本）。 */
+/** 城市識別碼也是帳本目錄名；不開啟舊版的 shared/ 或 cities/。 */
 export function sharedCityDir(baseDir) {
-  return `${baseDir}/shared`;
+  return `${baseDir}/${SHARED_CITY_ID}`;
 }
 
 /**
@@ -108,6 +108,9 @@ async function startWork(ledger, at) {
     kind: "workStart",
     at: since,
     cityId: ledger.cityId,
+    terrainVersion: TERRAIN_VERSION,
+    roadArmLength: START_ROAD_LENGTH,
+    resources: START_RESOURCES,
   }));
   return since;
 }
@@ -246,6 +249,8 @@ export function readSharedCity(state = {}) {
     city: {
       cityId: state.cityId ?? SHARED_CITY_ID,
       name: "共用城市",
+      terrainVersion: state.terrainVersion,
+      roadArmLength: state.roadArmLength,
       resources: Object.fromEntries(Object.keys(WORK_YIELD).map((key) => [key, Number(state.resources?.[key] ?? 0)])),
       work: { tokens: Number(state.work?.tokens ?? 0), unitTokens: WORK_TOKENS_PER_UNIT },
       queue,

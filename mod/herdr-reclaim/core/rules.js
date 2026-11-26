@@ -10,7 +10,11 @@
 //   8  ticket #27 哨站：沿用選址、備料與施工，完工揭開比一般建築更大片的土地
 //   9  停止 commit 加碼（#28、ADR 0002）：不再產生成果收成；已落帳的照常重播
 //   10 建設佇列（ADR 0003）：同時多項預定（上限 3）、預定不動庫存、排到隊首才付料、未開工可取消（不退款）
-export const RULES_VERSION = 10;
+//   11 新城：開城時將地形版本、道路臂長與起始庫存寫進帳本。
+export const RULES_VERSION = 11;
+export const TERRAIN_VERSION = 1;
+export const START_ROAD_LENGTH = 3;
+export const START_RESOURCES = { wood: 70, stone: 35, iron: 6 };
 
 /**
  * 建設佇列的上限（規則版本 10，試玩參數）：同時最多這麼多項預定（含施工中的那一項）。

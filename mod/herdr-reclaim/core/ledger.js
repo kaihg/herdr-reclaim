@@ -223,6 +223,9 @@ export const KINDS = {
     },
     apply(state, entry) {
       state.work.since = Number(entry.at);
+      state.terrainVersion = entry.terrainVersion;
+      state.roadArmLength = entry.roadArmLength;
+      if (entry.resources) stockUp(state, entry);
     },
   },
   /**
@@ -781,6 +784,8 @@ export class CityLedger {
       seq,
       segment,
       resources: state.resources,
+      terrainVersion: state.terrainVersion,
+      roadArmLength: state.roadArmLength,
       work: state.work,
       queue: state.queue,
       // 共用城市的建築會一直增加：清單放內容檔（可切塊），manifest 只留固定長度的雜湊；
@@ -873,6 +878,8 @@ export class CityLedger {
       for (const [key, value] of read.claims.entries) state.claims.set(key, value);
       for (const [key, packed] of read.activities.entries) state.activities.set(key, await this.unpackRecord(packed));
       state.resources = manifest.resources ?? state.resources;
+      state.terrainVersion = manifest.terrainVersion;
+      state.roadArmLength = manifest.roadArmLength;
       state.work = manifest.work ?? state.work;
       state.queue = manifest.queue ?? state.queue;
       state.buildings = manifest.buildings ? await this.blobs.getValue(manifest.buildings) : state.buildings;

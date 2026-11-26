@@ -3,22 +3,31 @@
 // 地圖是固定格大小＋原生雙軸捲動：內容區是整片投影外框，相機決定看到哪一塊。
 // 命中一律回到地面菱形（`cellAtOffset`）：相鄰格的菱形只共邊、不互相包含。
 //
-// 這裡不再有遠征配地（BFS 選格、起始揭開圈）：共用城市的地形、揭開與占地判準在
-// core/city-map.js，這一支只留投影與相機。
+// 方格拓撲集中在此；選址、揭開與道路使用同一套距離與鄰居。
 
 export const CENTER = { x: 0, y: 0 };
 
-/** 城鎮中心 2×2 的四格（左上角 (0, 0)）：每一格自己收事件，點哪一格都算中心。 */
-export const CENTER_CELLS = [
-  { x: 0, y: 0 },
-  { x: 1, y: 0 },
-  { x: 0, y: 1 },
-  { x: 1, y: 1 },
-];
+export function gridDistance(a, b) {
+  return Math.max(Math.abs(a.x - b.x), Math.abs(a.y - b.y));
+}
+
+/** 四個共邊鄰居，依北、東、南、西排列。 */
+export function neighbors({ x, y }) {
+  return [{ x, y: y - 1 }, { x: x + 1, y }, { x, y: y + 1 }, { x: x - 1, y }];
+}
+
+/** 占地外擴 radius 圈，含占地本身；每一格只列一次。 */
+export function* cellsWithin({ x, y, w = 1, h = 1 }, radius) {
+  for (let i = x - radius; i < x + w + radius; i++) {
+    for (let j = y - radius; j < y + h + radius; j++) yield { x: i, y: j };
+  }
+}
+
+export const CENTER_CELLS = [...cellsWithin(CENTER, 1)];
 
 /** 這一格是不是城鎮中心（帳本的選址前提與畫面共用同一個判斷）。 */
-export function isCenterCell({ x, y }) {
-  return x >= CENTER.x && x < CENTER.x + 2 && y >= CENTER.y && y < CENTER.y + 2;
+export function isCenterCell(cell) {
+  return gridDistance(CENTER, cell) <= 1;
 }
 
 /** 地圖至少畫到這個半徑（共用城市會隨揭開範圍長大，見 main.js 的 sharedRadius）。 */

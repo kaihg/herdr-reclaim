@@ -8,8 +8,8 @@ import { mapCells } from "../core/map-style.js";
 
 const RADIUS = 6;
 const PLAN = {
-  building: "outpost", label: "哨站", x: 4, y: 0,
-  cells: [{ x: 4, y: 0 }], stage: "queued",
+  building: "outpost", label: "哨站", x: 4, y: 1,
+  cells: [{ x: 4, y: 1 }], stage: "queued",
 };
 const MARKET = { building: "market", cells: footprintCells("market", { x: -3, y: 2 }) };
 const CITY = { queue: [PLAN], buildings: [MARKET] };
@@ -43,17 +43,17 @@ describe("地圖樣式（mapCells）", () => {
 
   test("預定地是強調色虛線、不在地形桶；完成建築是完成色並各自帶一個記號", () => {
     const layout = mapCells({ ...CITY, revealed: REVEALED, radius: RADIUS });
-    const planFill = bucketOf(layout, "fills", "4,0");
+    const planFill = bucketOf(layout, "fills", "4,1");
     expect(planFill).toMatchObject({ kind: "solid", token: "accent", opacity: 0.22 });
-    expect(bucketOf(layout, "outlines", "4,0")).toMatchObject({ token: "accent", dash: [4, 3] });
+    expect(bucketOf(layout, "outlines", "4,1")).toMatchObject({ token: "accent", dash: [4, 3] });
     expect(layout.marks.filter((mark) => mark.kind === "building").map((mark) => mark.recipe)).toEqual(["market", "market", "market", "market"]);
   });
 
   test("施工中（已開工）的預定地畫成工地斜線，不是預定地虛線", () => {
     const building = { ...PLAN, stage: "building", startedAt: 1, completesAt: 2 };
     const layout = mapCells({ queue: [building], buildings: [], revealed: revealedCells({ queue: [building], buildings: [] }), radius: RADIUS });
-    expect(bucketOf(layout, "fills", "4,0")).toMatchObject({ kind: "slash", token: "working" });
-    expect(bucketOf(layout, "outlines", "4,0")).toMatchObject({ token: "working", dash: null });
+    expect(bucketOf(layout, "fills", "4,1")).toMatchObject({ kind: "slash", token: "working" });
+    expect(bucketOf(layout, "outlines", "4,1")).toMatchObject({ token: "working", dash: null });
   });
 
   test("合法錨點與選取用強調色；預覽格只出一個記號，不重複算成地形", () => {

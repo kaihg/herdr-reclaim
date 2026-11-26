@@ -12,6 +12,7 @@ import { activityDir, adapterRoot } from "../core/adapter.js";
 import { loadCity } from "../core/city-load.js";
 import { CityLedger } from "../core/ledger.js";
 import { SHARED_CITY_ID, sharedCityDir } from "../core/shared-city.js";
+import { START_RESOURCES } from "../core/rules.js";
 import { createFileIo } from "./fs-io.js";
 
 // 真正的 adapter 程式：測試跑的是產品碼，不是另一份重寫。
@@ -149,7 +150,7 @@ describe("Codex 活動重播到共用城市", () => {
       // resp_a：1000 − 400 cached + 12 output = 612；resp_b：500 + 7 = 507。
       const city = await cityOf(appHome);
       expect(city.work.tokens).toBe(1_119);
-      expect(city.resources).toEqual({ wood: 0, stone: 0, iron: 0 });
+      expect(city.resources).toEqual(START_RESOURCES);
 
       // 兩個 epoch 都保存成 activity entry；重讀得到同一個計量器。
       const state = await (await openShared(appHome)).state();
@@ -181,7 +182,7 @@ describe("Codex 活動重播到共用城市", () => {
       const city = await cityOf(appHome);
       // 只有 resp_ok 進計量器：一份建材 + 餘數 12。
       expect(city.work.tokens).toBe(12);
-      expect(city.resources).toEqual({ wood: 3, stone: 2, iron: 1 });
+      expect(city.resources).toEqual({ wood: START_RESOURCES.wood + 3, stone: START_RESOURCES.stone + 2, iron: START_RESOURCES.iron + 1 });
 
       const record = readRecord(path.join(activityDir(appHome), session, "u1.json"));
       // 未知的來源記進 usageSeen，下一次不會再試著發一次。

@@ -2,7 +2,7 @@
 //
 // 一個寫入者（sessionId + writerEpoch）寫一個活動檔，mod 讀它、寫進共用城市的帳本，成功之後才寫 ack：
 //   <root>/activity/<sessionId>/<writerEpoch>.json        這裡寫
-//   <root>/shared/acks/<sessionId>/<epoch>.json           mod 寫；這裡只讀自己的 epoch
+//   <root>/shared-v2/acks/<sessionId>/<epoch>.json           mod 寫；這裡只讀自己的 epoch
 // root = $HERDR_APP_HOME/data/herdr-reclaim，$HERDR_APP_HOME 預設 ~/.config/herdr-app
 // ——跟 mod 讀的是同一個根目錄，不設分離的 adapter state path。
 // 舊 epoch 的檔案留著（不刪），mod 之後仍可以離線重播（§6.2）。
@@ -126,7 +126,7 @@ const HEARTBEAT_MS = 60_000;
 const HERDR_APP_HOME = process.env.HERDR_APP_HOME || path.join(os.homedir(), ".config", "herdr-app");
 const ROOT = path.join(HERDR_APP_HOME, "data", "herdr-reclaim");
 const ACTIVITY_DIR = path.join(ROOT, "activity");
-const SHARED_ACKS_DIR = path.join(ROOT, "shared", "acks");
+const SHARED_ACKS_DIR = path.join(ROOT, "shared-v2", "acks");
 function detectCliVersion() {
   if (process.env.OMP_VERSION) return process.env.OMP_VERSION;
   try {
@@ -217,7 +217,7 @@ function logError(where: string, error: unknown) {
 }
 
 /**
- * mod 的 ack：只讀自己 epoch 的。共用城市只有一本帳本（`shared/`），
+ * mod 的 ack：只讀自己 epoch 的。共用城市只有一本帳本（`shared-v2/`），
  * 讀不到、讀壞了都當成「還沒有 ack」。
  */
 function ackedEventSeq(sessionId: string, writerEpoch: string): number {
