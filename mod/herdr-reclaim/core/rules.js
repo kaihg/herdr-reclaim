@@ -19,13 +19,15 @@ export const POPULATION_VERSION = 13;
 export const PRODUCTION_VERSION = 14;
 export const AUTO_CONSTRUCTION_VERSION = 15;
 export const MARKET_VERSION = 17;
-export const RULES_VERSION = MARKET_VERSION;
+export const TOWN_VERSION = 18; // 哨站依離路距離計工期；升市鎮解鎖大宅。
+export const RULES_VERSION = TOWN_VERSION;
 // v16：以材料成本找路；橋的兩種材料等比增加。
 export const ROAD = { limit: 12, landWeight: 1, bridgeWeight: 5, wood: 4, stone: 8, cellsPerUnit: 2 };
 export const ROADSIDE_RANGE = 3;
 export const AUTO_INTERVAL_UNITS = 0;
 export const TOWN_UPGRADE_COSTS = { wood: 2600, stone: 2600, iron: 1300 };
 export const TOWN_UPGRADE_POPULATION = 86;
+export const TOWN_UPGRADE_UNITS = 16;
 export const manualCount = queue => queue.length - Number(queue[0]?.auto === true);
 export const TERRAIN_VERSION = 2;
 export const START_ROAD_LENGTH = 1;
@@ -64,17 +66,19 @@ export const CITY_BUILDINGS = {
   workshop: { ...BUILDINGS_V12.workshop, costs: { wood: 60, stone: 30 }, growth: 1.15, jobs: 3, unlockPopulation: 22,
     purpose: "生產鐵料，靠近碎石地或峭壁產量更高", production: { material: "iron", terrain: ["rubble", "cliff"], cap: 2 } },
   market: { ...BUILDINGS_V12.market, jobs: 2, unlockPopulation: 14, purpose: "用多餘建材 2 換 1，先補隊首缺料" },
-  library: { ...BUILDINGS_V12.library, jobs: 3, unlockPopulation: 42, purpose: "目前只揭開周圍土地" },
-  outpost: { ...BUILDINGS_V12.outpost, jobs: 0, purpose: "向遠處探勘，揭開更多土地" },
+  library: { ...BUILDINGS_V12.library, jobs: 3, unlockPopulation: 42, purpose: "運作中的書庫讓村落可以升為市鎮" },
+  outpost: { ...BUILDINGS_V12.outpost, growth: 1.30, jobs: 0, purpose: "向遠處探勘，離路越遠，工期越長" },
+  mansion: { label: "大宅", footprint: { w: 2, h: 2 }, costs: { wood: 100, stone: 85, iron: 350 }, growth: 1.16,
+    buildUnits: 18, reveal: 2, residents: 10, jobs: 0, purpose: "可多住 10 人" },
 };
 
 export const populationCapacity = buildings => buildings.reduce((n, b) => n + (CITY_BUILDINGS[b.building]?.residents ?? 0), 2);
 export const populationGap = (building, capacity) => Math.max(0, (CITY_BUILDINGS[building]?.unlockPopulation ?? 0) - capacity);
 
 /** 下令時固定配方；已排在前面的同種建築也算在棟次內。 */
-export function recipeOf(city, building) {
+export function recipeOf(city, building, version = RULES_VERSION) {
   const def = CITY_BUILDINGS[building];
-  if (!def?.growth) return def?.costs;
+  if (!def?.growth || (building === "outpost" && version < TOWN_VERSION)) return def?.costs;
   let n = 0;
   for (const list of [city.buildings, city.queue]) {
     for (const item of list ?? []) if (item.building === building) n++;

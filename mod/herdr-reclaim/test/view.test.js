@@ -218,6 +218,28 @@ test("沿線預覽", () => {
   findById(tree(), "building-outpost").handlers.click({}, cx);
   town.pickSite(4, 4, cx);
   expect(playerScreen(findById(tree(), "detail"))).toContain("預定這裡");
+  expect(playerScreen(findById(tree(), "detail"))).toContain("預計 8 份");
+});
+
+test("時代與解鎖", () => {
+  const { town, cx, tree } = open();
+  const houses = Array.from({ length: 21 }, (_, x) => ({ building: "house", x, y: 4, cells: [{ x, y: 4 }] }));
+  const library = { building: "library", x: -3, y: -3, cells: [{ x: -3, y: -3 }] };
+  for (const [buildings, blocker] of [[houses, "需要一座有人力運作的書庫"], [[...houses.slice(1), library], "還差 4 人"]]) {
+    town.town.shared = readSharedCity({ buildings });
+    expect(playerScreen(tree())).toContain(blocker);
+    expect(findByText(tree(), "預定升市鎮")).toBeNull();
+    expect(findById(tree(), "building-mansion")).toBeNull();
+  }
+  town.town.shared = readSharedCity({ buildings: [...houses, library] });
+  expect(playerScreen(findById(tree(), "top"))).toContain("時代：村落");
+  expect(findByText(tree(), "預定升市鎮")).not.toBeNull();
+  town.town.shared = readSharedCity({ buildings: [...houses, library], era: "town" });
+  expect(playerScreen(findById(tree(), "top"))).toContain("時代：市鎮");
+  findById(tree(), "building-mansion").handlers.click({}, cx);
+  town.pickSite(2, 1, cx);
+  expect(playerScreen(findById(tree(), "detail"))).toContain("可多住 10 人");
+  expect(findByText(tree(), "預定這裡")).not.toBeNull();
 });
 
 describe("固定情境的分區與庫存", () => {

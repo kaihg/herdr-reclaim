@@ -252,7 +252,7 @@ test("寫入前後中斷可重開", async () => {
       const { city } = await load(base);
       expect(city.buildings.map((b) => b.building)).toEqual(["house"]);
       expect(city.queue).toHaveLength(1);
-      expect(city.queue[0]).toMatchObject({ building: "outpost", remainingUnits: 2 });
+      expect(city.queue[0]).toMatchObject({ building: "outpost", remainingUnits: 4 });
       expect(stock(city)).toEqual([56, 25, 10]);
       expect((await load(base)).city).toEqual(city);
     } finally {

@@ -13,9 +13,9 @@
 // 舊版各城帳本留在磁碟上，不讀也不改。
 import { claimKey, planKey } from "./ledger.js";
 import { needs, roadsideSites } from "./roadside.js";
-import { BUILD_QUEUE_LIMIT, CITY_BUILDINGS, START_RESOURCES, START_ROAD_LENGTH, TERRAIN_VERSION, WORK_TOKENS_PER_UNIT, WORK_YIELD, isBuilding, recipeOf } from "./rules.js";
+import { BUILD_QUEUE_LIMIT, CITY_BUILDINGS, START_RESOURCES, START_ROAD_LENGTH, TERRAIN_VERSION, TOWN_UPGRADE_COSTS, TOWN_UPGRADE_UNITS, WORK_TOKENS_PER_UNIT, WORK_YIELD, isBuilding, recipeOf } from "./rules.js";
 import { constructionUnits } from "./construction.js";
-import { buildingCount, maintenanceRate, workforce } from "./economy.js";
+import { buildingCount, maintenanceRate, townUpgradeBlockers, workforce } from "./economy.js";
 import { missingOf } from "./city-map.js";
 import { createsTile, rootOf, roundsOf, sessionIndex } from "./research.js";
 
@@ -162,7 +162,8 @@ export function readSharedCity(state = {}) {
     return copy;
   });
   const buildings = state.buildings ?? [];
-  const { capacity, assigned, understaffed } = workforce(buildings);
+  const staff = workforce(buildings);
+  const { capacity, assigned, understaffed } = staff;
   const resources = Object.fromEntries(Object.keys(WORK_YIELD).map(k => [k, Number(state.resources?.[k] ?? 0)]));
   const city = { ...state, buildings, queue, resources };
   const priority = needs(city);
@@ -172,6 +173,8 @@ export function readSharedCity(state = {}) {
     city: {
       cityId: state.cityId ?? SHARED_CITY_ID,
       name: "共用城市",
+      era: state.era ?? "village",
+      upgradeBlockers: townUpgradeBlockers(city, staff),
       terrainVersion: state.terrainVersion,
       terrainSeed: state.terrainSeed,
       roadArmLength: state.roadArmLength,
@@ -214,7 +217,14 @@ export async function placePlan(ledger, { building, x, y, at } = {}) {
     y,
     w: def?.footprint.w ?? 0,
     h: def?.footprint.h ?? 0,
-    costs: recipeOf(current, building),
+    costs: recipeOf(current, building, ledger.rulesVersion),
+  }));
+}
+
+export function placeTownUpgrade(ledger, at = Date.now()) {
+  return ledger.submit(() => ({
+    kind: "townUpgrade", opId: `townUpgrade:${ledger.cityId}:${at}`, cityId: ledger.cityId, at,
+    costs: TOWN_UPGRADE_COSTS, buildUnits: TOWN_UPGRADE_UNITS,
   }));
 }
 

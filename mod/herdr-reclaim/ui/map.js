@@ -104,6 +104,7 @@ export function sharedMapView({
   };
   for (const b of buildings) children.push(label(b, b.understaffed ? `${b.label}・缺人` : b.label, b.understaffed ? t.blocked : t.done));
   for (const item of queue) {
+    if (!item.cells?.length) continue; // 升市鎮不占地。
     children.push(item.stage === "building"
       ? label(item, `施工·${item.label}`, t.working)
       : label(item, `預定·${item.label}`, t.accent));

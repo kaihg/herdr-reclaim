@@ -3,7 +3,7 @@
 // 這一支是純函式（不碰 I/O、不 import 帳本），所以預覽與帳本前提檢查用的是**同一個**
 // `siteCheck`：畫面說可以放，下令就不會被拒；畫面說不行，下令也進不了帳本。
 // 地圖本身固定（不依 repo、space、session 生成），玩家看到的是同一座城。
-import { CENTER, cellsWithin, gridDistance, isCenterCell, keyOf } from "./grid.js";
+import { CENTER, cellsWithin, gridDistance, isCenterCell, keyOf, neighbors } from "./grid.js";
 import { CITY_BUILDINGS, ROADSIDE_RANGE, START_ROAD_LENGTH, isBuilding, recipeOf } from "./rules.js";
 import { terrainV1 } from "./terrain-v1.js";
 import { mixedTerrain, specialSiteAt } from "./terrain-v2.js";
@@ -34,6 +34,24 @@ function completedRoad(city, cell) {
     return distance > 1 && distance <= 1 + (city?.roadArmLength ?? START_ROAD_LENGTH);
   }
   return false;
+}
+/** 開城道路與已通車路段；佇列裡的道路尚不算距離來源。 */
+function* roadCells(city) {
+  const length = city?.roadArmLength ?? START_ROAD_LENGTH;
+  for (const step of neighbors(CENTER)) {
+    for (let i = 2; i <= length + 1; i++) yield { x: step.x * i, y: step.y * i };
+  }
+  for (const key of Object.keys(city?.roads ?? {})) {
+    const [x, y] = key.split(",").map(Number);
+    yield { x, y };
+  }
+}
+
+export function outpostUnits(city, anchor) {
+  // 哨站占地 1×1，錨點就是唯一占地格。
+  let distance = Infinity;
+  for (const road of roadCells(city)) distance = Math.min(distance, gridDistance(anchor, road));
+  return CITY_BUILDINGS.outpost.buildUnits + distance;
 }
 
 export function surfaceAt(city, cell) {
@@ -85,11 +103,8 @@ export function footprintCells(building, { x, y }, footprint = CITY_BUILDINGS[bu
 export function siteChecker(city, range = ROADSIDE_RANGE) {
   const revealed = revealedCells(city);
   const covered = new Set();
-  for (const key of revealed) {
-    const [x, y] = key.split(",").map(Number);
-    if (completedRoad(city, { x, y })) {
-      for (const c of cellsWithin({ x, y }, range)) covered.add(keyOf(c));
-    }
+  for (const road of roadCells(city)) {
+    for (const c of cellsWithin(road, range)) covered.add(keyOf(c));
   }
   const built = new Set((city?.buildings ?? []).flatMap((done) => done.cells.map(keyOf)));
   const planned = new Set((city?.queue ?? []).flatMap((item) => (item.cells ?? []).map(keyOf)));
@@ -105,6 +120,7 @@ export function siteChecker(city, range = ROADSIDE_RANGE) {
       if (built.has(key)) return { ...cell, terrain, problem: "building" };
       if (planned.has(key)) return { ...cell, terrain, problem: "plan" };
       if (city?.terrainVersion === 2 && specialSiteAt(city.terrainSeed, cell)) return { ...cell, terrain, problem: "reserved" };
+      if (building === "outpost" && !covered.size) return { ...cell, terrain, problem: "no_road" };
       if (building !== "outpost" && !covered.has(key)) return { ...cell, terrain, problem: "off_road" };
       return { ...cell, terrain, problem: null };
     });
@@ -157,7 +173,7 @@ export function missingOf(costs = {}, resources = {}) {
 
 /** 建築清單（畫面左側）：種類、標籤、占地、配方與完工揭開半徑，順序就是帳本規則表的順序。 */
 export function cityBuildings(city) {
-  return Object.entries(CITY_BUILDINGS).map(([name, def]) => ({
+  return Object.entries(CITY_BUILDINGS).filter(([name]) => name !== "mansion" || city?.era === "town").map(([name, def]) => ({
     name,
     label: def.label,
     footprint: { ...def.footprint },

@@ -11,6 +11,7 @@
  */
 export const BUILDING_MOCK = {
   house: { label: "民居", top: 30, eave: 45, base: 60, roof: true },
+  mansion: { label: "大宅", top: 18, eave: 41, base: 62, roof: true },
   lumberyard: { label: "伐木場", top: 29, eave: 46, base: 60, roof: true },
   quarry: { label: "採石場", top: 33, eave: 48, base: 60, roof: false },
   workshop: { label: "工坊", top: 26, eave: 43, base: 60, roof: true },

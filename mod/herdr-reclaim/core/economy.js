@@ -1,4 +1,4 @@
-import { CITY_BUILDINGS, WORK_YIELD, populationCapacity } from "./rules.js";
+import { CITY_BUILDINGS, TOWN_UPGRADE_POPULATION, WORK_YIELD, populationCapacity } from "./rules.js";
 import { revealedCells, surfaceAt } from "./city-map.js";
 import { CENTER_CELLS, cellsWithin, keyOf } from "./grid.js";
 
@@ -19,6 +19,14 @@ export function workforce(buildings) {
     else assigned += jobs;
   }
   return { capacity, demand, assigned, understaffed };
+}
+export function townUpgradeBlockers(city, staff = workforce(city.buildings)) {
+  if (city.era === "town") return ["already_town"];
+  if (city.queue.some(item => item.building === "townUpgrade")) return ["upgrade_queued"];
+  const reasons = [];
+  if (staff.capacity < TOWN_UPGRADE_POPULATION) reasons.push("population_locked");
+  if (!city.buildings.some(b => b.building === "library" && !staff.understaffed.has(b))) reasons.push("library_inactive");
+  return reasons;
 }
 
 /** 每個相符格歸第一棟，即使它已達上限也不轉給後來的產場。 */

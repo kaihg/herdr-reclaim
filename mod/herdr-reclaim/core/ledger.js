@@ -31,10 +31,10 @@ import { byteLen, canonicalJson, hashText } from "./bytes.js";
 import { casWrite, rejectUnlessConflict } from "./cas.js";
 import { PrefixIndex } from "./pages.js";
 import { applyConstruction, constructionIncome } from "./construction.js";
-import { AUTO_CONSTRUCTION_VERSION, MARKET_VERSION, manualCount, populationCapacity, populationGap } from "./rules.js";
+import { AUTO_CONSTRUCTION_VERSION, MARKET_VERSION, TOWN_UPGRADE_COSTS, TOWN_UPGRADE_UNITS, TOWN_VERSION, manualCount, populationCapacity, populationGap } from "./rules.js";
 import { BUILD_QUEUE_LIMIT, BUILDINGS_V12, CITY_BUILDINGS, POPULATION_VERSION, PRODUCTION_VERSION, RESOURCES, RULES_VERSION, UNIT_CONSTRUCTION_VERSION, WORK_TOKENS_PER_UNIT, WORK_YIELD, affordable, isBuilding, recipeOf } from "./rules.js";
-import { buildingCount, creditUnits, grossYield } from "./economy.js";
-import { footprintCells, siteCheck } from "./city-map.js";
+import { buildingCount, creditUnits, grossYield, townUpgradeBlockers } from "./economy.js";
+import { footprintCells, outpostUnits, siteCheck } from "./city-map.js";
 import { previewRoad } from "./roads.js";
 
 export { byteLen, hashText };
@@ -135,7 +135,7 @@ export const claimKey = (cityId, claim) => `${cityId}@@${claim}`;
  * 共用城市一項建設的身分（#26）：建築、錨點與下令時間。開工、完工與取消都綁這把鍵，
  * 所以同一項只開工一次、完工一次、取消一次；之後在同一處再預定同一種建築是另一項。
  */
-export const planKey = (plan) => `${plan.building}:${plan.x},${plan.y}:${plan.at}`;
+export const planKey = (plan) => plan.building === "townUpgrade" ? `townUpgrade:${plan.at}` : `${plan.building}:${plan.x},${plan.y}:${plan.at}`;
 export const activityKey = (record) => `${record.sessionId}@@${record.writerEpoch ?? ""}`;
 
 const zeroResources = () => Object.fromEntries(RESOURCES.map((key) => [key, 0]));
@@ -151,6 +151,7 @@ const zeroResources = () => Object.fromEntries(RESOURCES.map((key) => [key, 0]))
 export function emptyState(cityId) {
   return {
     cityId,
+    era: "village",
     rulesVersion: RULES_VERSION,
     lastSeq: -1,
     activities: new Map(),
@@ -380,6 +381,19 @@ export const KINDS = {
     },
   },
 
+  townUpgrade: {
+    precheck(state, op, _blobs, version) {
+      if (op.cityId !== state.cityId) return "wrong_city";
+      if (version < TOWN_VERSION) return "unknown_building";
+      if (manualCount(state.queue) >= BUILD_QUEUE_LIMIT) return "queue_full";
+      if (!sameCosts(op.costs, TOWN_UPGRADE_COSTS) || op.buildUnits !== TOWN_UPGRADE_UNITS) return "recipe_mismatch";
+      return townUpgradeBlockers(state)[0] ?? null;
+    },
+    apply(state, { costs, buildUnits, at, rulesVersion }) {
+      state.queue.push({ building: "townUpgrade", label: "升市鎮", costs, buildUnits, cells: [], paid: false, at, rulesVersion });
+      startReadyHead(state, state.work.units ?? 0);
+    },
+  },
   roadPlan: {
     precheck(state, op) {
       if (op.cityId !== state.cityId) return "wrong_city";
@@ -415,9 +429,10 @@ export const KINDS = {
       if (manualCount(state.queue) >= BUILD_QUEUE_LIMIT) return "queue_full";
       const def = CITY_BUILDINGS[op.building];
       if (!def) return "unknown_building";
+      if (op.building === "mansion" && (version < TOWN_VERSION || state.era !== "town")) return "town_required";
       if (version >= MARKET_VERSION && populationGap(op.building, populationCapacity(state.buildings))) return "population_locked";
       if (Number(op.w) !== def.footprint.w || Number(op.h) !== def.footprint.h) return "footprint_mismatch";
-      if (!sameCosts(op.costs, recipeOf(state, op.building))) return "recipe_mismatch";
+      if (!sameCosts(op.costs, recipeOf(state, op.building, version))) return "recipe_mismatch";
       const preview = siteCheck(state, op.building, { x: op.x, y: op.y });
       const blocked = preview.cells.find((cell) => cell.problem);
       return blocked ? `site_${blocked.problem}` : null;
@@ -436,6 +451,7 @@ export const KINDS = {
         at: Number(entry.at),
         paid: entry.paid === true,
         rulesVersion: entry.rulesVersion,
+        ...(entry.rulesVersion >= TOWN_VERSION && entry.building === "outpost" ? { buildUnits: entry.buildUnits } : {}),
       };
       if (item.paid) adjust(state, item.costs, -1);
       state.queue.push(item);
@@ -736,7 +752,7 @@ export class CityLedger {
 
   /**
    * 讀取快取同步：`state()` 一律重讀尾段（別人的寫入才看得到）；`submit()` 平常只信快取，
-   * CAS 失敗時才標成 stale 強制重讀——所以一百萬筆操作的路徑上不是每筆都掃整個 journal。
+   * CAS 衝突或前提不符時才重讀；不能用別窗已經改變的狀態拒絕玩家，也不必為每筆收入掃尾段。
    * 重讀的尾段同樣取自這份掃描結果（跟 rebuild 一樣的理由）。
    */
   async refresh({ force = false } = {}) {
@@ -786,9 +802,18 @@ export class CityLedger {
         return { status: "duplicate", opId: op.opId, journalSeq: state.opSeqs.get(op.opId), attempts: attempt };
       }
       const reason = KINDS[op.kind]?.precheck?.(state, op, blobs, this.rulesVersion);
+      if (reason && attempt === 1) {
+        // 拒絕不會走到 CAS；先確認其他視窗沒有完成工地、改變解鎖條件。
+        const seq = state.lastSeq;
+        await this.refresh({ force: true });
+        if (state.lastSeq !== seq) continue;
+      }
       if (reason) return { status: "rejected", reason, attempts: attempt };
       const { blobs: _ignored, ...fields } = op;
       let events = [];
+      if (op.kind === "plan" && op.building === "outpost" && this.rulesVersion >= TOWN_VERSION) {
+        fields.buildUnits = outpostUnits(state, op);
+      }
       if (op.kind === "income") {
         const projected = incomeAtVersion(state, op.tokens, this.rulesVersion);
         if (op.resources && !sameCosts(op.resources, projected.income)) return { status: "rejected", reason: "rate_mismatch", attempts: attempt };
@@ -914,6 +939,7 @@ export class CityLedger {
       seq,
       segment,
       resources: state.resources,
+      era: state.era,
       terrainVersion: state.terrainVersion,
       terrainSeed: state.terrainSeed,
       roadArmLength: state.roadArmLength,
@@ -1010,6 +1036,7 @@ export class CityLedger {
       for (const [key, value] of read.claims.entries) state.claims.set(key, value);
       for (const [key, packed] of read.activities.entries) state.activities.set(key, await this.unpackRecord(packed));
       state.resources = manifest.resources ?? state.resources;
+      state.era = manifest.era ?? state.era;
       state.terrainVersion = manifest.terrainVersion;
       state.terrainSeed = manifest.terrainSeed;
       state.roadArmLength = manifest.roadArmLength;

@@ -90,7 +90,7 @@ test("付款、通車減產與重播", () => withCity(async ({ ledger, city, wor
 test("沿線與共用佇列", () => withCity(async ({ ledger, city, work }) => {
   await work(150);
   expect((await placePlan(ledger, { building: "outpost", ...p(4, 1) })).status).toBe("applied");
-  await work(4);
+  await work(6);
   const before = await city();
   // 左格距東臂 3，右格距東臂 4；中心不提供覆蓋。
   const anchor = p(5, 1);
@@ -112,4 +112,18 @@ test("沿線與共用佇列", () => withCity(async ({ ledger, city, work }) => {
   expect((await city()).queue[0]).toMatchObject({ building: "road", remainingUnits: 2, costs: bridge.costs });
   await work(2);
   expect((await city()).roads["-2,-3"]).toBe("bridge");
+}));
+
+test("哨站工期鎖定", () => withCity(async ({ ledger, open, work, city }) => {
+  await work(150);
+  const route = previewRoad(await city(), east, p(4, 0));
+  expect((await placeRoad(ledger, route)).status).toBe("applied");
+  expect((await placePlan(ledger, { building: "outpost", ...p(4, 1) })).status).toBe("applied");
+  expect((await city()).queue[1]).toMatchObject({ buildUnits: 6, costs: { wood: 25, stone: 15, iron: 5 } });
+  await work(1); // 新路讓距離縮為 1；已排隊的哨站仍需 6 份。
+  expect((await city()).queue[0].remainingUnits).toBe(6);
+  await work(6);
+  expect((await placePlan(ledger, { building: "outpost", ...p(4, -1) })).status).toBe("applied");
+  expect((await city()).queue[0]).toMatchObject({ remainingUnits: 5, costs: { wood: 33, stone: 20, iron: 7 } });
+  expect(readSharedCity(await (await open()).state()).city).toEqual(await city());
 }));

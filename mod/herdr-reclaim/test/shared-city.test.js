@@ -5,8 +5,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { CityLedger, emptyState, workYieldOf } from "../core/ledger.js";
 import { hashText } from "../core/bytes.js";
-import { BUILD_QUEUE_LIMIT, CITY_BUILDINGS, START_RESOURCES, WORK_TOKENS_PER_UNIT, WORK_YIELD } from "../core/rules.js";
-import { SHARED_CITY_ID, cancelPlan, ingestIncome, placePlan, planIncome, readSharedCity, sharedCityDir } from "../core/shared-city.js";
+import { BUILD_QUEUE_LIMIT, CITY_BUILDINGS, RULES_VERSION, START_RESOURCES, WORK_TOKENS_PER_UNIT, WORK_YIELD } from "../core/rules.js";
+import { SHARED_CITY_ID, cancelPlan, ingestIncome, placePlan, placeTownUpgrade, planIncome, readSharedCity, sharedCityDir } from "../core/shared-city.js";
 import { footprintCells, groundAt, legalSites, revealedCells, siteCheck, terrainAt } from "../core/city-map.js";
 import { createFileIo } from "./fs-io.js";
 
@@ -401,7 +401,8 @@ describe("選址與預定佇列（#25、ADR 0003）", () => {
       const dir = root(`agree-${building}`);
       const ledger = await sharedLedger(dir);
       const city = readSharedCity(await ledger.state()).city;
-      const locked = (CITY_BUILDINGS[building].unlockPopulation ?? 0) > city.population.capacity;
+      const lockReason = building === "mansion" ? "town_required"
+        : (CITY_BUILDINGS[building].unlockPopulation ?? 0) > city.population.capacity ? "population_locked" : null;
       const legal = new Set(keysOf(legalSites(city, building)));
       expect(legal.size).toBeGreaterThan(0);
       for (let x = -5; x <= 6; x++) {
@@ -411,7 +412,7 @@ describe("選址與預定佇列（#25、ADR 0003）", () => {
           if (preview.ok) continue; // 合法的位置另外用乾淨的帳本驗（一次只能排 3 項）
           const result = await order(ledger, building, at(x, y));
           expect(result.status).toBe("rejected");
-          expect(result.reason).toBe(locked ? "population_locked" : `site_${problemsOf(preview)[0]}`);
+          expect(result.reason).toBe(lockReason ?? `site_${problemsOf(preview)[0]}`);
         }
       }
       expect((await cityAt(dir)).queue).toEqual([]); // 被拒的下令不留任何占地
@@ -420,8 +421,8 @@ describe("選址與預定佇列（#25、ADR 0003）", () => {
         const [x, y] = key.split(",").map(Number);
         const acceptDir = root(`accept-${building}`);
         const result = await order(await sharedLedger(acceptDir), building, at(x, y));
-        if (locked) {
-          expect(result).toMatchObject({ status: "rejected", reason: "population_locked" });
+        if (lockReason) {
+          expect(result).toMatchObject({ status: "rejected", reason: lockReason });
           continue;
         }
         expect(result.status).toBe("applied");
@@ -858,7 +859,7 @@ describe("哨站揭開較大範圍（#27）", () => {
       await manualIncome(ledger, [research("a", REPO_A, units, T(1_000_000))]);
       constructing = await cityAt(dir);
     }
-    await manualIncome(ledger, [workload("edge-build", CITY_BUILDINGS[building].buildUnits * WORK_TOKENS_PER_UNIT)]);
+    await manualIncome(ledger, [workload("edge-build", constructing.queue[0].remainingUnits * WORK_TOKENS_PER_UNIT)]);
     const done = await cityAt(dir);
     return { dir, ledger, start, reserved, constructing, done, units };
   }
@@ -885,7 +886,7 @@ describe("哨站揭開較大範圍（#27）", () => {
     // 完工：哨站啟用，土地揭開；重開、重送工作、再推進、checkpoint 都不重扣、不重蓋。
     expect(done.queue).toEqual([]);
     expect(done.buildings.map((b) => [b.building, b.x, b.y])).toEqual([["outpost", 4, 1]]);
-    expect(stock(done)).toEqual([13, 4, 14]);
+    expect(stock(done)).toEqual([17, 6, 16]);
     const reopened = await sharedLedger(dir);
     await manualIncome(reopened, [research("a", REPO_A, units, T(1_000_000))]);
     await reopened.checkpoint();
@@ -946,13 +947,13 @@ describe("人口、人力與維護（#35）", () => {
       await ledger.submit(() => ({ opId: "found", kind: "workStart", cityId: ledger.cityId, at: T(0), roadArmLength, resources: START_RESOURCES }));
       expect((await cityAt(dir)).maintenance).toBe(0);
       await order(ledger, "outpost", at(4, 1));
-      await settle(ledger, [workload("finish", 40_000)]);
+      await settle(ledger, [workload("finish", (roadArmLength === 1 ? 6 : 5) * WORK_TOKENS_PER_UNIT)]);
       const before = await cityAt(dir);
       expect(before.maintenance).toBe(1 / 32);
       await settle(ledger, [], { activateAt: T(7 * 86_400_000) });
       expect(await cityAt(dir)).toEqual(before);
       await settle(ledger, [workload("income", 320_000)]);
-      // 第 6 份開始民居，第 20 份完工：32 份有一半按 N=1，一半按 N=2。
+      // 哨站完工後才有維護；既有工地與後續民居共用一條施工線。
       // 看實際入庫，不把同一筆內另付的建築配方算成維護。
       const entries = (await ledger.scanSegments()).flatMap(s => s.entries);
       expect(entries.filter(e => e.kind === "income").at(-1).resources).toEqual({ wood: 61, stone: 30, iron: 30 });
@@ -1204,11 +1205,68 @@ test("自動換料雙窗重播", async () => {
   const pair = { from: "wood", spent: 8, to: "stone", received: 4 };
   const trades = (await ledger.scanSegments()).flatMap(s => s.entries).filter(e => e.kind === "marketTrade");
   expect(trades).toHaveLength(1);
-  expect(trades[0]).toMatchObject({ ...pair, rulesVersion: 17, unit: 1 });
+  expect(trades[0]).toMatchObject({ ...pair, rulesVersion: RULES_VERSION, unit: 1 });
   expect(live.marketTrades).toEqual([pair]);
   expect(stock(live)).toEqual([0, 0, 0]);
   expect(live.queue[0]).toMatchObject({ auto: true, building: "house", startedUnit: 1 });
   expect(await cityAt(dir)).toEqual(live);
   await ledger.checkpoint();
   expect(await cityAt(dir)).toEqual(live);
+});
+
+test("升級門檻", async () => {
+  const houses = Array(21).fill("house");
+  for (const [types, reason] of [
+    [[...houses.slice(1), "library"], "population_locked"],
+    [houses, "library_inactive"],
+    [[...houses, ...Array(42).fill("lumberyard"), "library"], "library_inactive"],
+  ]) {
+    const { dir, ledger } = await marketCity(types, { wood: 5000, stone: 5000, iron: 5000 });
+    const before = await cityAt(dir);
+    expect((await placeTownUpgrade(ledger)).reason).toBe(reason);
+    expect(await cityAt(dir)).toEqual(before);
+  }
+});
+
+test("升級雙窗與重播", async () => {
+  const { dir, ledger } = await marketCity([...Array(21).fill("house"), "library"], { wood: 2600, stone: 2600, iron: 1300 });
+  const village = await cityAt(dir);
+  const site = legalSites(village, "mansion")[0];
+  expect((await order(ledger, "mansion", site)).reason).toBe("town_required");
+  const race = racingIos(), windows = await Promise.all(race.ios.map(io => sharedLedger(dir, { io })));
+  race.arm();
+  const orders = await Promise.all(windows.map((w, i) => placeTownUpgrade(w, AT + i)));
+  expect(orders.map(r => r.status).sort()).toEqual(["applied", "rejected"]);
+  expect(orders.find(r => r.status === "rejected").reason).toBe("upgrade_queued");
+  const paid = await cityAt(dir);
+  expect(stock(paid)).toEqual([0, 0, 0]);
+  expect(paid.queue).toHaveLength(1);
+  expect(paid.queue[0]).toMatchObject({ cells: [], stage: "building", remainingUnits: 16 });
+  await manualIncome(ledger, [workload("first15", 150000)]);
+  expect((await cityAt(dir)).era).toBe("village");
+  expect((await cityAt(dir)).queue[0].remainingUnits).toBe(1);
+  await Promise.all(windows.map(w => manualIncome(w, [workload("last", 10000)])));
+  const town = await cityAt(dir);
+  expect(town.era).toBe("town");
+  expect(town.maintenance).toBe(village.maintenance);
+  expect(town.buildings).toEqual(village.buildings);
+  expect((await placeTownUpgrade(ledger, AT + 2)).reason).toBe("already_town");
+  await ledger.checkpoint();
+  expect(await cityAt(dir)).toEqual(town);
+  expect((await order(ledger, "mansion", site)).status).toBe("applied");
+  const planned = (await cityAt(dir)).queue.at(-1);
+  expect(planned).toMatchObject({ building: "mansion", w: 2, h: 2, costs: { wood: 100, stone: 85, iron: 350 } });
+});
+
+test("舊哨站工期", async () => {
+  const dir = root("v17-outpost"), old = await sharedLedger(dir, { rulesVersion: 17 });
+  await manualIncome(old, [workload("stock", 500000)]);
+  await order(old, "outpost", at(4, 1));
+  await order(old, "outpost", at(4, 4));
+  const ledger = await sharedLedger(dir);
+  const before = await cityAt(dir);
+  expect(before.queue[0].remainingUnits).toBe(4);
+  expect(before.queue[1].costs).toEqual({ wood: 25, stone: 15, iron: 5 });
+  await manualIncome(ledger, [workload("finish-old", 80000)]);
+  expect((await cityAt(dir)).buildings.map(b => b.completedUnit)).toEqual([54, 58]);
 });

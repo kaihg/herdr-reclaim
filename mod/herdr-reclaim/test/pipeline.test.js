@@ -8,7 +8,9 @@ import fs from "node:fs";
 
 import { TERRAIN, groundAt, legalSites } from "../core/city-map.js";
 import { RESOURCE_LABELS, START_RESOURCES } from "../core/rules.js";
-import { workYieldOf } from "../core/ledger.js";
+import { CityLedger, workYieldOf } from "../core/ledger.js";
+import { SHARED_CITY_ID, placePlan } from "../core/shared-city.js";
+import { createFileIo } from "./fs-io.js";
 import {
   findByText, findById, installHost, ledgerDir, ledgerState, makeCx, mapTiles, submitOp, text, texts, waitFor,
 } from "./view-harness.js";
@@ -79,6 +81,41 @@ describe("載入鏈", () => {
 });
 
 describe("選址到下令（真的寫進帳本）", () => {
+  test("升市鎮到大宅", async () => {
+    const ledger = await new CityLedger({ io: createFileIo(), dir: ledgerDir(host.home), cityId: SHARED_CITY_ID }).open();
+    // 固定工作量備料；依正常預定與完工流程建出人口 86 的村落。
+    let n = 0;
+    const work = units => ledger.submit(() => ({ kind: "income", opId: `work-${++n}`, cityId: ledger.cityId,
+      sources: [String(n)], tokens: units * 10000 }));
+    await work(10000);
+    for (const building of [...Array(10).fill("house"), "library", ...Array(11).fill("house")]) {
+      const site = legalSites(await ledger.state(), building)[0];
+      expect((await placePlan(ledger, { building, ...site })).status).toBe("applied");
+      await work(14);
+    }
+    const { town, cx, tree } = await open();
+    findByText(tree(), "預定升市鎮").handlers.click({}, cx);
+    await waitFor(() => town.town.shared.city.queue[0]?.building === "townUpgrade");
+    expect(text(findById(tree(), "detail"))).toContain("不占新格");
+    await work(16);
+    town.town = await town.refreshShared();
+    const city = town.town.shared.city;
+    expect(text(findById(tree(), "top"))).toContain("時代：市鎮");
+    const site = legalSites(city, "mansion")[0];
+    findById(tree(), "building-mansion").handlers.click({}, cx);
+    town.pickSite(site.x, site.y, cx);
+    findByText(tree(), "預定這裡").handlers.click({}, cx);
+    await waitFor(() => town.town.shared.city.queue.at(-1)?.building === "mansion");
+    if (city.queue.length) await work(city.queue[0].remainingUnits);
+    town.town = await town.refreshShared();
+    expect(town.town.shared.city.queue[0]).toMatchObject({ building: "mansion", remainingUnits: 18 });
+    const before = town.town.shared.city.population.capacity;
+    await work(18);
+    const done = (await open()).town.town.shared.city;
+    expect(done.population.capacity).toBe(before + 10);
+    expect(done.buildings.at(-1)).toMatchObject({ building: "mansion", ...site });
+  });
+
   test("霧中河道不外洩", async () => {
     await submitOp(host.home, state => ({
       kind: "workStart", opId: "found", at: 32, cityId: state.cityId,
@@ -89,7 +126,7 @@ describe("選址到下令（真的寫進帳本）", () => {
     first.town.pickSite(4, 1, first.cx);
     findByText(first.tree(), "預定這裡").handlers.click({}, first.cx);
     await waitFor(() => first.town.town.shared.city.queue[0]?.stage === "building");
-    await submitOp(host.home, incomeOp(40_000, "scout"));
+    await submitOp(host.home, incomeOp(60_000, "scout"));
     const { town, cx, tree } = await open();
     const city = town.town.shared.city;
     expect(groundAt(city, { x: 10, y: 0 })).toBe("water");
@@ -103,10 +140,11 @@ describe("選址到下令（真的寫進帳本）", () => {
     expect(text(findById(tree(), "detail"))).toContain(`${edgeTerrain.buildable ? "離通車的道路超過 3 格，請先鋪路" : edgeTerrain.label}|迷霧|配方`);
     expect(findByText(tree(), "預定這裡")).toBeNull();
     // 即使繞過按鈕直接送出，帳本的拒絕原因也只能提到迷霧。
+    const before = await ledgerState(host.home);
     town.submitPlan({ building: "outpost", x: 10, y: 0, label: "哨站" }, cx);
     await waitFor(() => town.toast?.text?.includes("沒有預定"));
     expect(town.toast.text).toBe("沒有預定：有一角還在迷霧裡");
-    expect((await ledgerState(host.home)).queue).toEqual([]); // 哨站付料後僅剩 5 鐵，民居不能開工。
+    expect((await ledgerState(host.home)).lastSeq).toBe(before.lastSeq);
   });
 
   test("鋪路操作", async () => {

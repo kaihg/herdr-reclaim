@@ -5,7 +5,7 @@ import { needs, roadsideSites } from "./roadside.js";
 import { keyOf } from "./grid.js";
 
 const definition = item => (item.rulesVersion >= POPULATION_VERSION ? CITY_BUILDINGS : BUILDINGS_V12)[item.building];
-export const constructionUnits = item => item.building === "road" ? item.buildUnits : definition(item).buildUnits;
+export const constructionUnits = item => item.buildUnits ?? definition(item).buildUnits;
 
 const materials = ["wood", "stone", "iron"];
 
@@ -40,6 +40,10 @@ export function applyConstruction(city, event) {
   const item = city.queue[0];
   if (event.kind === "autoComplete" || event.kind === "manualComplete") {
     city.queue.shift();
+    if (item.building === "townUpgrade") {
+      city.era = "town";
+      return;
+    }
     if (item.building === "road") {
       for (const cell of item.cells) city.roads[keyOf(cell)] = cell.terrain === "water" ? "bridge" : "road";
       return;
@@ -89,8 +93,9 @@ export function constructionIncome(state, tokens, rulesVersion) {
       const road = head.building === "road";
       // 模擬交易時不能修改 CAS 前的城市；首次通車才複製道路表。
       if (road && city.roads === state.roads) city.roads = { ...state.roads };
-      record(head.auto ? "autoComplete" : "manualComplete", unit, { building: head.building, reveal: road ? 0 : definition(head).reveal });
-      if (!road) {
+      const physical = !road && head.building !== "townUpgrade";
+      record(head.auto ? "autoComplete" : "manualComplete", unit, { building: head.building, reveal: physical ? definition(head).reveal : 0 });
+      if (physical) {
         count++;
         if (marketRules) { staff = workforce(city.buildings); market = operatingMarket(); }
       }
