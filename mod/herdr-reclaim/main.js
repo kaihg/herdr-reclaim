@@ -49,14 +49,15 @@ const RESOURCES = [
 const SITE_PROBLEMS = {
   road: "道路", fog: "迷霧", water: "深水", cliff: "峭壁", center: "城鎮中心", building: "已有建築", plan: "預定地", unknown_building: "未知建築",
 };
+const INCOME_HINT = "繼續工作就會進帳";
 const PLAN_REASONS = {
   queue_full: "建設佇列已滿",
-  insufficient_resources: "庫存不足以支付完整配方",
+  insufficient_resources: `建材還沒備齊，${INCOME_HINT}`,
   already_started: "已經開工，不能取消",
   no_plan: "佇列裡已經沒有這一項",
   unknown_building: "未知的建築種類",
-  footprint_mismatch: "占地與規則表不符",
-  recipe_mismatch: "配方與規則表不符",
+  footprint_mismatch: "這棟建築需要不同的占地",
+  recipe_mismatch: "這棟建築需要不同的建材",
   site_fog: "有一角還在迷霧裡",
   site_water: "有一角是深水",
   site_cliff: "有一角是峭壁",
@@ -78,7 +79,7 @@ const workLeft = (item) => `還要 ${item.remainingUnits} 份`;
 const queueLine = (item, dev) => (item.stage === "building"
   ? `施工中：${item.label}${locationLabel(item, dev)}・${workLeft(item)}`
   : Object.keys(item.missing ?? {}).length > 0
-    ? `備料中：${item.label}${locationLabel(item, dev)}・還缺 ${missingText(item.missing)}`
+    ? `備料中：${item.label}${locationLabel(item, dev)}・還缺 ${missingText(item.missing)}；${INCOME_HINT}`
     : `排隊中：${item.label}${locationLabel(item, dev)}・材料已齊`);
 /**
  * 現在再加一項時真正可用的庫存：扣掉佇列裡還沒付款的配方。付款只在隊首發生，
@@ -254,7 +255,8 @@ export default class Town extends View {
     this.ui = null;
     this.devMode = false;
     this.toast = null;
-    this.note = "正在讀取共用城市帳本…";
+    this.note = "正在查看共用城市…";
+    this.devNote = null;
     this.metricsOpen = false;
     this.camera = null;
     this.metrics = emptyMetrics();
@@ -275,7 +277,8 @@ export default class Town extends View {
       try {
         await ensureActivityDir(this.io);
       } catch (error) {
-        this.note = `活動目錄建立失敗：${error}`;
+        this.note = "暫時無法接收工作進度。";
+        this.devNote = `活動目錄建立失敗：${error}`;
       }
       this.refreshQuotas(cx);
       let first = true;
@@ -286,9 +289,11 @@ export default class Town extends View {
           if (first) this.devMode = this.ui.dev;
           if (first) this.restoreSelection();
           this.note = null;
+          this.devNote = null;
         } catch (error) {
           this.town = null;
-          this.note = `共用城市帳本讀取失敗：${error}`;
+          this.note = "共用城市讀取失敗，請稍後再開啟。";
+          this.devNote = `共用城市帳本讀取失敗：${error}`;
         }
         cx.notify();
         first = false;
@@ -347,7 +352,10 @@ export default class Town extends View {
         .gap(8)
         .bg(t.canvas)
         .text_color(t.muted)
-        .child(div().child(this.note ?? "共用城市還沒啟用：開始工作後，建材就會進倉。"));
+        .child(div().child((this.devMode && this.devNote) || this.note || (this.devMode
+          ? "共用城市尚未啟用：開一個互動的 agent session。"
+          : "共用城市等著開工：開始工作，第一批建材就會進倉。")))
+        .child(chipButton(this.devMode ? "開發模式 ✓" : "開發模式", t, (cx2) => this.toggleDev(cx2)));
     }
     // 這一格 mod 有多寬決定兩側的欄寬；窄 pane 也看得到三個區塊。
     // on_size_change 給的是實際像素（含畫面縮放），版面用的 .w()/.left() 是 UI 像素。
@@ -358,6 +366,7 @@ export default class Town extends View {
     const rightW = Math.round(clamp(MIN_RIGHT_W, width * 0.26, MAX_RIGHT_W));
     // 共用城市沒有底部動作列：庫存常駐頂欄，選址在左側與地圖上完成。
     const mapArea = { width: Math.max(80, width - leftW - rightW), height: Math.max(80, height - TOP_H) };
+    const toastText = this.devMode ? this.toast?.devText ?? this.toast?.text : this.toast?.text;
     const root = v_flex()
       .id("root")
       .size_full()
@@ -380,7 +389,7 @@ export default class Town extends View {
             .relative()
             .child(this.sharedMap(shared, t, cx, mapArea))
             .when(this.metricsOpen && this.devMode, (element) => element.child(this.metricsPanel(t)))
-            .when(this.toast !== null, (element) => element.child(this.toastView(t))),
+            .when(Boolean(toastText), (element) => element.child(this.toastView(t, toastText))),
           this.sharedDetail(shared, t, rightW, cx),
         ]),
       ]);
@@ -413,8 +422,10 @@ export default class Town extends View {
     const work = h_flex()
       .gap(6)
       .items_center()
-      .child(div().text_size(10).text_color(t.dim).child("工作"))
-      .child(div().text_size(12.5).child(`${shared.work.tokens}/${shared.work.unitTokens}`));
+      .child(div().text_size(10).text_color(t.dim).child("下一份進帳"))
+      .child(div().text_size(12.5).child(this.devMode
+        ? `${shared.work.tokens}/${shared.work.unitTokens} token`
+        : `${Math.floor(100 * shared.work.tokens / shared.work.unitTokens)}%`));
     const target = div().text_size(10).text_color(t.muted).truncate().child(queueSummary(shared, this.devMode));
     const center = stacked
       ? v_flex().flex_1().min_w(0).overflow_hidden().gap(2).child(stock).child(work).child(target)
@@ -443,12 +454,10 @@ export default class Town extends View {
           .overflow_hidden()
           .items_end()
           .gap(3)
-          .child(h_flex().flex_wrap().gap(6).items_center().children([
-            chipButton("更新額度", t, (cx2) => this.refreshQuotas(cx2, { manual: true })),
-            chipButton(this.devMode ? "開發模式 ✓" : "開發模式", t, (cx2) => this.toggleDev(cx2)),
-          ]))
+          .child(chipButton(this.devMode ? "開發模式 ✓" : "開發模式", t, (cx2) => this.toggleDev(cx2)))
           // 規則版本與量測是開發用的工程資訊：開發模式才出現。
           .when(this.devMode, (element) => element.child(h_flex().flex_wrap().gap(6).items_center().children([
+            chipButton("更新額度", t, (cx2) => this.refreshQuotas(cx2, { manual: true })),
             div().text_size(9).text_color(t.dim).child(`規則 v${RULES_VERSION}`),
             chipButton(this.metricsOpen ? "關閉量測" : "量測", t, (cx2) => {
               this.metricsOpen = !this.metricsOpen;
@@ -484,7 +493,7 @@ export default class Town extends View {
           .child(full ? "佇列已滿：先讓最前面那一項完工，或取消還沒開工的項目。" : "預定不動庫存：排到隊首、材料備齊才一次付清；還沒開工的項目可以取消。"),
         div().text_size(9).text_color(t.dim)
           .child("草地、疏林、碎石地可以蓋；深水、峭壁與迷霧不行。預覽與下令用同一條規則。"),
-        ...this.quotaSection(t),
+        ...(this.devMode ? this.quotaSection(t) : []),
         div().text_size(9).text_color(t.dim)
           .child(`已揭開 ${revealedCells(shared).size} 格 · 建築 ${shared.buildings.length} 棟${this.devMode ? ` · 帳本 ${SHARED_CITY_ID}` : ""}`),
       ]);
@@ -515,7 +524,7 @@ export default class Town extends View {
         div().text_size(9).text_color(t.muted).truncate().child(costsText(building.costs)),
         div().text_size(9).text_color(t.muted).child(`完工揭開 ${building.reveal} 格`),
         div().text_size(9).text_color(affordable ? t.done : t.muted)
-          .child(affordable ? "材料已齊" : `還缺 ${missingText(missing)}`),
+          .child(affordable ? "材料已齊" : `還缺 ${missingText(missing)}；${INCOME_HINT}`),
       ]);
   }
 
@@ -631,10 +640,10 @@ export default class Town extends View {
       ...preview.cells.map((cell) => h_flex().gap(6).items_center()
         .when(this.devMode, (row) => row.child(div().text_size(9).text_color(t.dim).child(locationLabel(cell, true))))
         .child(div().text_size(10).text_color(cell.problem ? t.blocked : t.muted)
-          .child(cell.problem ? SITE_PROBLEMS[cell.problem] ?? cell.problem : TERRAIN[cell.terrain]?.label ?? "迷霧"))),
+          .child(cell.problem ? SITE_PROBLEMS[cell.problem] ?? (this.devMode ? cell.problem : "不能建造") : TERRAIN[cell.terrain]?.label ?? "迷霧"))),
       def ? fieldRow({ label: "配方", value: costsText(def.costs) }, t) : null,
       def ? div().text_size(9).text_color(ready ? t.done : t.muted)
-        .child(ready ? "排在佇列後面也付得出來：輪到它就開工" : `排在目前佇列之後還缺 ${missingText(missing)}；輪到它才付料`) : null,
+        .child(ready ? "排在佇列後面也付得出來：輪到它就開工" : `排在目前佇列之後還缺 ${missingText(missing)}；${INCOME_HINT}，輪到它才付料`) : null,
       room ? null : div().text_size(9).text_color(t.blocked)
         .child(`建設佇列已滿（${shared.queue.length}/${shared.queueLimit}）：先讓最前面那一項完工，或取消還沒開工的一項。`),
       preview.ok && room ? chipButton("預定這裡", t, (cx2) => this.submitPlan(preview, cx2)) : null,
@@ -670,7 +679,7 @@ export default class Town extends View {
             ...(building
               ? [fieldRow({ label: "工期", value: workLeft(item) }, t)]
               : [
-                fieldRow({ label: "還缺", value: missing ? missingText(item.missing) : "材料已齊" }, t),
+                fieldRow({ label: "還缺", value: missing ? `${missingText(item.missing)}；${INCOME_HINT}` : "材料已齊" }, t),
                 chipButton("取消", t, (cx2) => this.cancelItem(item, cx2)),
               ]),
           ]);
@@ -705,21 +714,25 @@ export default class Town extends View {
     const { building, x, y, label } = preview;
     cx.spawn(async (cx2) => {
       let text;
+      let devText;
       try {
         const result = await placePlan(await openShared(this.io), { building, x, y, at: startedAt });
         if (result.status === "applied" || result.status === "duplicate") {
           this.town = await this.refreshShared();
           this.picking = null;
           this.preview = null;
-          text = `已預定：${label}${locationLabel({ x, y }, this.devMode)}；排到隊首、材料備齊才付料開工`;
+          text = `已預定：${label}；排到隊首、材料備齊才付料開工`;
+          devText = text + locationLabel({ x, y }, true);
         } else {
-          text = `沒有預定：${PLAN_REASONS[result.reason] ?? result.reason ?? result.status}`;
+          text = `沒有預定：${PLAN_REASONS[result.reason] ?? "請重新選址再試"}`;
+          devText = `${text} (${result.reason ?? result.status})`;
         }
       } catch (error) {
-        text = `預定失敗：${error}`;
+        text = "暫時無法預定，請稍後再試。";
+        devText = `預定失敗：${error}`;
       }
       this.metrics.pending = { kind: "action", at: startedAt };
-      this.showToast(text, cx2);
+      this.showToast(text, cx2, devText);
     });
   }
 
@@ -728,19 +741,23 @@ export default class Town extends View {
     const startedAt = Date.now();
     cx.spawn(async (cx2) => {
       let text;
+      let devText;
       try {
         const result = await cancelPlan(await openShared(this.io), item);
         if (result.status === "applied" || result.status === "duplicate") {
           this.town = await this.refreshShared();
-          text = `已取消：${item.label}${locationLabel(item, this.devMode)}`;
+          text = `已取消：${item.label}`;
+          devText = text + locationLabel(item, true);
         } else {
-          text = `沒有取消：${PLAN_REASONS[result.reason] ?? result.reason ?? result.status}`;
+          text = `沒有取消：${PLAN_REASONS[result.reason] ?? "請再查看建設佇列"}`;
+          devText = `${text} (${result.reason ?? result.status})`;
         }
       } catch (error) {
-        text = `取消失敗：${error}`;
+        text = "暫時無法取消，請稍後再試。";
+        devText = `取消失敗：${error}`;
       }
       this.metrics.pending = { kind: "action", at: startedAt };
-      this.showToast(text, cx2);
+      this.showToast(text, cx2, devText);
     });
   }
 
@@ -754,7 +771,7 @@ export default class Town extends View {
   quotaSection(t) {
     const lines = quotaLines(this.town?.quotas);
     return [
-      div().text_size(10).text_color(t.dim).child(this.devMode ? "行會人力（provider 回報）" : "行會人力"),
+      div().text_size(10).text_color(t.dim).child("行會人力（provider 回報）"),
       ...lines.map((line) => div().text_size(9).text_color(line.known ? t.muted : t.dim).child(line.text)),
     ];
   }
@@ -803,7 +820,7 @@ export default class Town extends View {
    */
   refreshQuotas(cx, { manual = false } = {}) {
     if (this.quotaFetching) {
-      if (manual) this.showToast("額度正在更新中", cx);
+      if (manual) this.showToast(null, cx, "額度正在更新中");
       return;
     }
     this.quotaFetching = true;
@@ -811,12 +828,12 @@ export default class Town extends View {
       try {
         const claimed = await claimQuotaAttempt(this.io, quotaAttemptPath(), Date.now(), { force: manual });
         if (!claimed) return;
-        if (manual) this.showToast(`正在抓取額度：${QUOTA_SOURCE.command} ${QUOTA_SOURCE.args.join(" ")}`, cx2);
+        if (manual) this.showToast(null, cx2, `正在抓取額度：${QUOTA_SOURCE.command} ${QUOTA_SOURCE.args.join(" ")}`);
         const text = await this.fetchQuotas();
-        if (manual) this.showToast(text, cx2);
+        if (manual) this.showToast(null, cx2, text);
         else cx2.notify();
       } catch (error) {
-        if (manual) this.showToast(`額度更新失敗：${error}`, cx2);
+        if (manual) this.showToast(null, cx2, `額度更新失敗：${error}`);
       } finally {
         this.quotaFetching = false;
       }
@@ -824,9 +841,9 @@ export default class Town extends View {
   }
 
   /** 操作結果的一行小提示（浮在地圖下方）：幾秒後自己消失，點一下也能關。 */
-  showToast(text, cx) {
+  showToast(text, cx, devText) {
     const id = (this.toastSeq = (this.toastSeq ?? 0) + 1);
-    this.toast = { id, text };
+    this.toast = { id, text, devText };
     cx.notify();
     cx.timer.after(TOAST_MS, (cx2) => {
       if (this.toast?.id !== id) return;
@@ -835,7 +852,7 @@ export default class Town extends View {
     });
   }
 
-  toastView(t) {
+  toastView(t, text) {
     return h_flex()
       .id("toast")
       .absolute()
@@ -858,7 +875,7 @@ export default class Town extends View {
             this.toast = null;
             cx.notify();
           })
-          .child(this.toast.text),
+          .child(text),
       );
   }
 

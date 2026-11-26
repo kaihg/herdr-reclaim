@@ -3,13 +3,14 @@
 // 這裡釘住的事：`herdr-app check` 只看得到 render 不炸，看不到「畫面上是哪些字、按下某個
 // 東西之後狀態怎麼變、pane 變窄時欄寬怎麼算」。這三件都在這個檔案裡，不需要視窗、螢幕或
 // 指標事件。
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 
 import { selectionOf } from "../core/selection.js";
 import { SHARED_CITY_ID, readSharedCity } from "../core/shared-city.js";
 import { RULES_VERSION } from "../core/rules.js";
+import { createFileIo } from "./fs-io.js";
 import {
-  findByText, findById, installHost, makeCx, mapTiles, resize, text, texts,
+  findByText, findById, installHost, makeCx, mapTiles, resize, text, texts, waitFor,
 } from "./view-harness.js";
 
 installHost({ checking: true });
@@ -21,6 +22,15 @@ function open() {
   const town = new Town();
   town.init({}, cx);
   return { cx, town, tree: () => town.render(cx) };
+}
+
+// 列舉整棵 render 樹，而非只檢查預期藏起來的欄位；也抓沒有「座標」字樣的數字對。
+function playerScreen(root) {
+  const lines = texts(root);
+  expect(lines.filter((line) =>
+    /provider|session|agent|token|CLI|exit|omp usage|--json|openai-codex|shared-v2|帳本|座標|行會人力|額度|規則 v|量測|[（(]\s*-?\d+\s*[,，]\s*-?\d+\s*[)）]/i.test(line)
+  )).toEqual([]);
+  return lines.join("|");
 }
 
 test("新城外框與道路", () => {
@@ -96,10 +106,64 @@ describe("固定情境的分區與庫存", () => {
     expect(text(findByText(tree(), "取消"))).toBe("取消");
   });
 
-  test("沒有共用城市時說清楚原因，不是空畫面", () => {
-    const { town, cx } = open();
+  test("空城指引", () => {
+    const { town, cx, tree } = open();
     town.town = null;
-    expect(texts(town.render(cx)).join("")).toContain("共用城市");
+    expect(playerScreen(tree())).toContain("開始工作，第一批建材就會進倉");
+    findByText(tree(), "開發模式").handlers.click({}, cx);
+    expect(text(tree())).toContain("互動的 agent session");
+  });
+
+  test("全畫面模式切換與缺料", () => {
+    const { town, cx, tree } = open();
+    town.town.quotas = { unknowns: [{ provider: "openai-codex", reason: "尚未回報" }] };
+    const toggle = () => findByText(tree(), "開發模式").handlers.click({}, cx);
+    const queued = playerScreen(tree());
+    expect(queued).toContain("下一份進帳|40%");
+    expect(queued).toContain("還缺|木材 8・石材 2；繼續工作就會進帳");
+    expect(text(findById(tree(), "building-house"))).toContain("還缺 木材 8・石材 2；繼續工作就會進帳");
+    toggle();
+    const dev = text(tree());
+    for (const detail of ["provider 回報", "openai-codex", "更新額度", `帳本 ${SHARED_CITY_ID}`, "(4, 1)", "4000/10000 token"]) {
+      expect(dev).toContain(detail);
+    }
+    toggle();
+    findById(tree(), "building-house").handlers.click({}, cx);
+    town.pickSite(-2, -2, cx);
+    expect(playerScreen(tree())).toMatch(/排在目前佇列之後還缺 [^|]+繼續工作就會進帳/);
+    toggle();
+    expect(text(findById(tree(), "detail"))).toContain("民居 (-2, -2)");
+    toggle();
+    town.town.shared = readSharedCity({ terrainVersion: 1, roadArmLength: 3 });
+    town.picking = null;
+    town.pickSite(-2, -2, cx);
+    expect(playerScreen(tree())).toContain("選取的土地");
+    toggle();
+    expect(text(tree())).toContain("選取的土地 (-2, -2)");
+  });
+
+  test("更新途中切換模式", async () => {
+    const { cx, town, tree } = open();
+    town.io = createFileIo();
+    const toggle = () => findByText(tree(), "開發模式").handlers.click({}, cx);
+    const reply = Promise.withResolvers();
+    const command = spyOn(await import("herdr"), "exec").mockImplementation(() => reply.promise);
+    try {
+      toggle();
+      findByText(tree(), "更新額度").handlers.click({}, cx);
+      await waitFor(() => command.mock.calls.length > 0);
+      expect(text(tree())).toContain("omp usage");
+      toggle();
+      playerScreen(tree());
+      reply.resolve({ code: 7, stderr: "CLI provider unavailable" });
+      await Promise.all(cx.running);
+      playerScreen(tree());
+      toggle();
+      expect(text(tree())).toContain("exit 7）：CLI provider unavailable");
+    } finally {
+      reply.resolve({ code: 7, stderr: "" });
+      command.mockRestore();
+    }
   });
 });
 
