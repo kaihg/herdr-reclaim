@@ -4,7 +4,7 @@
 // `siteCheck`：畫面說可以放，下令就不會被拒；畫面說不行，下令也進不了帳本。
 // 地圖本身固定（不依 repo、space、session 生成），玩家看到的是同一座城。
 import { CENTER, cellsWithin, gridDistance, isCenterCell, keyOf } from "./grid.js";
-import { CITY_BUILDINGS, START_ROAD_LENGTH, isBuilding } from "./rules.js";
+import { CITY_BUILDINGS, START_ROAD_LENGTH, isBuilding, recipeOf } from "./rules.js";
 
 /** 地形種類；`buildable` 的三種可以蓋，深水與峭壁不行（#22 的選址規則）。 */
 export const TERRAIN = {
@@ -84,12 +84,11 @@ export function groundAt(city, cell) {
 }
 
 /** 一棟建築在某個錨點（左上角）佔用的整片格子，順序固定：先 x 再 y。 */
-export function footprintCells(building, { x, y }) {
-  const def = CITY_BUILDINGS[building];
-  if (!def) return [];
+export function footprintCells(building, { x, y }, footprint = CITY_BUILDINGS[building]?.footprint) {
+  if (!footprint) return [];
   const cells = [];
-  for (let dy = 0; dy < def.footprint.h; dy++) {
-    for (let dx = 0; dx < def.footprint.w; dx++) cells.push({ x: x + dx, y: y + dy });
+  for (let dy = 0; dy < footprint.h; dy++) {
+    for (let dx = 0; dx < footprint.w; dx++) cells.push({ x: x + dx, y: y + dy });
   }
   return cells;
 }
@@ -165,12 +164,12 @@ export function missingOf(costs = {}, resources = {}) {
 }
 
 /** 建築清單（畫面左側）：種類、標籤、占地、配方與完工揭開半徑，順序就是帳本規則表的順序。 */
-export function cityBuildings() {
+export function cityBuildings(city) {
   return Object.entries(CITY_BUILDINGS).map(([name, def]) => ({
     name,
     label: def.label,
     footprint: { ...def.footprint },
-    costs: { ...def.costs },
+    costs: recipeOf(city, name),
     reveal: Number(def.reveal ?? 0),
   }));
 }

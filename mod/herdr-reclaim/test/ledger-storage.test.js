@@ -3,9 +3,8 @@
 import { describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import {
-  CityLedger, CrashAfterContent, CrashAfterJournal, byteLen, hashText,
+  CityLedger, CrashAfterContent, CrashAfterJournal, byteLen, hashText, workYieldOf,
 } from "../core/ledger.js";
-import { workYieldOf } from "../core/rules.js";
 import { createFileIo } from "./fs-io.js";
 
 const AT = 1_800_000_000_000;
@@ -22,7 +21,7 @@ function incomeOp(state, source, { tokens = 10_000, at = T(0) } = {}) {
     cityId: "shared",
     tokens,
     sources: [source],
-    resources: workYieldOf(Number(state.work.tokens ?? 0) + tokens),
+    resources: workYieldOf(state, tokens),
   };
 }
 
@@ -69,9 +68,9 @@ describe("完成依據與崩潰恢復", () => {
 
     const reopened = await open(dir);
     const state = await reopened.state();
-    expect(stock(state)).toEqual([3, 2, 1]);
+    expect(stock(state)).toEqual([2, 1, 1]);
     expect((await reopened.submit((current) => incomeOp(current, "a"))).status).toBe("duplicate");
-    expect(stock(await (await open(dir)).state())).toEqual([3, 2, 1]);
+    expect(stock(await (await open(dir)).state())).toEqual([2, 1, 1]);
   });
 
   test("同樣的 operation ID 再送一次（即使內容不同）不會改變狀態", async () => {
@@ -80,7 +79,7 @@ describe("完成依據與崩潰恢復", () => {
     await ledger.submit((state) => incomeOp(state, "a", { tokens: 10_000 }));
     const again = await ledger.submit((state) => incomeOp(state, "a", { tokens: 20_000 }));
     expect(again.status).toBe("duplicate");
-    expect(stock(await ledger.state())).toEqual([3, 2, 1]);
+    expect(stock(await ledger.state())).toEqual([2, 1, 1]);
   });
 
   test("前提不符整筆拒絕：同一筆來源不可能再入帳一次", async () => {
@@ -94,7 +93,7 @@ describe("完成依據與崩潰恢復", () => {
       cityId: "shared",
       tokens: 10_000,
       sources: ["a"],
-      resources: { wood: 3, stone: 2, iron: 1 },
+      resources: { wood: 2, stone: 1, iron: 1 },
     }));
     expect(rejected).toMatchObject({ status: "rejected", reason: "source_exists" });
     expect((await ledger.state()).lastSeq).toBe(0);
@@ -242,7 +241,7 @@ describe("commit 收成退場（#28、ADR 0002）：只重播、不再產生", (
     // 舊版（v8）寫下的成果收成：直接寫進 journal，模擬磁碟上既有的帳本。
     fs.appendFileSync(`${dir}/journal/0.json`, `${JSON.stringify({ journalSeq: 1, ...LEGACY })}\n`);
     const state = await (await open(dir)).state();
-    expect(stock(state)).toEqual([6, 4, 2]); // 基本收入 3/2/1 ＋ 舊成果 3/2/1
+    expect(stock(state)).toEqual([5, 3, 2]); // 基本收入 2/1/1 ＋ 舊成果 3/2/1
     expect(state.claims.has("shared@@/tmp/repo|src/a.js:blob1")).toBe(true);
     expect(state.opSeqs.has("achievement:shared:abc")).toBe(true);
   });

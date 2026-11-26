@@ -11,8 +11,9 @@
 // 這一票交付「工作 → 基本建材 + 常駐庫存」。
 // 選址與佇列見 #25／#26、ADR 0003；#33 起，入庫、工地進度與隊首付料是同一筆帳。
 // 舊版各城帳本留在磁碟上，不讀也不改。
-import { claimKey, planKey } from "./ledger.js";
-import { BUILD_QUEUE_LIMIT, BUILDINGS_V12, CITY_BUILDINGS, START_RESOURCES, START_ROAD_LENGTH, TERRAIN_VERSION, WORK_TOKENS_PER_UNIT, WORK_YIELD, isBuilding, workYieldOf } from "./rules.js";
+import { claimKey, planKey, workYieldOf } from "./ledger.js";
+import { BUILD_QUEUE_LIMIT, BUILDINGS_V12, CITY_BUILDINGS, POPULATION_VERSION, START_RESOURCES, START_ROAD_LENGTH, TERRAIN_VERSION, WORK_TOKENS_PER_UNIT, WORK_YIELD, isBuilding, recipeOf } from "./rules.js";
+import { buildingCount, maintenanceRate, workforce } from "./economy.js";
 import { missingOf } from "./city-map.js";
 import { createsTile, rootOf, roundsOf, sessionIndex } from "./research.js";
 
@@ -140,7 +141,7 @@ export async function ingestIncome(ledger, { activities = [], activateAt } = {})
       round: settlement.round,
       tokens: settlement.tokens,
       sources: settlement.sources,
-      resources: workYieldOf(Number(current.work?.tokens ?? 0) + settlement.tokens),
+      resources: workYieldOf(current, settlement.tokens),
     }));
     results.push(result);
   }
@@ -164,12 +165,15 @@ export function readSharedCity(state = {}) {
     copy.missing = running ? {} : missingOf(copy.costs, pool);
     if (running) {
       const elapsed = item.startedUnit == null ? 0 : (state.work?.units ?? 0) - item.startedUnit;
-      copy.remainingUnits = BUILDINGS_V12[item.building].buildUnits - elapsed;
+      const defs = item.rulesVersion >= POPULATION_VERSION ? CITY_BUILDINGS : BUILDINGS_V12;
+      copy.remainingUnits = defs[item.building].buildUnits - elapsed;
     }
     // 這一項之後就輪到下一項：排隊中的配方先從池子裡扣掉（已開工的那一項早就付過了）。
     if (!running) for (const [key, amount] of Object.entries(copy.costs)) pool[key] = Number(pool[key] ?? 0) - Number(amount);
     return copy;
   });
+  const buildings = state.buildings ?? [];
+  const { capacity, assigned, understaffed } = workforce(buildings);
   return {
     schema: 2,
     city: {
@@ -179,10 +183,13 @@ export function readSharedCity(state = {}) {
       roadArmLength: state.roadArmLength,
       resources: Object.fromEntries(Object.keys(WORK_YIELD).map((key) => [key, Number(state.resources?.[key] ?? 0)])),
       work: { tokens: Number(state.work?.tokens ?? 0), unitTokens: WORK_TOKENS_PER_UNIT },
+      population: { assigned, capacity },
+      maintenance: maintenanceRate(buildingCount(buildings)),
       queue,
       queueLimit: BUILD_QUEUE_LIMIT,
-      buildings: (state.buildings ?? []).map((building) => ({
+      buildings: buildings.map((building) => ({
         ...building,
+        understaffed: understaffed.has(building),
         costs: { ...building.costs },
         cells: building.cells.map((cell) => ({ ...cell })),
       })),
@@ -199,7 +206,7 @@ export function readSharedCity(state = {}) {
 export async function placePlan(ledger, { building, x, y, at } = {}) {
   const def = CITY_BUILDINGS[building];
   const when = Number.isFinite(Number(at)) ? Number(at) : Date.now();
-  return ledger.submit(() => ({
+  return ledger.submit((current) => ({
     opId: `plan:${ledger.cityId}:${building}:${x},${y}:${when}`,
     kind: "plan",
     at: when,
@@ -209,7 +216,7 @@ export async function placePlan(ledger, { building, x, y, at } = {}) {
     y,
     w: def?.footprint.w ?? 0,
     h: def?.footprint.h ?? 0,
-    costs: { ...(def?.costs ?? {}) },
+    costs: recipeOf(current, building),
   }));
 }
 

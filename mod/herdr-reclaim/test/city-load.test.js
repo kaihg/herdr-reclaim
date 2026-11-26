@@ -97,7 +97,7 @@ test("整筆與拆份重播相同", async () => {
     try {
       await load(base);
       const ledger = await openCity(base);
-      for (const [building, x, y] of [["house", 4, 1], ["market", 2, 2], ["library", -2, 2]]) {
+      for (const [building, x, y] of [["house", 3, 1], ["market", 2, 2], ["library", -2, 2]]) {
         expect((await placePlan(ledger, { building, x, y, at: AT })).status).toBe("applied");
       }
       writeActivity(base, record("work", "e1", { rounds, units }));
@@ -110,7 +110,7 @@ test("整筆與拆份重播相同", async () => {
   }
   const batch = await play(1, 28);
   expect(await play(28, 1)).toEqual(batch);
-  expect(stock(batch)).toEqual([74, 41, 29]);
+  expect(stock(batch)).toEqual([45, 12, 22]);
   expect(batch.buildings.map((b) => [b.building, b.completedUnit])).toEqual([["house", 14], ["market", 26]]);
   expect(batch.queue).toHaveLength(1);
   expect(batch.queue[0]).toMatchObject({ building: "library", remainingUnits: 12 });
@@ -123,7 +123,7 @@ test("寫入前後中斷可重開", async () => {
     try {
       await load(base);
       const ledger = await openCity(base);
-      await placePlan(ledger, { building: "house", x: 4, y: 1, at: AT });
+      await placePlan(ledger, { building: "house", x: 3, y: 1, at: AT });
       await placePlan(ledger, { building: "outpost", x: 2, y: 3, at: AT });
       writeActivity(base, record("work", "e1", { units: 16 }));
       const disk = createFileIo();
@@ -141,7 +141,7 @@ test("寫入前後中斷可重開", async () => {
       expect(city.buildings.map((b) => b.building)).toEqual(["house"]);
       expect(city.queue).toHaveLength(1);
       expect(city.queue[0]).toMatchObject({ building: "outpost", remainingUnits: 2 });
-      expect(stock(city)).toEqual([73, 42, 17]);
+      expect(stock(city)).toEqual([56, 25, 10]);
       expect((await load(base)).city).toEqual(city);
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
@@ -178,7 +178,7 @@ test("開城參數與地形重播", async () => {
   const base = root();
   try {
     const first = (await load(base)).city;
-    expect(first).toMatchObject({ terrainVersion: 1, roadArmLength: 3, resources: { wood: 70, stone: 35, iron: 6 } });
+    expect(first).toMatchObject({ terrainVersion: 1, roadArmLength: 1, resources: { wood: 70, stone: 35, iron: 6 } });
     const terrain = (city) => [...revealedCells(city)].map((key) => {
       const [x, y] = key.split(",").map(Number);
       return groundAt(city, { x, y });
@@ -193,13 +193,13 @@ test("開城參數與地形重播", async () => {
     const other = `${base}/other`;
     const ledger = await open(other);
     await ledger.submit(() => ({ kind: "workStart", at: 0, cityId: ledger.cityId, opId: "found",
-      terrainVersion: 1, roadArmLength: 1, resources: { wood: 8, stone: 5, iron: 2 } }));
+      terrainVersion: 1, roadArmLength: 3, resources: { wood: 8, stone: 5, iron: 2 } }));
     await ledger.checkpoint();
     const saved = (await load(other)).city;
     expect(saved.resources).toEqual({ wood: 8, stone: 5, iron: 2 });
     expect(saved.terrainVersion).toBe(1);
     expect(groundAt(saved, { x: 2, y: 0 })).toBe("road");
-    expect(groundAt(saved, { x: 3, y: 0 })).toBe("grass");
+    expect(groundAt(saved, { x: 4, y: 0 })).toBe("road");
   } finally {
     fs.rmSync(base, { recursive: true, force: true });
   }
@@ -327,13 +327,13 @@ describe("正式載入路徑：活動檔 → 共用城市", () => {
   test("無進帳不完工", async () => {
     const base = root();
     try {
-      // 十個回合＝木 30、石 20、鐵 10：民居（木 20、石 10）的配方備得齊。
+      // 十份工作收木 20、石 10、鐵 10，足夠支付首棟民居。
       writeActivity(base, record("solo", "solo-1", { rounds: 10 }));
       const first = await load(base);
       expect(stock(first.city)).toEqual(times(10));
 
       const ledger = await openCity(base);
-      expect((await placePlan(ledger, { building: "house", x: 4, y: 1, at: AT + 900_000 })).status).toBe("applied");
+      expect((await placePlan(ledger, { building: "house", x: 3, y: 1, at: AT + 900_000 })).status).toBe("applied");
       const building = await load(base);
       expect(building.city.queue[0]).toMatchObject({ building: "house", stage: "building", remainingUnits: 14 });
 
@@ -346,11 +346,11 @@ describe("正式載入路徑：活動檔 → 共用城市", () => {
       writeActivity(base, record("more", "e1", { units: 14, from: AT + 1_000_000 }));
       const done = await load(base);
       expect(done.city.queue).toEqual([]);
-      expect(done.city.buildings.map((entry) => [entry.building, entry.x, entry.y])).toEqual([["house", 4, 1]]);
+      expect(done.city.buildings.map((entry) => [entry.building, entry.x, entry.y])).toEqual([["house", 3, 1]]);
       // 完工揭開新土地：正式路徑重讀之後，那一格是看得到的。
       expect(revealedCells(done.city).has("5,0")).toBe(true);
       // 只做研究、沒有 commit：庫存只扣一次配方，沒有成果加成。
-      expect(stock(done.city)).toEqual([START_RESOURCES.wood + 52, START_RESOURCES.stone + 38, START_RESOURCES.iron + 24]);
+      expect(stock(done.city)).toEqual([START_RESOURCES.wood + 28, START_RESOURCES.stone + 14, START_RESOURCES.iron + 18]);
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
     }

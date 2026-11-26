@@ -12,10 +12,12 @@
 //   10 建設佇列（ADR 0003）：同時多項預定（上限 3）、預定不動庫存、排到隊首才付料、未開工可取消（不退款）
 //   11 新城：開城時將地形版本、道路臂長與起始庫存寫進帳本。
 //   12 工期改以份計；每筆收入與它引發的施工變化同一次提交。
+//   13 人口與維護：城鎮中心供應基本建材，依進帳前規模扣維護。
 export const UNIT_CONSTRUCTION_VERSION = 12;
-export const RULES_VERSION = UNIT_CONSTRUCTION_VERSION;
+export const POPULATION_VERSION = 13;
+export const RULES_VERSION = POPULATION_VERSION;
 export const TERRAIN_VERSION = 1;
-export const START_ROAD_LENGTH = 3;
+export const START_ROAD_LENGTH = 1;
 export const START_RESOURCES = { wood: 70, stone: 35, iron: 6 };
 
 /**
@@ -42,7 +44,24 @@ export const BUILDINGS_V12 = {
   library: { label: "書庫", footprint: { w: 2, h: 2 }, costs: { wood: 20, stone: 20, iron: 5 }, buildUnits: 14, reveal: 2 },
   outpost: { label: "哨站", footprint: { w: 1, h: 1 }, costs: { wood: 25, stone: 15, iron: 5 }, buildUnits: 4, reveal: 5 },
 };
-export const CITY_BUILDINGS = BUILDINGS_V12;
+export const CITY_BUILDINGS = {
+  house: { ...BUILDINGS_V12.house, footprint: { w: 2, h: 1 }, costs: { wood: 20, stone: 10, iron: 6 }, growth: 1.12, residents: 4, jobs: 0 },
+  workshop: { ...BUILDINGS_V12.workshop, jobs: 3 },
+  market: { ...BUILDINGS_V12.market, jobs: 2 },
+  library: { ...BUILDINGS_V12.library, jobs: 3 },
+  outpost: { ...BUILDINGS_V12.outpost, jobs: 0 },
+};
+
+/** 下令時固定配方；已排在前面的同種建築也算在棟次內。 */
+export function recipeOf(city, building) {
+  const def = CITY_BUILDINGS[building];
+  if (!def?.growth) return def?.costs;
+  let n = 0;
+  for (const list of [city.buildings, city.queue]) {
+    for (const item of list ?? []) if (item.building === building) n++;
+  }
+  return Object.fromEntries(Object.entries(def.costs).map(([key, base]) => [key, Math.ceil(base * def.growth ** n)]));
+}
 
 /** 舊 journal 的開工記號是時刻；新版是份數（第零份也能下令開工）。 */
 export const isBuilding = (item) => item.startedUnit != null || item.startedAt != null;
@@ -55,15 +74,6 @@ export function affordable(costs, resources = {}) {
 /** #23：共用城市的基本收入——每 WORK_TOKENS_PER_UNIT 個有效 token 收成一份建材（試玩參數）。 */
 export const WORK_TOKENS_PER_UNIT = 10_000;
 
-/** 一份收成的建材。羊皮卷不在其中：日常工作只供應基本建材。 */
-export const WORK_YIELD = { wood: 3, stone: 2, iron: 1 };
-
-/**
- * 一批有效工作的收成：整份的建材（計量器餘數由帳本的 work.tokens 另外保留）。
- * 長短對話、換 provider、換專案只改變 token 從哪裡來，收成只依 token 總量。
- */
-export function workYieldOf(tokens = 0) {
-  const units = Math.floor(Number(tokens ?? 0) / WORK_TOKENS_PER_UNIT);
-  return Object.fromEntries(Object.entries(WORK_YIELD).map(([key, amount]) => [key, amount * units]));
-}
+/** 城鎮中心每份毛產；先扣維護，再把整數建材存進倉庫。 */
+export const WORK_YIELD = { wood: 2, stone: 1, iron: 1 };
 

@@ -446,7 +446,9 @@ export default class Town extends View {
           .flex_none()
           .overflow_hidden()
           .child(div().text_size(10).text_color(t.dim).child("共用城市"))
-          .child(div().text_size(stacked ? 13 : 17).font_semibold().truncate().child(shared.name)),
+          .child(div().text_size(stacked ? 13 : 17).font_semibold().truncate().child(shared.name))
+          .child(div().text_size(11).child(`人口 ${shared.population.assigned}/${shared.population.capacity}`))
+          .child(div().text_size(11).child(`維護 ${Number((shared.maintenance * 100).toFixed(2))}%`)),
         center,
         v_flex()
           .w(blockW)
@@ -488,7 +490,7 @@ export default class Town extends View {
         div().text_size(9).text_color(t.muted).child(queue.length
           ? queueLine(queue[0], this.devMode)
           : "選好建築後，地圖會標出全部合法位置；點一格看整棟預覽，再按「預定這裡」。"),
-        ...cityBuildings().map((building) => this.buildingCard(shared, building, t, cx)),
+        ...cityBuildings(shared).map((building) => this.buildingCard(shared, building, t, cx)),
         div().text_size(9).text_color(t.dim)
           .child(full ? "佇列已滿：先讓最前面那一項完工，或取消還沒開工的項目。" : "預定不動庫存：排到隊首、材料備齊才一次付清；還沒開工的項目可以取消。"),
         div().text_size(9).text_color(t.dim)
@@ -628,7 +630,7 @@ export default class Town extends View {
 
   /** 整棟預覽＋下令：配方、還缺什麼、佇列還有沒有位置，都先講清楚再按「預定這裡」。 */
   previewSection(preview, t, shared, cx) {
-    const def = cityBuildings().find((building) => building.name === preview.building);
+    const def = cityBuildings(shared).find((building) => building.name === preview.building);
     const missing = def ? missingOf(def.costs, poolOf(shared)) : {};
     const ready = Object.keys(missing).length === 0;
     const room = shared.queue.length < shared.queueLimit;

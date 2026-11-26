@@ -35,7 +35,7 @@ function playerScreen(root) {
 
 test("新城外框與道路", () => {
   const { town, cx, tree } = open();
-  town.town.shared = readSharedCity({ terrainVersion: 1, roadArmLength: 3 });
+  town.town.shared = readSharedCity({ terrainVersion: 1 });
   const screen = tree();
   const tiles = mapTiles(screen);
   expect(tiles).toHaveLength(81);
@@ -58,7 +58,7 @@ test("新城外框與道路", () => {
       town.pickSite(x, y, cx);
       expect(text(tree())).toContain("不能放");
       expect(findByText(tree(), "預定這裡")).toBeNull();
-    } else if (x === 0 || y === 0) {
+    } else if (Math.abs(x) + Math.abs(y) === 2 && (x === 0 || y === 0)) {
       expectedRoads.push([tile.props.left + tile.props.w / 2, tile.props.top]);
     }
   }
@@ -67,16 +67,30 @@ test("新城外框與道路", () => {
 
 test("道路文字", () => {
   const { town, cx, tree } = open();
-  town.town.shared = readSharedCity({ terrainVersion: 1, roadArmLength: 3 });
-  const tile = findById(tree(), "map-0--4");
+  town.town.shared = readSharedCity({ terrainVersion: 1 });
+  const tile = findById(tree(), "map-0--2");
   tile.handlers.mouseDown.left({ local_position: { x: tile.props.w / 2, y: tile.props.h / 2 }, bounds: {} }, cx);
   expect(text(tree())).toContain("地面|道路");
   findById(tree(), "building-house").handlers.click({}, cx);
-  town.pickSite(0, -4, cx);
+  town.pickSite(0, -2, cx);
   const screen = text(tree());
   expect(screen).toContain("道路");
   expect(screen).toContain("不能放");
   expect(screen).not.toMatch(/provider|session|token|shared-v2|帳本|座標|\(-?\d+, ?-?\d+\)/i);
+});
+
+test("人口維護與缺人只用玩家用語", () => {
+  const { town, tree } = open();
+  const building = (type, label, x, y) => ({ building: type, label, x, y, w: 2, h: 2, cells: [{ x, y }], reveal: 2 });
+  const buildings = [building("market", "市場", 2, 1), building("library", "書庫", -3, 2)];
+  town.town.shared = readSharedCity({ buildings });
+  expect(playerScreen(findById(tree(), "top"))).toContain("人口 2/2|維護 5.88%");
+  expect(playerScreen(tree())).toContain("書庫・缺人");
+  expect(text(findById(tree(), "map"))).not.toContain("市場・缺人");
+  buildings.push(building("house", "民居", 2, 3));
+  town.town.shared = readSharedCity({ buildings });
+  expect(playerScreen(findById(tree(), "top"))).toContain("人口 5/6|維護 8.33%");
+  expect(playerScreen(tree())).not.toContain("缺人");
 });
 
 describe("固定情境的分區與庫存", () => {
@@ -99,7 +113,7 @@ describe("固定情境的分區與庫存", () => {
     expect(screen).toContain("施工中：哨站・還要 3 份");
     expect(screen).toContain("工期|還要 3 份");
     expect(screen).not.toMatch(/預計開工|\d{1,2}:\d{2}|provider|session|token|shared-v2|帳本|座標|\(-?\d+, ?-?\d+\)/i);
-    // 固定情境的庫存 12/8/3 不夠民居的 20/10：排隊中的那一項是備料中，還缺沿佇列累計。
+    // 第一棟民居缺木 8、石 2、鐵 3。
     expect(screen).toContain("備料中");
     expect(screen).toContain("還缺|木材 8・石材 2");
     // 只有還沒開工的那一項有取消按鈕；按鈕文字就是「取消」（施工中的哨站沒有）。
@@ -120,8 +134,8 @@ describe("固定情境的分區與庫存", () => {
     const toggle = () => findByText(tree(), "開發模式").handlers.click({}, cx);
     const queued = playerScreen(tree());
     expect(queued).toContain("下一份進帳|40%");
-    expect(queued).toContain("還缺|木材 8・石材 2；繼續工作就會進帳");
-    expect(text(findById(tree(), "building-house"))).toContain("還缺 木材 8・石材 2；繼續工作就會進帳");
+    expect(queued).toContain("還缺|木材 8・石材 2・鐵料 3；繼續工作就會進帳");
+    expect(text(findById(tree(), "building-house"))).toContain("還缺 木材 11・石材 4・鐵料 4；繼續工作就會進帳");
     toggle();
     const dev = text(tree());
     for (const detail of ["provider 回報", "openai-codex", "更新額度", `帳本 ${SHARED_CITY_ID}`, "(4, 1)", "4000/10000 token"]) {

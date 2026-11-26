@@ -90,7 +90,7 @@ mod 以 `find` 列活動檔，成功寫 journal 後按 epoch 寫 ack，並用 `w
 完整規則與數值見 `docs/rules.md`。
 
 - **基本收入**（`ingestIncome`）：每一個已結束的有效工作回合累積 non-cache input + output，
-  每滿 10,000 token 收成木 3、石 2、鐵 1；用量來源鍵寫進城級 claim，兩個 space 或恢復對話
+  每滿 10,000 token 算一份，中心毛產木 2、石 1、鐵 1，扣維護後入庫；用量來源鍵寫進城級 claim，兩個 space 或恢復對話
   後的新 epoch 重送同一份工作只入帳一次。
 - **commit 不另外收成**（#28、ADR 0002）：收入只看工作量。舊帳本裡的 `achievement` 照常
   重播、庫存不變；新版不再讀 `commits/`、`sources/`，也不跑 `git reflog`、`git diff-tree`。

@@ -30,7 +30,8 @@ import { BlobStore } from "./blobs.js";
 import { byteLen, canonicalJson, hashText } from "./bytes.js";
 import { casWrite, rejectUnlessConflict } from "./cas.js";
 import { PrefixIndex } from "./pages.js";
-import { BUILD_QUEUE_LIMIT, BUILDINGS_V12, CITY_BUILDINGS, RESOURCES, RULES_VERSION, UNIT_CONSTRUCTION_VERSION, WORK_TOKENS_PER_UNIT, affordable, isBuilding, workYieldOf } from "./rules.js";
+import { BUILD_QUEUE_LIMIT, BUILDINGS_V12, CITY_BUILDINGS, POPULATION_VERSION, RESOURCES, RULES_VERSION, UNIT_CONSTRUCTION_VERSION, WORK_TOKENS_PER_UNIT, affordable, isBuilding, recipeOf } from "./rules.js";
+import { buildingCount, creditUnits } from "./economy.js";
 import { footprintCells, siteCheck } from "./city-map.js";
 
 export { byteLen, hashText };
@@ -164,7 +165,7 @@ function sameCosts(costs, recipe) {
   const entries = Object.entries(costs ?? {});
   const expected = Object.entries(recipe ?? {});
   return entries.length === expected.length &&
-    expected.every(([key, need]) => Number(costs[key]) === Number(need));
+    expected.every(([key, need]) => costs[key] === need);
 }
 
 /**
@@ -222,20 +223,51 @@ function applyUnitIncome(state, entry, units) {
     }
     const unit = before + i;
     adjust(state, yieldPerUnit, 1);
-    // v11 已開工的項目不重扣；收到第一份新版收入時，從完整的份制工期繼續。
-    if (item.startedAt != null && item.startedUnit == null) item.startedUnit = unit - 1;
-    const def = BUILDINGS_V12[item.building];
-    if (item.startedUnit != null && unit - item.startedUnit === def.buildUnits) {
-      state.queue.shift();
-      state.buildings.push({
-        building: item.building, label: item.label, x: item.x, y: item.y, w: item.w, h: item.h,
-        costs: item.costs, cells: item.cells, startedUnit: item.startedUnit, completedUnit: unit,
-        reveal: def.reveal, rulesVersion: entry.rulesVersion,
-      });
-    }
-    startReadyHead(state, unit);
+    advanceWorksite(state, unit, entry.rulesVersion);
   }
 }
+
+function advanceWorksite(state, unit, rulesVersion) {
+  const item = state.queue[0];
+  // v11 已開工的項目不重扣；新版第一份收入才開始計份制工期。
+  if (item.startedAt != null && item.startedUnit == null) item.startedUnit = unit - 1;
+  const def = (item.rulesVersion >= POPULATION_VERSION ? CITY_BUILDINGS : BUILDINGS_V12)[item.building];
+  if (item.startedUnit != null && unit - item.startedUnit === def.buildUnits) {
+    state.queue.shift();
+    state.buildings.push({
+      building: item.building, label: item.label, x: item.x, y: item.y, w: item.w, h: item.h,
+      costs: item.costs, cells: item.cells, startedUnit: item.startedUnit, completedUnit: unit,
+      reveal: def.reveal, rulesVersion,
+    });
+  }
+  startReadyHead(state, unit);
+}
+
+/** v13 的純交易：只複製這筆可能改動的庫存與佇列，不帶入來源索引或歷史建築。 */
+function projectIncome(state, tokens) {
+  const metered = state.work.tokens + Number(tokens);
+  const units = Math.floor(metered / WORK_TOKENS_PER_UNIT);
+  const income = { wood: 0, stone: 0, iron: 0 };
+  const work = { ...state.work, tokens: metered % WORK_TOKENS_PER_UNIT };
+  if (!units) return { income, work };
+  const draft = { resources: { ...state.resources }, queue: state.queue.map(item => ({ ...item })), buildings: [] };
+  const existing = buildingCount(state.buildings);
+  const carry = { ...work.carry };
+  let unit = work.units ?? 0;
+  const end = unit + units;
+  while (unit < end) {
+    // 沒有工地就不會再改變規模；精確分數使合算與逐份取整等價。
+    const span = draft.queue.length ? 1 : end - unit;
+    creditUnits(draft.resources, income, carry, existing + draft.buildings.length, span);
+    unit += span;
+    if (draft.queue.length) advanceWorksite(draft, unit, POPULATION_VERSION);
+  }
+  work.units = end;
+  work.carry = carry;
+  return { ...draft, income, work };
+}
+
+export const workYieldOf = (state, tokens) => projectIncome(state, tokens).income;
 
 /**
  * 每一種 operation 的套用與前提檢查。entry 只要帶上自己的欄位即可，格式不用改。
@@ -269,25 +301,28 @@ export const KINDS = {
   income: {
     precheck(state, op) {
       if (op.cityId !== state.cityId) return "wrong_city";
-      if (!(Number.isInteger(Number(op.tokens)) && Number(op.tokens) > 0)) return "invalid_income";
+      if (!Number.isSafeInteger(Number(op.tokens) + state.work.tokens) || !(Number(op.tokens) > 0)) return "invalid_income";
       if (!Array.isArray(op.sources) || op.sources.length === 0) return "missing_sources";
       // 收成要跟「這筆提交之前」的計量器餘數相符：CAS 重試重新計算，驗的也是同一條規則。
-      const expected = workYieldOf(Number(state.work.tokens ?? 0) + Number(op.tokens));
-      const paid = Object.entries(expected);
-      const got = Object.entries(op.resources ?? {});
-      if (got.length !== paid.length || !paid.every(([key, amount]) => Number(op.resources?.[key]) === amount)) {
-        return "rate_mismatch";
-      }
+      if (!sameCosts(op.resources, workYieldOf(state, op.tokens))) return "rate_mismatch";
       if (op.sources.some((source) => state.claims.has(claimKey(op.cityId, source)))) return "source_exists";
       return null;
     },
     apply(state, entry) {
-      const total = Number(state.work.tokens ?? 0) + Number(entry.tokens);
-      state.work.tokens = total % WORK_TOKENS_PER_UNIT;
-      if (entry.rulesVersion >= UNIT_CONSTRUCTION_VERSION) {
-        applyUnitIncome(state, entry, Math.floor(total / WORK_TOKENS_PER_UNIT));
+      if (entry.rulesVersion >= POPULATION_VERSION) {
+        const projected = projectIncome(state, entry.tokens);
+        if (!sameCosts(entry.resources, projected.income)) throw new Error("收入與進帳前的城市不符");
+        state.work = projected.work;
+        if (projected.queue) {
+          state.resources = projected.resources;
+          state.queue = projected.queue;
+          state.buildings.push(...projected.buildings);
+        }
       } else {
-        stockUp(state, entry);
+        const total = Number(state.work.tokens ?? 0) + Number(entry.tokens);
+        state.work.tokens = total % WORK_TOKENS_PER_UNIT;
+        if (entry.rulesVersion >= UNIT_CONSTRUCTION_VERSION) applyUnitIncome(state, entry, Math.floor(total / WORK_TOKENS_PER_UNIT));
+        else stockUp(state, entry);
       }
       for (const source of entry.sources ?? []) state.claims.set(claimKey(entry.cityId, source), entry.journalSeq);
     },
@@ -326,7 +361,7 @@ export const KINDS = {
       const def = CITY_BUILDINGS[op.building];
       if (!def) return "unknown_building";
       if (Number(op.w) !== def.footprint.w || Number(op.h) !== def.footprint.h) return "footprint_mismatch";
-      if (!sameCosts(op.costs, def.costs)) return "recipe_mismatch";
+      if (!sameCosts(op.costs, recipeOf(state, op.building))) return "recipe_mismatch";
       const preview = siteCheck(state, op.building, { x: op.x, y: op.y });
       const blocked = preview.cells.find((cell) => cell.problem);
       return blocked ? `site_${blocked.problem}` : null;
@@ -341,7 +376,7 @@ export const KINDS = {
         w: entry.w,
         h: entry.h,
         costs: { ...entry.costs },
-        cells: footprintCells(entry.building, { x: entry.x, y: entry.y }),
+        cells: footprintCells(entry.building, entry, { w: entry.w, h: entry.h }),
         at: Number(entry.at),
         paid: entry.paid === true,
         rulesVersion: entry.rulesVersion,

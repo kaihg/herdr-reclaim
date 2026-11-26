@@ -95,7 +95,7 @@ export function sharedMapView({
       .text_color(color)
       .child(text);
   };
-  for (const building of buildings) children.push(label(building, building.label, t.done));
+  for (const b of buildings) children.push(label(b, b.understaffed ? `${b.label}・缺人` : b.label, b.understaffed ? t.blocked : t.done));
   for (const item of queue) {
     children.push(item.stage === "building"
       ? label(item, `施工·${item.label}`, t.working)

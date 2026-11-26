@@ -9,7 +9,7 @@ import { SHARED_CITY_ID, readSharedCity } from "../core/shared-city.js";
 
 const MARKET = { building: "market", label: "市場", x: -3, y: 2, w: 2, h: 2 };
 const OUTPOST = { building: "outpost", label: "哨站", x: 4, y: 1, w: 1, h: 1 };
-const HOUSE = { building: "house", label: "民居", x: 2, y: -1, w: 1, h: 1 };
+const HOUSE = { building: "house", label: "民居", x: 2, y: -1, w: 2, h: 1 };
 
 /** 佇列的第一項在施工、第二項備料中：check 看得到兩種階段與「取消」按鈕。 */
 const QUEUE = [
@@ -23,7 +23,7 @@ const QUEUE = [
   },
   {
     ...HOUSE,
-    costs: { wood: 20, stone: 10 },
+    costs: { wood: 20, stone: 10, iron: 6 },
     cells: footprintCells("house", HOUSE).map((cell) => ({ x: cell.x, y: cell.y })),
     at: 1_500,
   },

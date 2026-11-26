@@ -7,7 +7,8 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import fs from "node:fs";
 
 import { legalSites } from "../core/city-map.js";
-import { RESOURCE_LABELS, START_RESOURCES, workYieldOf } from "../core/rules.js";
+import { RESOURCE_LABELS, START_RESOURCES } from "../core/rules.js";
+import { workYieldOf } from "../core/ledger.js";
 import {
   findByText, findById, installHost, ledgerState, makeCx, mapTiles, submitOp, text, waitFor,
 } from "./view-harness.js";
@@ -33,7 +34,7 @@ const incomeOp = (tokens, id = "test") => (state) => ({
   cityId: state.cityId,
   tokens,
   sources: [id],
-  resources: workYieldOf(Number(state.work.tokens ?? 0) + tokens),
+  resources: workYieldOf(state, tokens),
 });
 
 describe("載入鏈", () => {
@@ -61,12 +62,12 @@ describe("載入鏈", () => {
 
 describe("選址到下令（真的寫進帳本）", () => {
   test("點選預定付料，重開工地不排完工計時器", async () => {
-    // 先備料：七單位工作（木 21、石 14、鐵 7）足夠民居的 20/10。
+    // 七份工作另收木 14、石 7、鐵 7。
     await open();
     const before = await ledgerState(host.home);
     expect((await submitOp(host.home, incomeOp(70_000, "seed-house"))).status).toBe("applied");
     const funded = await ledgerState(host.home);
-    expect(funded.resources.wood).toBe(before.resources.wood + 21);
+    expect(funded.resources.wood).toBe(before.resources.wood + 14);
     const { cx, town, tree } = await open();
     expect(text(tree())).toContain(`共用倉庫|${funded.resources.wood}|木材|${funded.resources.stone}|石材|${funded.resources.iron}|鐵料`);
 

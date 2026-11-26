@@ -27,7 +27,7 @@ const incomeOp = (index) => ({
   cityId: CITY_ID,
   tokens: 10_000,
   sources: [`s-${index}`],
-  resources: { wood: 3, stone: 2, iron: 1 },
+  resources: { wood: 2, stone: 1, iron: 1 },
 });
 
 function filesOf(dir) {
@@ -62,7 +62,7 @@ describe("長期共用帳本的容量：兩萬筆收入", () => {
       const state = await ledger.state();
       expect(state.lastSeq).toBe(ENTRIES - 1);
       expect(state.claims.size).toBe(ENTRIES);
-      expect(state.resources).toEqual({ wood: 3 * ENTRIES, stone: 2 * ENTRIES, iron: ENTRIES, parchment: 0 });
+      expect(state.resources).toEqual({ wood: 2 * ENTRIES, stone: ENTRIES, iron: ENTRIES, parchment: 0 });
       expect(state.work.tokens).toBe(0);
       expect(entriesOf(await ledger.scanSegments())).toHaveLength(ENTRIES);
 

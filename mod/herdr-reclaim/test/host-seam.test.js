@@ -7,9 +7,8 @@
 //
 // 這裡用一個行為相同的假 host 逼出這個接縫：帳本只認 CasConflict，其他錯誤原樣往上丟。
 import { describe, expect, test } from "bun:test";
-import { CasConflict, CityLedger } from "../core/ledger.js";
+import { CasConflict, CityLedger, workYieldOf } from "../core/ledger.js";
 import { hostIo } from "../core/host-io.js";
-import { workYieldOf } from "../core/rules.js";
 
 const HOST_CONFLICT =
   "`herdr.writeTextFile`: The file changed outside Herdr. Reload before saving; your draft is still here.";
@@ -28,7 +27,7 @@ function incomeOp(state, source, cityId) {
     cityId,
     tokens,
     sources: [source],
-    resources: workYieldOf(Number(state.work.tokens ?? 0) + tokens),
+    resources: workYieldOf(state, tokens),
   };
 }
 
