@@ -109,6 +109,7 @@ async function startWork(ledger, at) {
     at: since,
     cityId: ledger.cityId,
     terrainVersion: TERRAIN_VERSION,
+    terrainSeed: since >>> 0,
     roadArmLength: START_ROAD_LENGTH,
     resources: START_RESOURCES,
   }));
@@ -180,6 +181,7 @@ export function readSharedCity(state = {}) {
       cityId: state.cityId ?? SHARED_CITY_ID,
       name: "共用城市",
       terrainVersion: state.terrainVersion,
+      terrainSeed: state.terrainSeed,
       roadArmLength: state.roadArmLength,
       resources: Object.fromEntries(Object.keys(WORK_YIELD).map((key) => [key, Number(state.resources?.[key] ?? 0)])),
       work: { tokens: Number(state.work?.tokens ?? 0), unitTokens: WORK_TOKENS_PER_UNIT },

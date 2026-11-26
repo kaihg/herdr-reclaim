@@ -286,6 +286,7 @@ export const KINDS = {
     apply(state, entry) {
       state.work.since = Number(entry.at);
       state.terrainVersion = entry.terrainVersion;
+      state.terrainSeed = entry.terrainSeed;
       state.roadArmLength = entry.roadArmLength;
       if (entry.resources) stockUp(state, entry);
     },
@@ -838,6 +839,7 @@ export class CityLedger {
       segment,
       resources: state.resources,
       terrainVersion: state.terrainVersion,
+      terrainSeed: state.terrainSeed,
       roadArmLength: state.roadArmLength,
       work: state.work,
       queue: state.queue,
@@ -932,6 +934,7 @@ export class CityLedger {
       for (const [key, packed] of read.activities.entries) state.activities.set(key, await this.unpackRecord(packed));
       state.resources = manifest.resources ?? state.resources;
       state.terrainVersion = manifest.terrainVersion;
+      state.terrainSeed = manifest.terrainSeed;
       state.roadArmLength = manifest.roadArmLength;
       state.work = manifest.work ?? state.work;
       state.queue = manifest.queue ?? state.queue;

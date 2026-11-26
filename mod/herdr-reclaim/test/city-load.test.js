@@ -178,16 +178,21 @@ test("開城參數與地形重播", async () => {
   const base = root();
   try {
     const first = (await load(base)).city;
-    expect(first).toMatchObject({ terrainVersion: 1, roadArmLength: 1, resources: { wood: 70, stone: 35, iron: 6 } });
-    const terrain = (city) => [...revealedCells(city)].map((key) => {
+    expect(first).toMatchObject({ terrainVersion: 2, roadArmLength: 1, resources: { wood: 70, stone: 35, iron: 6 } });
+    expect(Number.isInteger(first.terrainSeed)).toBe(true);
+    const terrain = (city) => [...revealedCells(city), "10,16", "-19,73", "107,-51"].map((key) => {
       const [x, y] = key.split(",").map(Number);
       return groundAt(city, { x, y });
     });
     const open = (dir) => new CityLedger({ io: createFileIo(), dir: sharedCityDir(dir), cityId: SHARED_CITY_ID }).open();
     const before = terrain(first);
-    expect(terrain((await load(base)).city)).toEqual(before);
+    const replay = (await load(base)).city;
+    expect(replay.terrainSeed).toBe(first.terrainSeed);
+    expect(terrain(replay)).toEqual(before);
     await (await open(base)).checkpoint();
-    expect(terrain((await load(base)).city)).toEqual(before);
+    const checkpoint = (await load(base)).city;
+    expect(checkpoint.terrainSeed).toBe(first.terrainSeed);
+    expect(terrain(checkpoint)).toEqual(before);
 
     // 另一座城創建時的設定與目前規則不同：不可拿現在的參數覆寫歷史。
     const other = `${base}/other`;
@@ -198,6 +203,8 @@ test("開城參數與地形重播", async () => {
     const saved = (await load(other)).city;
     expect(saved.resources).toEqual({ wood: 8, stone: 5, iron: 2 });
     expect(saved.terrainVersion).toBe(1);
+    expect(groundAt(saved, { x: -2, y: -3 })).toBe("water");
+    expect(groundAt(saved, { x: 4, y: -2 })).toBe("cliff");
     expect(groundAt(saved, { x: 2, y: 0 })).toBe("road");
     expect(groundAt(saved, { x: 4, y: 0 })).toBe("road");
   } finally {

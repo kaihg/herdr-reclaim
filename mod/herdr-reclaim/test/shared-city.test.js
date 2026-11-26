@@ -322,6 +322,7 @@ describe("選址與預定佇列（#25、ADR 0003）", () => {
   test("起始揭開區可以隔一格蓋市場；不同占地的建築各有自己的合法位置；過往工作不影響選址", async () => {
     const dir = root("start-area");
     const ledger = await sharedLedger(dir);
+    await settle(ledger, []); // 先開城，後續對照的是同一版本與種子的土地。
     const fresh = readSharedCity(await ledger.state()).city;
 
     // 城鎮中心是 (-1..1, -1..1)；市場 2×2 放在 (3..4, 1..2)，中間隔著 x = 2 那一行空地。

@@ -32,6 +32,7 @@ const QUEUE = [
 const STATE = {
   cityId: SHARED_CITY_ID,
   terrainVersion: TERRAIN_VERSION,
+  terrainSeed: 32,
   roadArmLength: START_ROAD_LENGTH,
   resources: { wood: 12, stone: 8, iron: 3, parchment: 0 },
   work: { tokens: 4_000, units: 13, since: 1 },

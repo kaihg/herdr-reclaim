@@ -16,7 +16,7 @@
 export const UNIT_CONSTRUCTION_VERSION = 12;
 export const POPULATION_VERSION = 13;
 export const RULES_VERSION = POPULATION_VERSION;
-export const TERRAIN_VERSION = 1;
+export const TERRAIN_VERSION = 2;
 export const START_ROAD_LENGTH = 1;
 export const START_RESOURCES = { wood: 70, stone: 35, iron: 6 };
 

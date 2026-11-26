@@ -6,7 +6,7 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import fs from "node:fs";
 
-import { legalSites } from "../core/city-map.js";
+import { TERRAIN, groundAt, legalSites } from "../core/city-map.js";
 import { RESOURCE_LABELS, START_RESOURCES } from "../core/rules.js";
 import { workYieldOf } from "../core/ledger.js";
 import {
@@ -61,6 +61,36 @@ describe("載入鏈", () => {
 });
 
 describe("選址到下令（真的寫進帳本）", () => {
+  test("霧中河道不外洩", async () => {
+    await submitOp(host.home, state => ({
+      kind: "workStart", opId: "found", at: 32, cityId: state.cityId,
+      terrainVersion: 2, terrainSeed: 32, roadArmLength: 1, resources: START_RESOURCES,
+    }));
+    const first = await open();
+    findById(first.tree(), "building-outpost").handlers.click({}, first.cx);
+    first.town.pickSite(4, 1, first.cx);
+    findByText(first.tree(), "預定這裡").handlers.click({}, first.cx);
+    await waitFor(() => first.town.town.shared.city.queue[0]?.stage === "building");
+    await submitOp(host.home, incomeOp(40_000, "scout"));
+    const { town, cx, tree } = await open();
+    const city = town.town.shared.city;
+    expect(groundAt(city, { x: 10, y: 0 })).toBe("water");
+    expect(findById(tree(), "map-10-0")).toBeNull();
+    findById(tree(), "building-house").handlers.click({}, cx);
+    town.pickSite(10, 0, cx);
+    expect(town.preview).toBeNull();
+    const edge = findById(tree(), "map-9-0");
+    edge.handlers.mouseDown.left({ local_position: { x: edge.props.w / 2, y: edge.props.h / 2 }, bounds: {} }, cx);
+    const visible = TERRAIN[groundAt(city, { x: 9, y: 0 })].label;
+    expect(text(findById(tree(), "detail"))).toContain(`${visible}|迷霧|配方`);
+    expect(findByText(tree(), "預定這裡")).toBeNull();
+    // 即使繞過按鈕直接送出，帳本的拒絕原因也只能提到迷霧。
+    town.submitPlan({ building: "outpost", x: 10, y: 0, label: "哨站" }, cx);
+    await waitFor(() => town.toast?.text?.includes("沒有預定"));
+    expect(town.toast.text).toBe("沒有預定：有一角還在迷霧裡");
+    expect((await ledgerState(host.home)).queue).toEqual([]);
+  });
+
   test("點選預定付料，重開工地不排完工計時器", async () => {
     // 七份工作另收木 14、石 7、鐵 7。
     await open();

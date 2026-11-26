@@ -27,12 +27,12 @@ const paintOf = (style, t) => (style.kind === "slash"
 
 export function sharedMapView({
   revealed, queue = [], buildings = [], legal = [], preview = null, selected = null, theme: t, tile, camera,
-  terrainVersion, roadArmLength,
+  terrainVersion, terrainSeed, roadArmLength,
   radius = MAP_RADIUS, onPick, onPan, viewport = null,
 }) {
   const origin = originInContent(radius, tile);
   const base = basePaths(radius, tile);
-  const layout = mapCells({ revealed, queue, buildings, terrainVersion, roadArmLength, legal, preview, selected, radius });
+  const layout = mapCells({ revealed, queue, buildings, terrainVersion, terrainSeed, roadArmLength, legal, preview, selected, radius });
   const spotOf = (cell) => projectTile(cell, tile);
   const marks = layout.marks.map((mark) => {
     if (mark.kind === "building") {

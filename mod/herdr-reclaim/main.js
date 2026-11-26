@@ -48,6 +48,7 @@ const RESOURCES = [
 /** 選址被拒的原因（帳本的前提檢查）：畫面上只翻成人看得懂的一句話。 */
 const SITE_PROBLEMS = {
   road: "道路", fog: "迷霧", water: "深水", cliff: "峭壁", center: "城鎮中心", building: "已有建築", plan: "預定地", unknown_building: "未知建築",
+  reserved: "地標預留地",
 };
 const INCOME_HINT = "繼續工作就會進帳";
 const PLAN_REASONS = {
@@ -65,6 +66,7 @@ const PLAN_REASONS = {
   site_center: "有一角是城鎮中心",
   site_building: "有一角已有建築",
   site_plan: "有一角是預定地",
+  site_reserved: "有一角是地標預留地",
 };
 const costsText = (costs = {}) => Object.entries(costs)
   .map(([key, amount]) => `${RESOURCE_LABELS[key]} ${amount}`).join("・");
@@ -574,6 +576,7 @@ export default class Town extends View {
       queue: shared.queue,
       buildings: shared.buildings,
       terrainVersion: shared.terrainVersion,
+      terrainSeed: shared.terrainSeed,
       roadArmLength: shared.roadArmLength,
       theme: t,
       tile,
