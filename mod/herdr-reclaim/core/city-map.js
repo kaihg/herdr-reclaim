@@ -27,7 +27,7 @@ export function terrainAt(cell, version = 1, seed) {
   throw new Error(`不支援的地形版本：${version}`);
 }
 
-function surfaceAt(city, cell) {
+export function surfaceAt(city, cell) {
   if (cell.x === CENTER.x || cell.y === CENTER.y) {
     const distance = gridDistance(CENTER, cell);
     if (distance > 1 && distance <= 1 + (city?.roadArmLength ?? START_ROAD_LENGTH)) return "road";

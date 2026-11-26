@@ -13,9 +13,11 @@
 //   11 新城：開城時將地形版本、道路臂長與起始庫存寫進帳本。
 //   12 工期改以份計；每筆收入與它引發的施工變化同一次提交。
 //   13 人口與維護：城鎮中心供應基本建材，依進帳前規模扣維護。
+//   14 產出建築：有人力才產，依已揭開的相鄰地形加成，再扣維護。
 export const UNIT_CONSTRUCTION_VERSION = 12;
 export const POPULATION_VERSION = 13;
-export const RULES_VERSION = POPULATION_VERSION;
+export const PRODUCTION_VERSION = 14;
+export const RULES_VERSION = PRODUCTION_VERSION;
 export const TERRAIN_VERSION = 2;
 export const START_ROAD_LENGTH = 1;
 export const START_RESOURCES = { wood: 70, stone: 35, iron: 6 };
@@ -45,11 +47,16 @@ export const BUILDINGS_V12 = {
   outpost: { label: "哨站", footprint: { w: 1, h: 1 }, costs: { wood: 25, stone: 15, iron: 5 }, buildUnits: 4, reveal: 5 },
 };
 export const CITY_BUILDINGS = {
-  house: { ...BUILDINGS_V12.house, footprint: { w: 2, h: 1 }, costs: { wood: 20, stone: 10, iron: 6 }, growth: 1.12, residents: 4, jobs: 0 },
-  workshop: { ...BUILDINGS_V12.workshop, jobs: 3 },
-  market: { ...BUILDINGS_V12.market, jobs: 2 },
-  library: { ...BUILDINGS_V12.library, jobs: 3 },
-  outpost: { ...BUILDINGS_V12.outpost, jobs: 0 },
+  house: { ...BUILDINGS_V12.house, footprint: { w: 2, h: 1 }, costs: { wood: 20, stone: 10, iron: 6 }, growth: 1.12, residents: 4, jobs: 0, purpose: "可多住 4 人" },
+  lumberyard: { label: "伐木場", footprint: { w: 2, h: 2 }, costs: { wood: 50, stone: 25 }, growth: 1.15, buildUnits: 18, reveal: 2, jobs: 2,
+    purpose: "生產木材，靠近疏林產量更高", production: { material: "wood", terrain: ["scrub"], cap: 3 } },
+  quarry: { label: "採石場", footprint: { w: 2, h: 2 }, costs: { wood: 60, stone: 15 }, growth: 1.15, buildUnits: 18, reveal: 2, jobs: 2,
+    purpose: "生產石材，靠近碎石地產量更高", production: { material: "stone", terrain: ["rubble"], cap: 3 } },
+  workshop: { ...BUILDINGS_V12.workshop, costs: { wood: 60, stone: 30 }, growth: 1.15, jobs: 3,
+    purpose: "生產鐵料，靠近碎石地或峭壁產量更高", production: { material: "iron", terrain: ["rubble", "cliff"], cap: 2 } },
+  market: { ...BUILDINGS_V12.market, jobs: 2, purpose: "目前只揭開周圍土地" },
+  library: { ...BUILDINGS_V12.library, jobs: 3, purpose: "目前只揭開周圍土地" },
+  outpost: { ...BUILDINGS_V12.outpost, jobs: 0, purpose: "向遠處探勘，揭開更多土地" },
 };
 
 /** 下令時固定配方；已排在前面的同種建築也算在棟次內。 */

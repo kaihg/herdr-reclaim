@@ -79,6 +79,26 @@ test("道路文字", () => {
   expect(screen).not.toMatch(/provider|session|token|shared-v2|帳本|座標|\(-?\d+, ?-?\d+\)/i);
 });
 
+test("產場清單與詳情只用玩家用語", () => {
+  for (const [type, label, purpose] of [
+    ["lumberyard", "伐木場", /木材.*疏林/], ["quarry", "採石場", /石材.*碎石/], ["workshop", "工坊", /鐵料.*碎石.*峭壁/],
+  ]) {
+    const { town, cx, tree } = open();
+    town.town.shared = readSharedCity({ terrainVersion: 1 });
+    const card = findById(tree(), `building-${type}`);
+    expect(playerScreen(card)).toContain(label);
+    expect(playerScreen(card)).toMatch(purpose);
+    card.handlers.click({}, cx);
+    town.pickSite(3, 1, cx);
+    expect(playerScreen(findById(tree(), "detail"))).toMatch(purpose);
+    expect(playerScreen(tree())).toContain("預定這裡");
+    town.town.shared = readSharedCity({ buildings: [{ building: type, label, x: 3, y: 1, cells: [{ x: 3, y: 1 }] }] });
+    town.picking = null;
+    town.pickSite(3, 1, cx);
+    expect(playerScreen(findById(tree(), "detail"))).toMatch(purpose);
+  }
+});
+
 test("人口維護與缺人只用玩家用語", () => {
   const { town, tree } = open();
   const building = (type, label, x, y) => ({ building: type, label, x, y, w: 2, h: 2, cells: [{ x, y }], reveal: 2 });

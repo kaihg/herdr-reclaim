@@ -21,7 +21,7 @@ import { CasConflict, CityLedger } from "./core/ledger.js";
 import { quotaLines } from "./core/provider-stats.js";
 import { QUOTA_REFRESH_MS, QUOTA_SOURCE, claimQuotaAttempt, parseQuotaReport } from "./core/quota-source.js";
 import { quotaView, readQuotaView } from "./core/quota-view.js";
-import { RESOURCE_LABELS, RULES_VERSION } from "./core/rules.js";
+import { CITY_BUILDINGS, RESOURCE_LABELS, RULES_VERSION } from "./core/rules.js";
 import { parseUi, selectionOf, serializeUi, withDev, withSelection } from "./core/selection.js";
 import {
   SHARED_CITY_ID, cancelPlan, placePlan, readSharedCity, sharedCityDir,
@@ -525,6 +525,7 @@ export default class Town extends View {
       .children([
         div().text_size(11.5).text_color(locked && !selected ? t.dim : t.foreground)
           .child(`${building.label}　${building.footprint.w}×${building.footprint.h}`),
+        div().text_size(10).text_color(t.muted).child(CITY_BUILDINGS[building.name].purpose),
         div().text_size(9).text_color(t.muted).truncate().child(costsText(building.costs)),
         div().text_size(9).text_color(t.muted).child(`完工揭開 ${building.reveal} 格`),
         div().text_size(9).text_color(affordable ? t.done : t.muted)
@@ -639,6 +640,7 @@ export default class Town extends View {
     const room = shared.queue.length < shared.queueLimit;
     return [
       div().text_size(14).font_semibold().child(preview.label + locationLabel(preview, this.devMode)),
+      fieldRow({ label: "用途", value: CITY_BUILDINGS[preview.building].purpose }, t),
       h_flex().gap(6).items_center()
         .child(statusBadge(preview.ok ? "可以放" : "不能放", t))
         .child(div().text_size(10).text_color(t.muted).child(preview.ok ? "整片占地都在可建的土地上" : "整棟都不能放")),
@@ -680,6 +682,7 @@ export default class Town extends View {
               .child(div().text_size(12).font_semibold().child(`#${index + 1} ${item.label}`))
               .child(statusBadge(building ? "施工中" : missing ? "備料中" : "排隊中", t)),
             div().text_size(10).text_color(t.muted).child(`占地 ${item.w}×${item.h}${locationLabel(item, this.devMode)}`),
+            fieldRow({ label: "用途", value: CITY_BUILDINGS[item.building].purpose }, t),
             fieldRow({ label: "配方", value: costsText(item.costs) }, t),
             ...(building
               ? [fieldRow({ label: "工期", value: workLeft(item) }, t)]
@@ -701,7 +704,8 @@ export default class Town extends View {
     return [
       div().text_size(14).font_semibold().child(`選取的土地${locationLabel(spot, this.devMode)}`),
       fieldRow({ label: "地面", value: ground ? groundLabel(ground) : "迷霧" }, t),
-      ...(done ? [fieldRow({ label: "建築", value: done.label }, t)] : []),
+      ...(done ? [fieldRow({ label: "建築", value: done.label }, t),
+        fieldRow({ label: "用途", value: CITY_BUILDINGS[done.building].purpose }, t)] : []),
       div().text_size(9).text_color(t.muted).child(
         this.picking ? "這一格是整棟占地的左上角：在地圖點它就會顯示預覽。" : "選一棟建築之後，這裡會列出整棟占地的判斷。",
       ),

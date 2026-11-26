@@ -30,8 +30,8 @@ import { BlobStore } from "./blobs.js";
 import { byteLen, canonicalJson, hashText } from "./bytes.js";
 import { casWrite, rejectUnlessConflict } from "./cas.js";
 import { PrefixIndex } from "./pages.js";
-import { BUILD_QUEUE_LIMIT, BUILDINGS_V12, CITY_BUILDINGS, POPULATION_VERSION, RESOURCES, RULES_VERSION, UNIT_CONSTRUCTION_VERSION, WORK_TOKENS_PER_UNIT, affordable, isBuilding, recipeOf } from "./rules.js";
-import { buildingCount, creditUnits } from "./economy.js";
+import { BUILD_QUEUE_LIMIT, BUILDINGS_V12, CITY_BUILDINGS, POPULATION_VERSION, PRODUCTION_VERSION, RESOURCES, RULES_VERSION, UNIT_CONSTRUCTION_VERSION, WORK_TOKENS_PER_UNIT, WORK_YIELD, affordable, isBuilding, recipeOf } from "./rules.js";
+import { buildingCount, creditUnits, grossYield } from "./economy.js";
 import { footprintCells, siteCheck } from "./city-map.js";
 
 export { byteLen, hashText };
@@ -243,24 +243,33 @@ function advanceWorksite(state, unit, rulesVersion) {
   startReadyHead(state, unit);
 }
 
-/** v13 的純交易：只複製這筆可能改動的庫存與佇列，不帶入來源索引或歷史建築。 */
-function projectIncome(state, tokens) {
+/** 模擬整筆收入；只有完工會在這筆交易中改變人力、地形歸屬與維護率。 */
+function projectIncome(state, tokens, rulesVersion = RULES_VERSION) {
   const metered = state.work.tokens + Number(tokens);
   const units = Math.floor(metered / WORK_TOKENS_PER_UNIT);
   const income = { wood: 0, stone: 0, iron: 0 };
   const work = { ...state.work, tokens: metered % WORK_TOKENS_PER_UNIT };
   if (!units) return { income, work };
-  const draft = { resources: { ...state.resources }, queue: state.queue.map(item => ({ ...item })), buildings: [] };
-  const existing = buildingCount(state.buildings);
+  const draft = {
+    terrainVersion: state.terrainVersion, terrainSeed: state.terrainSeed, roadArmLength: state.roadArmLength,
+    resources: { ...state.resources }, queue: state.queue.map(item => ({ ...item })),
+    buildings: state.queue.length ? state.buildings.slice() : state.buildings,
+  };
+  let count = buildingCount(state.buildings);
+  let gross;
   const carry = { ...work.carry };
   let unit = work.units ?? 0;
   const end = unit + units;
   while (unit < end) {
-    // 沒有工地就不會再改變規模；精確分數使合算與逐份取整等價。
+    gross ??= rulesVersion >= PRODUCTION_VERSION ? grossYield(draft) : WORK_YIELD;
     const span = draft.queue.length ? 1 : end - unit;
-    creditUnits(draft.resources, income, carry, existing + draft.buildings.length, span);
+    creditUnits(draft.resources, income, carry, count, span, gross);
     unit += span;
-    if (draft.queue.length) advanceWorksite(draft, unit, POPULATION_VERSION);
+    if (draft.queue.length) {
+      const before = draft.buildings.length;
+      advanceWorksite(draft, unit, rulesVersion);
+      if (draft.buildings.length !== before) { count++; gross = null; }
+    }
   }
   work.units = end;
   work.carry = carry;
@@ -311,13 +320,13 @@ export const KINDS = {
     },
     apply(state, entry) {
       if (entry.rulesVersion >= POPULATION_VERSION) {
-        const projected = projectIncome(state, entry.tokens);
+        const projected = projectIncome(state, entry.tokens, entry.rulesVersion);
         if (!sameCosts(entry.resources, projected.income)) throw new Error("收入與進帳前的城市不符");
         state.work = projected.work;
         if (projected.queue) {
           state.resources = projected.resources;
           state.queue = projected.queue;
-          state.buildings.push(...projected.buildings);
+          state.buildings = projected.buildings;
         }
       } else {
         const total = Number(state.work.tokens ?? 0) + Number(entry.tokens);
