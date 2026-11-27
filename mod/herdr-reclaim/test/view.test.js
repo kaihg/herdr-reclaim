@@ -352,6 +352,40 @@ describe("按下之後", () => {
     expect(selectionOf(town.ui, SHARED_CITY_ID)).toEqual({ kind: "site", cityId: SHARED_CITY_ID, x, y });
   });
 
+  test("選地在佇列上方，合法起點可從這裡鋪路", () => {
+    const { town, tree, cx } = open();
+    const pick = (x, y) => {
+      const tile = findById(tree(), `map-${x}-${y}`);
+      tile.handlers.mouseDown.left({ local_position: { x: tile.props.w / 2, y: tile.props.h / 2 }, bounds: {} }, cx);
+    };
+    const detail = () => findById(tree(), "detail");
+    pick(3, 1);
+    expect(findByText(detail(), "從這裡鋪路")).toBeNull();
+    for (const [x, y, ground] of [[0, -2, "道路"], [1, 1, "草地"]]) {
+      pick(x, y);
+      expect(playerScreen(detail())).toMatch(new RegExp(`選取的土地\\|地面\\|${ground}.*建設佇列 2/3.*#1 哨站.*#2 民居`));
+      findByText(detail(), "從這裡鋪路").handlers.click({}, cx);
+      expect(playerScreen(detail())).toContain("選終點");
+      expect(town.roadFrom).toMatchObject({ x, y });
+      findByText(detail(), "取消鋪路").handlers.click({}, cx);
+    }
+  });
+
+  test("滿列鋪路可預覽但不能確認", () => {
+    const { town, tree, cx } = open();
+    const city = town.town.shared.city;
+    city.queueLimit = city.queue.length;
+    const detail = () => findById(tree(), "detail");
+    findByText(findById(tree(), "city-panel"), "鋪路").handlers.click({}, cx);
+    expect(playerScreen(detail())).toContain("選起點");
+    town.pickSite(0, -2, cx);
+    town.pickSite(-1, -3, cx);
+    const panel = playerScreen(detail());
+    expect(panel).toMatch(/道路預覽.*總成本\|木材 \d+・石材 \d+/);
+    expect(panel).toMatch(/建設佇列已滿.*最前面那一項完工.*取消還沒開工/);
+    expect(findByText(detail(), "確認鋪路")).toBeNull();
+  });
+
   test("佇列還沒滿時點建築：進入選址（不用先等前一項蓋完）", () => {
     const { cx, town, tree } = open();
     const card = findById(tree(), "building-house");

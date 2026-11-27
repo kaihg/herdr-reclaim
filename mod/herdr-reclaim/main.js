@@ -612,14 +612,14 @@ export default class Town extends View {
       ]);
   }
 
-  /** 選一種建築開始選址；佇列滿了才不能選（還在排隊的項目彼此不擋）。 */
-  pickBuilding(shared, building, cx) {
-    if (manualCount(shared.queue) >= shared.queueLimit) {
+  /** 佇列滿時不能選建築位置，但仍可規劃道路。 */
+  pickBuilding(shared, building, cx, roadFrom = null) {
+    if (building !== "road" && manualCount(shared.queue) >= shared.queueLimit) {
       this.showToast(`建設佇列已滿（${manualCount(shared.queue)}/${shared.queueLimit}）：先讓最前面那一項完工，或取消還沒開工的一項`, cx);
       return;
     }
     this.picking = this.picking === building ? null : building;
-    this.roadFrom = null;
+    this.roadFrom = roadFrom;
     this.preview = null;
     cx.notify();
   }
@@ -699,7 +699,7 @@ export default class Town extends View {
     this.select({ kind: "site", cityId: SHARED_CITY_ID, x, y }, cx);
   }
 
-  /** 右側：整棟預覽與「預定這裡」；沒有預覽時顯示建設佇列或選取格的地形。 */
+  /** 右側優先顯示鋪路或整棟預覽，平時在佇列上方顯示選取的土地。 */
   sharedDetail(shared, t, width, cx, route) {
     const road = this.picking === "road";
     const preview = !road && this.picking && this.preview ? siteCheck(shared, this.picking, this.preview) : null;
@@ -719,7 +719,10 @@ export default class Town extends View {
         div().text_size(10).text_color(t.dim).child(road ? "鋪路" : preview ? "整棟預覽" : "選址與建設"),
         ...(road ? this.roadSection(shared, t, route) : preview
           ? this.previewSection(preview, t, shared, cx)
-          : (shared.queue.length ? this.queueSection(shared, t, cx) : this.spotSection(shared, spot, t))),
+          : [
+            ...(spot || !shared.queue.length ? this.spotSection(shared, spot, t) : []),
+            ...(shared.queue.length ? this.queueSection(shared, t, cx) : []),
+          ]),
         this.note ? div().text_size(9).text_color(t.muted).child(this.note) : null,
       ].filter(Boolean));
   }
@@ -733,7 +736,7 @@ export default class Town extends View {
         fieldRow({ label: "總成本", value: costsText(route.costs) }, t),
         fieldRow({ label: "工期", value: `${route.buildUnits} 份` }, t),
         room ? chipButton("確認鋪路", t, cx => this.submitPlan({ building: "road", label: "道路", ...route.end, route }, cx))
-          : div().child(PLAN_REASONS.queue_full),
+          : div().text_color(t.blocked).child("建設佇列已滿：先讓最前面那一項完工，或取消還沒開工的項目。"),
       ] : route ? [div().text_color(t.blocked).child(PLAN_REASONS[route.reason])] : []),
       chipButton("取消鋪路", t, cx => {
         this.picking = this.preview = this.roadFrom = null;
@@ -823,7 +826,8 @@ export default class Town extends View {
       div().text_size(9).text_color(t.muted).child(
         this.picking ? "這一格是整棟占地的左上角：在地圖點它就會顯示預覽。" : "選一棟建築之後，這裡會列出整棟占地的判斷。",
       ),
-      ...(shared.queue.length ? [div().text_size(9).text_color(t.dim).child(`建設佇列 ${manualCount(shared.queue)}/${shared.queueLimit}：${queueLine(shared.queue[0], this.devMode)}。`)] : []),
+      ...(ground && roadStart(shared, spot) ? [chipButton("從這裡鋪路", t,
+        cx => this.pickBuilding(shared, "road", cx, { x: spot.x, y: spot.y }))] : []),
     ];
   }
 

@@ -131,6 +131,12 @@ describe("選址到下令（真的寫進帳本）", () => {
     const city = town.town.shared.city;
     expect(groundAt(city, { x: 10, y: 0 })).toBe("water");
     expect(findById(tree(), "map-10-0")).toBeNull();
+    // 還原到尚未揭開的格子時，土地詳情也不能顯示河道或鋪路捷徑。
+    town.select({ kind: "site", cityId: SHARED_CITY_ID, x: 10, y: 0 }, cx);
+    const detail = findById(tree(), "detail");
+    expect(text(detail)).toContain("地面|迷霧");
+    expect(text(detail)).not.toContain("深水");
+    expect(findByText(detail, "從這裡鋪路")).toBeNull();
     findById(tree(), "building-house").handlers.click({}, cx);
     town.pickSite(10, 0, cx);
     expect(town.preview).toBeNull();
