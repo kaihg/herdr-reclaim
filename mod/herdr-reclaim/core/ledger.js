@@ -57,7 +57,7 @@ export const SEGMENT_LIMIT = 256 * 1024;
 export const SEAL_RESERVE = 96;
 
 /** 預設每幾筆 entry 就主動做一次 checkpoint（mod 開機時呼叫 `maybeCheckpoint`）。 */
-export const CHECKPOINT_EVERY = 512;
+export const CHECKPOINT_EVERY = 128;
 
 /** CAS 失敗就重讀、重新檢查、再試；連續失敗到這個次數才放棄。 */
 const MAX_ATTEMPTS = 8;
@@ -137,6 +137,22 @@ export const claimKey = (cityId, claim) => `${cityId}@@${claim}`;
  */
 export const planKey = (plan) => plan.building === "townUpgrade" ? `townUpgrade:${plan.at}` : `${plan.building}:${plan.x},${plan.y}:${plan.at}`;
 export const activityKey = (record) => `${record.sessionId}@@${record.writerEpoch ?? ""}`;
+
+function mergedActivityEvent(prior, event) {
+  const keepVisit = prior?.kind === "visit_start" && prior.visit?.commonDir &&
+    event.kind === "visit_start" && !event.visit?.commonDir;
+  return keepVisit ? { ...event, visit: prior.visit } : event;
+}
+
+/** 比較重播後的內容，而非 JSON 欄位順序或 adapter 是否已壓縮。 */
+export function activityDelta(current, events) {
+  if (!current || events.every(event => event.eventSeq > current.lastEventSeq)) return events;
+  const bySeq = new Map(current.events.map(event => [event.eventSeq, event]));
+  return events.filter(event => {
+    const prior = bySeq.get(event.eventSeq);
+    return !prior || canonicalJson(prior) !== canonicalJson(mergedActivityEvent(prior, event));
+  });
+}
 
 const zeroResources = () => Object.fromEntries(RESOURCES.map((key) => [key, 0]));
 
@@ -532,8 +548,8 @@ export const KINDS = {
   },
 
   /**
-   * 活動合併（§6.2）：以 (sessionId, writerEpoch) 為鍵。adapter 收到 ack 後會 compact
-   * 磁碟快照，後續 entry 只含未 ack 的尾巴；帳本重播時必須把事件併回舊快照，不能覆蓋它。
+   * 活動合併（§6.2）：以 (sessionId, writerEpoch) 為鍵。舊 entry 可含重疊尾巴，新 entry
+   * 只含新增或修正事件；兩者都依 eventSeq 併回舊快照。
    */
   activity: {
     precheck(state, op, blobs) {
@@ -547,10 +563,7 @@ export const KINDS = {
       const current = state.activities.get(key);
       const bySeq = new Map((current?.events ?? []).map((event) => [event.eventSeq, event]));
       for (const event of blobs?.events ?? []) {
-        const prior = bySeq.get(event.eventSeq);
-        const resolvedVisit = prior?.kind === "visit_start" && prior.visit?.commonDir &&
-          event.kind === "visit_start" && !event.visit?.commonDir;
-        bySeq.set(event.eventSeq, resolvedVisit ? { ...event, visit: prior.visit } : event);
+        bySeq.set(event.eventSeq, mergedActivityEvent(bySeq.get(event.eventSeq), event));
       }
       const events = [...bySeq.values()].sort((a, b) => a.eventSeq - b.eventSeq);
       state.activities.set(key, {

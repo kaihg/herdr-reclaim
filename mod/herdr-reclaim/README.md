@@ -53,11 +53,12 @@ mod 端由 `core/host-io.js` 把 herdr 的原生錯誤轉成 `CasConflict`（真
   `activity`（活動合併）。
   舊版的 `achievement` 只重播、不再產生（#28），新的提交一律被拒。收成的資源向量由 entry
   自己帶，所以調整規則不改寫已落帳的結果。
-- 每個 writer 的活動寫成一筆 `activity` entry，內容（事件陣列）放在以雜湊命名的
-  `blobs/<hash>.json`，**先寫內容再附加 entry**。
+- 每個 writer 只為新增或內容修正的事件寫 `activity` entry。先寫 `blobs/<hash>.json`，
+  再附加 entry；沒有差異只補 ack，不寫空內容檔。
 - **CAS**：`writeTextFile(path, text, expected)` 的 expected 不符就重讀、重新檢查前提、再試。
-- **checkpoint**：`checkpoints/<seq>/` 的索引頁（`ops`／`claims`／`activities`）加之後的 journal
-  重播，等於從頭重播；manifest 的內容雜湊記在 `head.json`，對不上就整份丟棄重建。
+- **checkpoint**：累積 128 筆 entry 後，載入時保存合併後的狀態，不複製歷史事件批次。
+  `checkpoints/<seq>/` 的索引頁（`ops`／`claims`／`activities`）加之後的 journal 重播，等於
+  從頭重播；manifest 的內容雜湊記在 `head.json`，對不上就整份丟棄重建。
 - 每段有大小上限（預設 256 KiB）；放不下先 CAS 附加封段行，再寫下一段。
 - **ack**（§6.2）：`acks/<sessionId>/<epoch>.json`，在 journal 提交成功之後才寫；帳本重播
   不讀 ack，所以 ack 延遲或重播不改變最終狀態。OMP adapter 只在讀到這個 epoch 的 ack 後

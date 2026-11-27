@@ -91,6 +91,93 @@ const times = (n) => ["wood", "stone", "iron"].map((key, i) => START_RESOURCES[k
 
 const openCity = (base, rulesVersion) => new CityLedger({ io: createFileIo(), dir: sharedCityDir(base), cityId: SHARED_CITY_ID, rulesVersion }).open();
 
+test("未壓縮尾巴線性落帳", async () => {
+  const base = root();
+  try {
+    const disk = createFileIo();
+    let blobEvents = 0, blobBytes = 0;
+    const io = { ...disk, async write(file, text, expected) {
+      await disk.write(file, text, expected);
+      if (!file.includes("/blobs/")) return;
+      const payload = JSON.parse(JSON.parse(text).d);
+      // checkpoint 另存合併後的 writer 快照，不是 activity entry 的內容檔。
+      if (payload.events && !payload.sessionId) {
+        blobEvents += payload.events.length;
+        blobBytes += Buffer.byteLength(text);
+      }
+    } };
+    const ledger = await new CityLedger({ io, dir: sharedCityDir(base), cityId: SHARED_CITY_ID }).open();
+    const data = record("growing", "e", { rounds: 0 });
+    for (let seq = 1; seq <= 200; seq++) {
+      data.events.push({ eventSeq: seq, kind: "heartbeat", at: AT + seq });
+      writeActivity(base, data);
+      await loadCity(io, { root: base, list, ledger, activateAt: AT });
+    }
+    expect(blobEvents).toBe(200);
+    expect(blobBytes).toBeLessThan(200 * 128);
+    expect((await ledger.readAck("growing", "e")).ackedEventSeq).toBe(200);
+  } finally { fs.rmSync(base, { recursive: true, force: true }); }
+});
+
+test("舊重疊與增量重播等價", async () => {
+  const old = root(), fresh = root();
+  try {
+    const legacy = await openCity(old);
+    const data = record("worker", "e");
+    // 模擬舊 writer：第一筆以未關閉區間結束，第二筆再次提交從 1 開始的所有事件。
+    for (const lastEventSeq of [3, 4]) {
+      const events = data.events.slice(0, lastEventSeq);
+      await legacy.submit(() => ({
+        opId: `activity:${SHARED_CITY_ID}:worker@@e@@${lastEventSeq}`, kind: "activity", cityId: SHARED_CITY_ID,
+        sessionId: "worker", writerEpoch: "e", interactive: true, cli: data.cli,
+        at: data.updatedAt, updatedAt: data.updatedAt, lastEventSeq, blobs: { events },
+      }));
+      await load(old);
+      writeActivity(fresh, { ...data, events });
+      await load(fresh);
+    }
+    const a = await (await openCity(old)).state(), b = await (await openCity(fresh)).state();
+    expect(a.activities.get("worker@@e").events).toEqual(data.events);
+    expect(a.claims.size).toBe(1);
+    expect(b.activities).toEqual(a.activities);
+    expect(b.claims).toEqual(a.claims);
+    expect(b.work).toEqual(a.work);
+    expect(b.resources).toEqual(a.resources);
+  } finally {
+    for (const dir of [old, fresh]) fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("雙窗修正與補 ack", async () => {
+  const base = root();
+  try {
+    const data = record("visit", "e");
+    const unresolved = { ...data, events: [{ ...data.events[0], visit: { cwd: CHECKOUT_A } }, ...data.events.slice(1)] };
+    writeActivity(base, unresolved);
+    await Promise.all([load(base), load(base)]);
+    writeActivity(base, data);
+    await Promise.all([load(base), load(base)]);
+    const ledger = await openCity(base);
+    const entries = (await ledger.scanSegments()).flatMap(p => p.entries).filter(e => e.kind === "activity");
+    expect(entries).toHaveLength(2);
+    expect((await ledger.contentOf(entries[1])).events).toEqual([data.events[0]]);
+    const saved = (await ledger.state()).activities.get("visit@@e");
+    expect(saved.events[0].visit.commonDir).toBe(REPO_A);
+
+    // 模擬 journal 已成立、ack 遺失；舊快照缺 commonDir，不應覆蓋已解析的 visit。
+    fs.unlinkSync(ledger.ackPath("visit", "e"));
+    writeActivity(base, unresolved);
+    const disk = createFileIo(), writes = [];
+    const io = { ...disk, async write(file, text, expected) {
+      writes.push(file);
+      await disk.write(file, text, expected);
+    } };
+    await loadCity(io, { root: base, list });
+    expect(writes).toEqual([ledger.ackPath("visit", "e")]);
+    expect(await ledger.readAck("visit", "e")).toMatchObject({ ackedEventSeq: 4, journalSeq: saved.seq });
+  } finally { fs.rmSync(base, { recursive: true, force: true }); }
+});
+
 test("分批同城", async () => {
   async function play(every, rounds = 8, units = 13) {
     const base = root();

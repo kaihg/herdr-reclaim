@@ -8,7 +8,7 @@
 // 主機相依的部分由呼叫端注入：
 //   `list(dir)`  列檔案（herdr 的 mod 沒有 listdir）
 import { loadActivities, mergeActivities } from "./adapter.js";
-import { CityLedger } from "./ledger.js";
+import { CityLedger, activityDelta, activityKey } from "./ledger.js";
 import { SHARED_CITY_ID, ingestIncome, readSharedCity, sharedCityDir } from "./shared-city.js";
 
 /**
@@ -46,10 +46,8 @@ export function townOf(loaded, quotas) {
 /**
  * adapter 磁碟上的活動尾巴 → `activity` entry，並在 entry 成立之後寫 ack（§6.2）。
  *
- * 只送磁碟上的那一份（adapter ack 後會 compact 掉已入帳的事件）；帳本把事件併回舊快照，
- * 所以 journal 保存的仍是完整的事件序列，重播看得到原本的 visit、區間與用量。同一份尾巴
- * 重送是 duplicate（opId 含 writer epoch 與最後的 eventSeq），不會重寫內容檔；ack 補在同一個
- * journal 位置。
+ * 在 submit 的 CAS 前提內計算差異；其他視窗搶先提交時，重試會看到它剛保存的事件。
+ * ack 依據整份磁碟尾巴，而非這一次新增的事件；即使上次提交後沒寫到 ack 也能補回。
  */
 export async function recordActivities(ledger, activities) {
   const results = [];
@@ -57,30 +55,39 @@ export async function recordActivities(ledger, activities) {
     const events = record.events ?? [];
     if (events.length === 0) continue; // 已全部 ack 的 compacted 快照沒有新事件
     const lastEventSeq = events.reduce((latest, event) => Math.max(latest, event.eventSeq ?? 0), 0);
-    const result = await ledger.submit(() => ({
-      opId: `activity:${ledger.cityId}:${record.sessionId}@@${record.writerEpoch ?? ""}@@${lastEventSeq}`,
-      kind: "activity",
-      at: record.updatedAt ?? events[events.length - 1]?.at ?? 0,
-      cityId: ledger.cityId,
-      sessionId: record.sessionId,
-      writerEpoch: record.writerEpoch,
-      role: record.role ?? "root",
-      interactive: record.interactive === true,
-      parentSessionId: record.parentSessionId ?? null,
-      cli: record.cli ?? null,
-      updatedAt: record.updatedAt ?? 0,
-      lastEventSeq,
-      blobs: { events },
-    }));
+    const key = activityKey(record);
+    const baseId = `activity:${ledger.cityId}:${key}@@${lastEventSeq}`;
+    let saved;
+    const result = await ledger.submit(state => {
+      saved = state.activities.get(key);
+      const delta = activityDelta(saved, events);
+      if (!delta.length) return null;
+      return {
+        // 只修正內容時最大序號不變。綁定被修正的版本，避免撞上舊 opId，也允許改回原值。
+        opId: saved?.lastEventSeq === lastEventSeq ? `${baseId}:after:${saved.seq}` : baseId,
+        kind: "activity",
+        at: record.updatedAt ?? events[events.length - 1]?.at ?? 0,
+        cityId: ledger.cityId,
+        sessionId: record.sessionId,
+        writerEpoch: record.writerEpoch,
+        role: record.role ?? "root",
+        interactive: record.interactive === true,
+        parentSessionId: record.parentSessionId ?? null,
+        cli: record.cli ?? null,
+        updatedAt: record.updatedAt ?? 0,
+        lastEventSeq,
+        blobs: { events: delta },
+      };
+    });
     results.push(result);
     // §6.2：ack 在 journal 提交成功之後才寫。上一次中斷或重播時 entry 已經在，這裡補上同一筆
     // （journalSeq 是 entry 的位置，不是這次嘗試的位置）。
-    if (result.status === "applied" || result.status === "duplicate") {
+    if (result.status === "applied" || result.status === "duplicate" || result.status === "nothing") {
       await ledger.writeAck({
         sessionId: record.sessionId,
         writerEpoch: record.writerEpoch,
         ackedEventSeq: lastEventSeq,
-        journalSeq: result.journalSeq,
+        journalSeq: result.journalSeq ?? saved.seq,
       });
     }
   }
