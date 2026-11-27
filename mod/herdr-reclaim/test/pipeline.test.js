@@ -7,6 +7,7 @@ import { beforeEach, describe, expect, spyOn, test } from "bun:test";
 import fs from "node:fs";
 
 import { TERRAIN, groundAt, legalSites } from "../core/city-map.js";
+import { recordActivities } from "../core/city-load.js";
 import { RESOURCE_LABELS, START_RESOURCES } from "../core/rules.js";
 import { CityLedger, workYieldOf } from "../core/ledger.js";
 import { SHARED_CITY_ID, placePlan } from "../core/shared-city.js";
@@ -153,7 +154,27 @@ describe("選址到下令（真的寫進帳本）", () => {
     expect((await ledgerState(host.home)).lastSeq).toBe(before.lastSeq);
   });
 
-  test("鋪路操作", async () => {
+  test("雙窗交錯預定後看到同一份佇列", async () => {
+    const a = await open(), b = await open();
+    const site = legalSites(a.town.town.shared.city, "house")[0];
+    const order = (view, target) => view.town.submitPlan({ building: "house", label: "民居", ...target }, view.cx);
+    order(a, site);
+    await waitFor(() => a.town.town.shared.city.queue.length === 1);
+    const second = legalSites(a.town.town.shared.city, "house")[0];
+    order(b, second); // b 還沒讀到 a 的預定；要在 CAS 後以新庫存與配方重算。
+    await waitFor(() => b.town.town.shared.city.queue.length === 2);
+    const latest = await a.town.refreshShared();
+    expect(latest.shared).toEqual(b.town.town.shared);
+    expect(latest.shared.city.queue.map(({ x, y }) => ({ x, y }))).toEqual([site, second].map(({ x, y }) => ({ x, y })));
+    expect((await ledgerState(host.home)).lastSeq).toBe(latest.shared.lastSeq);
+  });
+
+  test("300 筆活動後鋪路、取消與刷新只讀尾段", async () => {
+    const ledger = await new CityLedger({ io: createFileIo(), dir: ledgerDir(host.home), cityId: SHARED_CITY_ID }).open();
+    for (let seq = 1; seq <= 300; seq++) {
+      await recordActivities(ledger, [{ sessionId: "worker", writerEpoch: "epoch",
+        events: [{ kind: "heartbeat", at: seq, eventSeq: seq }] }]);
+    }
     const { cx, town, tree } = await open();
     const click = label => findByText(tree(), label).handlers.click({}, cx);
     const pick = (x, y) => {
@@ -184,15 +205,24 @@ describe("選址到下令（真的寫進帳本）", () => {
     }
     click("取消鋪路");
     expect((await ledgerState(host.home)).lastSeq).toBe(before.lastSeq);
-    click("鋪路"); pick(0, -2); pick(-2, -3); click("確認鋪路");
-    await waitFor(() => town.town.shared.city.queue[0]?.building === "road");
-    expect(screen()).toContain("#1 道路");
-    expect(screen()).toContain("還缺 石材 21");
-    expect((await ledgerState(host.home)).resources).toEqual(before.resources);
-    click("取消");
-    await waitFor(() => !town.town.shared.city.queue.length);
-    expect(screen()).toContain("已取消：道路");
-    expect((await ledgerState(host.home)).resources).toEqual(before.resources);
+    const reads = spyOn(town.io, "read");
+    try {
+      click("鋪路"); pick(0, -2); pick(-2, -3); click("確認鋪路");
+      await waitFor(() => town.town.shared.city.queue[0]?.building === "road");
+      expect(reads.mock.calls.length).toBeLessThan(15);
+      expect(screen()).toContain("#1 道路");
+      expect(screen()).toContain("還缺 石材 21");
+      expect((await ledgerState(host.home)).resources).toEqual(before.resources);
+      reads.mockClear();
+      click("取消");
+      await waitFor(() => !town.town.shared.city.queue.length);
+      expect(reads.mock.calls.length).toBeLessThan(15);
+      expect(screen()).toContain("已取消：道路");
+      expect((await ledgerState(host.home)).resources).toEqual(before.resources);
+      reads.mockClear();
+      expect((await town.refreshShared()).shared.city.queue).toEqual([]);
+      expect(reads.mock.calls.length).toBeLessThan(15);
+    } finally { reads.mockRestore(); }
   });
 
   test("點選預定付料，重開工地不排完工計時器", async () => {

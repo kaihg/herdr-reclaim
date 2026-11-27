@@ -16,11 +16,12 @@ import { SHARED_CITY_ID, ingestIncome, readSharedCity, sharedCityDir } from "./s
  * 每筆收入同時推進對應的工期，最後回傳公開讀取模型。
  *
  * `activities` 可以覆寫（測試給固定的事件）；沒有給就讀磁碟。
+ * `ledger` 可傳入這座城已開啟的實例，讓同一視窗後續重讀只重播新 entry。
  * `activateAt` 只給測試：正式 runtime 由第一次啟用的當下決定。
  */
-export async function loadCity(io, { root, list, activities: given = null, activateAt } = {}) {
+export async function loadCity(io, { root, list, activities: given = null, activateAt, ledger } = {}) {
   const fromDisk = given ?? await loadActivities({ ...io, list }, `${root}/activity`);
-  const ledger = await new CityLedger({ io, dir: sharedCityDir(root), cityId: SHARED_CITY_ID }).open();
+  ledger ??= await new CityLedger({ io, dir: sharedCityDir(root), cityId: SHARED_CITY_ID }).open();
   await ledger.maybeCheckpoint();
   // 磁碟上的新事件先寫進 journal，成功之後才寫 ack（adapter 下一次才敢 compact）。
   await recordActivities(ledger, fromDisk);

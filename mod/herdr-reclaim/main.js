@@ -187,10 +187,10 @@ function openShared(io) {
  * 正式載入：活動檔 → `loadCity` → 公開模型。
  * 沒有 repo 舊帳本的讀寫，也不碰 git 的提交紀錄（#28：commit 不另外收成）。
  */
-async function loadModel(io) {
+async function loadModel(io, ledger) {
   const root = adapterRoot(appHome());
   const activities = await loadActivities(io, activityDir(appHome()));
-  const loaded = await loadCity(io, { root, list: listFiles, activities });
+  const loaded = await loadCity(io, { root, list: listFiles, activities, ledger });
   return townOf(loaded, await loadQuotas(io));
 }
 
@@ -308,7 +308,7 @@ export default class Town extends View {
       let first = true;
       for (;;) {
         try {
-          this.town = await loadModel(this.io);
+          this.town = await this.withShared(ledger => loadModel(this.io, ledger));
           this.ui = parseUi(await this.io.read(uiPath()));
           if (first) this.devMode = this.ui.dev;
           if (first) this.restoreSelection();
@@ -831,6 +831,16 @@ export default class Town extends View {
     ];
   }
 
+  // 同窗的 watch、按鈕都會 await IO；依序使用同一份可變快取，跨窗則由帳本的 CAS 仲裁。
+  withShared(run) {
+    const next = (this.sharedTask ?? Promise.resolve()).then(async () => {
+      this.ledger ??= await openShared(this.io);
+      return run(this.ledger);
+    });
+    this.sharedTask = next.then(() => {}, () => { this.ledger = null; });
+    return next;
+  }
+
   /**
    * 下令：寫進共用帳本的 plan entry，只保留占地、不扣料（ADR 0003）。成功就重讀共用城市，
    * 失敗只回報原因；被拒的下令不寫任何東西，所以另一個視窗搶先佔位或佇列已滿時，
@@ -843,10 +853,9 @@ export default class Town extends View {
       let text;
       let devText;
       try {
-        const ledger = await openShared(this.io);
-        const result = building === "road" ? await placeRoad(ledger, preview.route, startedAt)
-          : building === "townUpgrade" ? await placeTownUpgrade(ledger, startedAt)
-          : await placePlan(ledger, { building, x, y, at: startedAt });
+        const result = await this.withShared(ledger => building === "road" ? placeRoad(ledger, preview.route, startedAt)
+          : building === "townUpgrade" ? placeTownUpgrade(ledger, startedAt)
+          : placePlan(ledger, { building, x, y, at: startedAt }));
         if (result.status === "applied" || result.status === "duplicate") {
           this.town = await this.refreshShared();
           this.picking = null;
@@ -874,7 +883,7 @@ export default class Town extends View {
       let text;
       let devText;
       try {
-        const result = await cancelPlan(await openShared(this.io), item);
+        const result = await this.withShared(ledger => cancelPlan(ledger, item));
         if (result.status === "applied" || result.status === "duplicate") {
           this.town = await this.refreshShared();
           text = `已取消：${item.label}`;
@@ -894,8 +903,8 @@ export default class Town extends View {
 
   /** 只重讀共用帳本（不重跑活動檔、commit 證據或 git）：操作之後畫面立刻看到同一份庫存。 */
   async refreshShared() {
-    const state = await (await openShared(this.io)).state();
-    return { ...this.town, shared: readSharedCity(state) };
+    const shared = await this.withShared(async ledger => readSharedCity(await ledger.state()));
+    return { ...this.town, shared };
   }
 
   /** 額度清單（§9）：已知的回報一行，未知的另起一行；不捏造數字。 */
